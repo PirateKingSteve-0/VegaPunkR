@@ -1,0 +1,87 @@
+<div class="template-gallery">
+  <h2 mat-dialog-title>
+    <mat-icon>library_books</mat-icon>
+    Strategy Templates
+  </h2>
+
+  <mat-dialog-content>
+    <p class="subtitle">
+      Choose a proven scalping strategy template optimized for small accounts.
+      All templates start in paper trading mode for safety.
+    </p>
+
+    <div *ngIf="loading" class="loading-container">
+      <mat-progress-spinner mode="indeterminate" diameter="50"></mat-progress-spinner>
+      <p>Loading templates...</p>
+    </div>
+
+    <div *ngIf="!loading" class="templates-grid">
+      <mat-card *ngFor="let template of templates" class="template-card" [class.recommended]="template.template_id === 'spy_0dte_scalping'">
+        <!-- Recommended Badge -->
+        <div *ngIf="template.template_id === 'spy_0dte_scalping'" class="recommended-badge">
+          <mat-icon>star</mat-icon>
+          RECOMMENDED
+        </div>
+
+        <mat-card-header>
+          <div class="template-icon" [ngClass]="'icon-' + template.difficulty">
+            <mat-icon>{{ getTemplateIcon(template) }}</mat-icon>
+          </div>
+          <div>
+            <mat-card-title>{{ template.name }}</mat-card-title>
+            <mat-card-subtitle>
+              {{ template.instruments.join(', ') }} · {{ template.timeframe }}
+            </mat-card-subtitle>
+          </div>
+        </mat-card-header>
+
+        <mat-card-content>
+          <p class="description">{{ template.description }}</p>
+
+          <div class="template-details">
+            <div class="detail-row">
+              <mat-icon class="detail-icon">trending_up</mat-icon>
+              <span>Take Profit: {{ template.take_profit_percentage }}%</span>
+            </div>
+            <div class="detail-row">
+              <mat-icon class="detail-icon">trending_down</mat-icon>
+              <span>Stop Loss: {{ template.stop_loss_percentage }}%</span>
+            </div>
+            <div class="detail-row">
+              <mat-icon class="detail-icon">account_balance_wallet</mat-icon>
+              <span>Min Account: ${{ template.recommended_min_account_size }}</span>
+            </div>
+            <div class="detail-row">
+              <mat-icon class="detail-icon">layers</mat-icon>
+              <span>Max Positions: {{ template.max_positions }}</span>
+            </div>
+          </div>
+
+          <div class="tags">
+            <mat-chip class="difficulty-chip" [ngClass]="'difficulty-' + template.difficulty">
+              {{ template.difficulty }}
+            </mat-chip>
+            <mat-chip *ngFor="let tag of template.tags.slice(0, 3)">
+              {{ tag }}
+            </mat-chip>
+          </div>
+        </mat-card-content>
+
+        <mat-card-actions>
+          <button mat-stroked-button (click)="viewDetails(template)">
+            <mat-icon>info</mat-icon>
+            View Details
+          </button>
+          <button mat-raised-button color="primary" (click)="cloneTemplate(template)" [disabled]="cloning === template.template_id">
+            <mat-icon>content_copy</mat-icon>
+            {{ cloning === template.template_id ? 'Cloning...' : 'Clone & Edit' }}
+          </button>
+        </mat-card-actions>
+      </mat-card>
+    </div>
+  </mat-dialog-content>
+
+  <mat-dialog-actions align="end">
+    <button mat-button mat-dialog-close>Close</button>
+  </mat-dialog-actions>
+</div>

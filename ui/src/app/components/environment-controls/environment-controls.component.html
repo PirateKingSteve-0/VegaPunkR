@@ -1,0 +1,104 @@
+<div class="environment-controls" *ngIf="settings">
+  <div class="controls-container">
+    <!-- Environment Selector -->
+    <div class="control-group">
+      <label class="control-label">Environment</label>
+      <div class="button-group">
+        <button
+          class="btn btn-env"
+          [class.active]="settings.environment === 'dev'"
+          [disabled]="isEnvironmentDisabled('dev')"
+          (click)="changeEnvironment('dev')"
+          [title]="getEnvironmentTooltip('dev')">
+          <span class="icon">🔧</span>
+          <span class="label">Dev</span>
+        </button>
+        <button
+          class="btn btn-env"
+          [class.active]="settings.environment === 'test'"
+          [disabled]="isEnvironmentDisabled('test')"
+          (click)="changeEnvironment('test')"
+          [title]="getEnvironmentTooltip('test')">
+          <span class="icon">🧪</span>
+          <span class="label">Test</span>
+        </button>
+        <button
+          class="btn btn-env"
+          [class.active]="settings.environment === 'prod'"
+          [disabled]="isEnvironmentDisabled('prod')"
+          (click)="changeEnvironment('prod')"
+          [title]="getEnvironmentTooltip('prod')">
+          <span class="icon">🚀</span>
+          <span class="label">Prod</span>
+        </button>
+      </div>
+    </div>
+
+    <!-- Trading Mode Toggle -->
+    <div class="control-group">
+      <label class="control-label">Trading Mode</label>
+      <div class="button-group">
+        <button
+          class="btn btn-mode"
+          [class.active]="settings.trading_mode === 'paper'"
+          [class.safe]="settings.trading_mode === 'paper'"
+          [disabled]="isTradingModeDisabled('paper')"
+          (click)="changeTradingMode('paper')"
+          [title]="getTradingModeTooltip('paper')">
+          <span class="icon">📄</span>
+          <span class="label">Paper</span>
+        </button>
+        <button
+          class="btn btn-mode"
+          [class.active]="settings.trading_mode === 'live'"
+          [class.danger]="settings.trading_mode === 'live'"
+          [disabled]="isTradingModeDisabled('live')"
+          (click)="changeTradingMode('live')"
+          [title]="getTradingModeTooltip('live')">
+          <span class="icon">💰</span>
+          <span class="label">Live</span>
+        </button>
+      </div>
+    </div>
+
+    <!-- Status Display -->
+    <div class="status-display">
+      <div class="status-item">
+        <span class="status-label">Database:</span>
+        <span class="badge" [class]="getEnvironmentBadgeClass(settings.environment)">
+          {{ settings.database }}
+        </span>
+      </div>
+      <div class="status-item">
+        <span class="status-label">API:</span>
+        <span class="badge" [class]="getTradingModeBadgeClass(settings.trading_mode)">
+          {{ settings.trading_api }}
+        </span>
+      </div>
+    </div>
+
+    <!-- Warning Banner (for live trading) -->
+    <div class="warning-banner" *ngIf="settings.warning">
+      <span class="warning-icon">⚠️</span>
+      <span class="warning-text">{{ settings.warning }}</span>
+    </div>
+
+    <!-- Loading Indicator -->
+    <div class="loading-indicator" *ngIf="loading">
+      <span class="spinner"></span>
+      <span>Switching...</span>
+    </div>
+
+    <!-- Error Message -->
+    <div class="error-message" *ngIf="error">
+      <span class="error-icon">❌</span>
+      <span>{{ error }}</span>
+    </div>
+  </div>
+</div>
+
+<!-- Loading State -->
+<div class="environment-controls loading" *ngIf="!settings && loading">
+  <div class="spinner"></div>
+  <span>Loading settings...</span>
+</div>

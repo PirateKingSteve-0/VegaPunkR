@@ -1,0 +1,67 @@
+.trades-container {
+  padding: 24px;
+
+  .header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 24px;
+
+    h1 {
+      margin: 0;
+      color: rgba(0, 0, 0, 0.87);
+    }
+
+    button {
+      gap: 8px;
+    }
+  }
+
+  .filters-card {
+    margin-bottom: 16px;
+
+    .filters {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+      gap: 16px;
+
+      mat-form-field {
+        width: 100%;
+      }
+    }
+  }
+
+  mat-card {
+    .empty-state {
+      text-align: center;
+      padding: 64px 24px;
+      color: rgba(0, 0, 0, 0.6);
+
+      mat-icon {
+        font-size: 64px;
+        width: 64px;
+        height: 64px;
+        margin-bottom: 16px;
+        opacity: 0.5;
+      }
+
+      p {
+        margin: 8px 0;
+      }
+
+      .subtitle {
+        font-size: 14px;
+        opacity: 0.7;
+      }
+    }
+
+    .trades-table {
+      width: 100%;
+
+      .side-chip {
+        min-height: 24px;
+        font-size: 12px;
+      }
+    }
+  }
+}

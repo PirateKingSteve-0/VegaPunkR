@@ -1,0 +1,156 @@
+<div class="strategy-form-container">
+  <div class="header">
+    <h1>{{ isEditMode ? 'Edit Strategy' : 'Create New Strategy' }}</h1>
+  </div>
+
+  @if (isLoading) {
+    <div class="loading-container">
+      <mat-spinner></mat-spinner>
+    </div>
+  } @else {
+    <mat-card class="form-card">
+      <form [formGroup]="strategyForm" (ngSubmit)="onSubmit()">
+        <!-- Basic Information -->
+        <div class="form-section">
+          <h2>Basic Information</h2>
+
+          <mat-form-field appearance="outline" class="full-width">
+            <mat-label>Strategy Name</mat-label>
+            <input matInput formControlName="name" placeholder="e.g., MACD Momentum Strategy">
+            <mat-icon matPrefix>psychology</mat-icon>
+            @if (strategyForm.get('name')?.hasError('required') && strategyForm.get('name')?.touched) {
+              <mat-error>Name is required</mat-error>
+            }
+            @if (strategyForm.get('name')?.hasError('minlength')) {
+              <mat-error>Name must be at least 3 characters</mat-error>
+            }
+          </mat-form-field>
+
+          <div class="form-row">
+            <mat-form-field appearance="outline">
+              <mat-label>Strategy Type</mat-label>
+              <mat-select formControlName="strategy_type">
+                @for (type of strategyTypes; track type) {
+                  <mat-option [value]="type">{{ type }}</mat-option>
+                }
+              </mat-select>
+            </mat-form-field>
+
+            <mat-form-field appearance="outline">
+              <mat-label>Timeframe</mat-label>
+              <mat-select formControlName="timeframe">
+                <mat-option value="1m">1 Minute</mat-option>
+                <mat-option value="5m">5 Minutes</mat-option>
+                <mat-option value="15m">15 Minutes</mat-option>
+                <mat-option value="1h">1 Hour</mat-option>
+                <mat-option value="4h">4 Hours</mat-option>
+                <mat-option value="1d">1 Day</mat-option>
+              </mat-select>
+            </mat-form-field>
+          </div>
+        </div>
+
+        <!-- Trading Parameters -->
+        <div class="form-section">
+          <h2>Trading Parameters</h2>
+
+          <mat-form-field appearance="outline" class="full-width">
+            <mat-label>Instruments/Symbols</mat-label>
+            <mat-chip-grid #chipGrid>
+              @for (instrument of instruments; track instrument) {
+                <mat-chip-row (removed)="removeInstrument(instrument)">
+                  {{ instrument }}
+                  <button matChipRemove>
+                    <mat-icon>cancel</mat-icon>
+                  </button>
+                </mat-chip-row>
+              }
+            </mat-chip-grid>
+            <input
+              placeholder="Add symbol (e.g., AAPL, TSLA)"
+              [matChipInputFor]="chipGrid"
+              [matChipInputSeparatorKeyCodes]="separatorKeysCodes"
+              (matChipInputTokenEnd)="addInstrument($event)">
+            <mat-hint>Press Enter or comma to add a symbol</mat-hint>
+          </mat-form-field>
+
+          <mat-form-field appearance="outline" class="full-width">
+            <mat-label>Max Positions</mat-label>
+            <input matInput type="number" formControlName="max_positions" step="1">
+            <mat-hint>Maximum number of concurrent positions</mat-hint>
+            @if (strategyForm.get('max_positions')?.hasError('min')) {
+              <mat-error>Minimum is 1</mat-error>
+            }
+          </mat-form-field>
+        </div>
+
+        <!-- Risk Management -->
+        <div class="form-section">
+          <h2>Risk Management</h2>
+
+          <div class="form-row">
+            <mat-form-field appearance="outline">
+              <mat-label>Stop Loss</mat-label>
+              <input matInput type="number" formControlName="stop_loss_percentage" step="0.1">
+              <span matSuffix>%</span>
+              @if (strategyForm.get('stop_loss_percentage')?.hasError('min')) {
+                <mat-error>Minimum is 0.1%</mat-error>
+              }
+              @if (strategyForm.get('stop_loss_percentage')?.hasError('max')) {
+                <mat-error>Maximum is 20%</mat-error>
+              }
+            </mat-form-field>
+
+            <mat-form-field appearance="outline">
+              <mat-label>Take Profit</mat-label>
+              <input matInput type="number" formControlName="take_profit_percentage" step="0.1">
+              <span matSuffix>%</span>
+              @if (strategyForm.get('take_profit_percentage')?.hasError('min')) {
+                <mat-error>Minimum is 0.1%</mat-error>
+              }
+              @if (strategyForm.get('take_profit_percentage')?.hasError('max')) {
+                <mat-error>Maximum is 50%</mat-error>
+              }
+            </mat-form-field>
+          </div>
+        </div>
+
+        <!-- Strategy Settings -->
+        <div class="form-section">
+          <h2>Strategy Settings</h2>
+
+          <div class="checkbox-row">
+            <mat-checkbox formControlName="is_paper_trading">
+              Paper Trading Mode
+            </mat-checkbox>
+            <mat-hint>Start in paper trading mode for safety (recommended)</mat-hint>
+          </div>
+
+          <div class="checkbox-row">
+            <mat-checkbox formControlName="is_active">
+              Activate Strategy
+            </mat-checkbox>
+            <mat-hint>Strategy will start executing trades when active</mat-hint>
+          </div>
+        </div>
+
+        <!-- Actions -->
+        <div class="form-actions">
+          <button mat-button type="button" (click)="cancel()">Cancel</button>
+          <button
+            mat-raised-button
+            color="primary"
+            type="submit"
+            [disabled]="isSaving || strategyForm.invalid">
+            @if (isSaving) {
+              <mat-spinner diameter="20"></mat-spinner>
+              <span>Saving...</span>
+            } @else {
+              <span>{{ isEditMode ? 'Update' : 'Create' }} Strategy</span>
+            }
+          </button>
+        </div>
+      </form>
+    </mat-card>
+  }
+</div>

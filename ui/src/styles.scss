@@ -1,0 +1,45 @@
+/* You can add global styles to this file, and also import other style files */
+
+// Import Angular Material theming
+@use '@angular/material' as mat;
+
+// Include the common styles for Angular Material
+@include mat.core();
+
+// Define custom theme colors
+$vegapunk-primary: mat.m2-define-palette(mat.$m2-indigo-palette, 700);
+$vegapunk-accent: mat.m2-define-palette(mat.$m2-pink-palette, A200);
+$vegapunk-warn: mat.m2-define-palette(mat.$m2-red-palette);
+
+// Create the theme object
+$vegapunk-theme: mat.m2-define-light-theme((
+  color: (
+    primary: $vegapunk-primary,
+    accent: $vegapunk-accent,
+    warn: $vegapunk-warn,
+  ),
+  typography: mat.m2-define-typography-config(
+    $font-family: 'Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif',
+  ),
+  density: 0,
+));
+
+// Include theme styles for core and each component
+@include mat.all-component-themes($vegapunk-theme);
+
+// Global styles
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+html, body {
+  height: 100%;
+  font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+}
+
+body {
+  margin: 0;
+  background-color: #fafafa;
+}

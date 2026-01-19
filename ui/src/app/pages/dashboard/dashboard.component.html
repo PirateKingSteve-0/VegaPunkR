@@ -1,0 +1,118 @@
+<div class="dashboard-container">
+  <!-- Toolbar -->
+  <mat-toolbar color="primary" class="dashboard-toolbar">
+    <button mat-icon-button (click)="toggleSidenav()">
+      <mat-icon>menu</mat-icon>
+    </button>
+    <span class="app-title">VegaPunkR</span>
+    <span class="spacer"></span>
+
+    <!-- User Menu -->
+    <button mat-icon-button [matMenuTriggerFor]="userMenu">
+      <mat-icon>account_circle</mat-icon>
+    </button>
+    <mat-menu #userMenu="matMenu">
+      @if (currentUser$ | async; as user) {
+        <div class="user-info" mat-menu-item disabled>
+          <div class="user-name">{{ user.username }}</div>
+          <div class="user-email">{{ user.email }}</div>
+        </div>
+        <mat-divider></mat-divider>
+      }
+      <button mat-menu-item (click)="logout()">
+        <mat-icon>logout</mat-icon>
+        <span>Logout</span>
+      </button>
+    </mat-menu>
+  </mat-toolbar>
+
+  <!-- Sidenav Container -->
+  <mat-sidenav-container class="dashboard-sidenav-container">
+    <!-- Sidenav -->
+    <mat-sidenav
+      #sidenav
+      mode="side"
+      [opened]="isSidenavOpen()"
+      class="dashboard-sidenav">
+      <mat-nav-list>
+        @for (item of menuItems; track item.route) {
+          <a mat-list-item [routerLink]="item.route" routerLinkActive="active-link">
+            <mat-icon matListItemIcon>{{ item.icon }}</mat-icon>
+            <span matListItemTitle>{{ item.label }}</span>
+          </a>
+        }
+      </mat-nav-list>
+
+      <!-- Environment & Trading Mode Selector at bottom -->
+      <div class="environment-selector">
+        <mat-divider></mat-divider>
+
+        <!-- Trading Mode Toggle (shown first) -->
+        <button mat-button [matMenuTriggerFor]="tradingMenu" class="trading-button"
+                [class.trading-paper]="environmentSettings()?.trading_mode === 'paper'"
+                [class.trading-live]="environmentSettings()?.trading_mode === 'live'"
+                [disabled]="loading()">
+          <mat-icon>{{ environmentSettings()?.trading_mode === 'live' ? 'attach_money' : 'description' }}</mat-icon>
+          <span class="trading-label">
+            <div class="trading-title">Trading</div>
+            <div class="trading-value">{{ getTradingModeDisplayName() }}</div>
+          </span>
+          <mat-icon class="dropdown-icon">arrow_drop_down</mat-icon>
+        </button>
+        <mat-menu #tradingMenu="matMenu">
+          <button mat-menu-item (click)="setTradingMode('paper')"
+                  [class.active]="environmentSettings()?.trading_mode === 'paper'">
+            <mat-icon>description</mat-icon>
+            <span>Paper Trading</span>
+          </button>
+          <button mat-menu-item (click)="setTradingMode('live')"
+                  [class.active]="environmentSettings()?.trading_mode === 'live'">
+            <mat-icon>attach_money</mat-icon>
+            <span>Live Trading ⚠️</span>
+          </button>
+        </mat-menu>
+
+        <!-- Environment Selector (only shown for paper trading) -->
+        @if (environmentSettings()?.trading_mode === 'paper') {
+          <button mat-button [matMenuTriggerFor]="envMenu" class="env-button"
+                  [class.env-dev]="environmentSettings()?.environment === 'dev'"
+                  [class.env-test]="environmentSettings()?.environment === 'test'"
+                  [disabled]="loading()">
+            <mat-icon>storage</mat-icon>
+            <span class="env-label">
+              <div class="env-title">Database</div>
+              <div class="env-value">{{ getEnvironmentDisplayName() }}</div>
+            </span>
+            <mat-icon class="dropdown-icon">arrow_drop_down</mat-icon>
+          </button>
+          <mat-menu #envMenu="matMenu">
+            <button mat-menu-item (click)="setEnvironment('dev')"
+                    [class.active]="environmentSettings()?.environment === 'dev'">
+              <mat-icon>code</mat-icon>
+              <span>Dev</span>
+            </button>
+            <button mat-menu-item (click)="setEnvironment('test')"
+                    [class.active]="environmentSettings()?.environment === 'test'">
+              <mat-icon>science</mat-icon>
+              <span>Test</span>
+            </button>
+          </mat-menu>
+        }
+
+        <!-- Warning for Live Trading -->
+        @if (environmentSettings()?.warning) {
+          <div class="warning-banner">
+            ⚠️ {{ environmentSettings()?.warning }}
+          </div>
+        }
+      </div>
+    </mat-sidenav>
+
+    <!-- Main Content -->
+    <mat-sidenav-content class="dashboard-content">
+      <div class="content-wrapper">
+        <router-outlet></router-outlet>
+      </div>
+    </mat-sidenav-content>
+  </mat-sidenav-container>
+</div>

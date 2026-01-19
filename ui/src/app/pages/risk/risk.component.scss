@@ -1,0 +1,215 @@
+.risk-container {
+  padding: 24px;
+
+  .header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 24px;
+
+    h1 {
+      margin: 0;
+      color: rgba(0, 0, 0, 0.87);
+    }
+
+    button {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+  }
+
+  .risk-metrics-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+    gap: 16px;
+    margin-bottom: 24px;
+
+    .risk-metric-card {
+      mat-card-content {
+        .metric-header {
+          display: flex;
+          align-items: center;
+          gap: 16px;
+          margin-bottom: 16px;
+
+          mat-icon {
+            font-size: 40px;
+            width: 40px;
+            height: 40px;
+          }
+
+          .metric-title {
+            flex: 1;
+
+            .label {
+              font-size: 14px;
+              color: rgba(0, 0, 0, 0.6);
+              margin-bottom: 4px;
+            }
+
+            .value {
+              font-size: 20px;
+              font-weight: 500;
+              color: rgba(0, 0, 0, 0.87);
+            }
+          }
+        }
+
+        mat-progress-bar {
+          height: 8px;
+          border-radius: 4px;
+        }
+      }
+    }
+  }
+
+  .risk-content {
+    display: grid;
+    grid-template-columns: 2fr 1fr;
+    gap: 24px;
+
+    @media (max-width: 1024px) {
+      grid-template-columns: 1fr;
+    }
+
+    .left-column, .right-column {
+      display: flex;
+      flex-direction: column;
+      gap: 24px;
+    }
+
+    .exposure-card {
+      mat-card-header {
+        margin-bottom: 16px;
+      }
+
+      .empty-state {
+        text-align: center;
+        padding: 48px 24px;
+        color: rgba(0, 0, 0, 0.6);
+
+        mat-icon {
+          font-size: 48px;
+          width: 48px;
+          height: 48px;
+          margin-bottom: 16px;
+          opacity: 0.5;
+        }
+
+        p {
+          margin: 0;
+        }
+      }
+
+      table {
+        width: 100%;
+      }
+    }
+
+    .correlation-card {
+      mat-card-header {
+        margin-bottom: 16px;
+      }
+
+      .chart-placeholder {
+        text-align: center;
+        padding: 48px 24px;
+        color: rgba(0, 0, 0, 0.6);
+
+        mat-icon {
+          font-size: 48px;
+          width: 48px;
+          height: 48px;
+          margin-bottom: 16px;
+          opacity: 0.5;
+        }
+
+        p {
+          margin: 0;
+        }
+      }
+    }
+
+    .alerts-card {
+      mat-card-header {
+        margin-bottom: 16px;
+      }
+
+      .alerts-list {
+        .alert-item {
+          display: flex;
+          gap: 12px;
+          padding: 12px;
+          border-radius: 4px;
+          margin-bottom: 12px;
+          background-color: rgba(0, 0, 0, 0.03);
+
+          &.info {
+            background-color: rgba(33, 150, 243, 0.1);
+          }
+
+          &.warning {
+            background-color: rgba(255, 152, 0, 0.1);
+          }
+
+          &.error {
+            background-color: rgba(244, 67, 54, 0.1);
+          }
+
+          .alert-icon {
+            mat-icon {
+              font-size: 24px;
+              width: 24px;
+              height: 24px;
+            }
+          }
+
+          .alert-content {
+            flex: 1;
+
+            .alert-message {
+              font-size: 14px;
+              color: rgba(0, 0, 0, 0.87);
+              margin-bottom: 4px;
+            }
+
+            .alert-time {
+              font-size: 12px;
+              color: rgba(0, 0, 0, 0.6);
+            }
+          }
+        }
+      }
+    }
+
+    .limits-card {
+      mat-card-header {
+        margin-bottom: 16px;
+      }
+
+      .limit-item {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        padding: 12px 0;
+        border-bottom: 1px solid rgba(0, 0, 0, 0.12);
+
+        &:last-child {
+          border-bottom: none;
+        }
+
+        .limit-label {
+          font-size: 14px;
+          color: rgba(0, 0, 0, 0.6);
+        }
+
+        .limit-value {
+          font-size: 16px;
+          font-weight: 500;
+          color: rgba(0, 0, 0, 0.87);
+        }
+      }
+    }
+  }
+}

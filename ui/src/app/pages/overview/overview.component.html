@@ -1,0 +1,48 @@
+<div class="overview-container">
+  <div class="header">
+    <h1>Dashboard Overview</h1>
+    <button mat-raised-button color="primary" (click)="refresh()" [disabled]="loading()">
+      <mat-icon>refresh</mat-icon>
+      Refresh
+    </button>
+  </div>
+
+  <div *ngIf="error()" class="error-message">
+    <mat-icon>error</mat-icon>
+    {{ error() }}
+  </div>
+
+  <div class="stats-grid">
+    <mat-card *ngFor="let stat of stats; let i = index" class="stat-card">
+      <mat-card-content>
+        <div class="stat-content">
+          <mat-icon [color]="i === 3 ? pnlColor() : stat.color" class="stat-icon">{{ stat.icon }}</mat-icon>
+          <div class="stat-info">
+            <div class="stat-label">{{ stat.label }}</div>
+            <div class="stat-value">{{ stat.value() }}</div>
+          </div>
+        </div>
+      </mat-card-content>
+    </mat-card>
+  </div>
+
+  <div class="charts-section">
+    <mat-card>
+      <mat-card-header>
+        <mat-card-title>Portfolio Performance</mat-card-title>
+      </mat-card-header>
+      <mat-card-content>
+        <p class="placeholder">Chart visualization coming soon...</p>
+      </mat-card-content>
+    </mat-card>
+
+    <mat-card>
+      <mat-card-header>
+        <mat-card-title>Recent Activity</mat-card-title>
+      </mat-card-header>
+      <mat-card-content>
+        <p class="placeholder">Recent trades and events will appear here...</p>
+      </mat-card-content>
+    </mat-card>
+  </div>
+</div>

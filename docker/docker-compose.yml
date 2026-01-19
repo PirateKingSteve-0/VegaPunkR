@@ -1,0 +1,60 @@
+services:
+  # Development Database (persistent, for feature development)
+  timescaledb_dev:
+    image: timescale/timescaledb:latest-pg16
+    container_name: vegapunk_db_dev
+    environment:
+      POSTGRES_USER: user
+      POSTGRES_PASSWORD: pass
+      POSTGRES_DB: vegapunk_dev
+    ports:
+      - "5432:5432"
+    volumes:
+      - timescale_data_dev:/var/lib/postgresql/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U user -d vegapunk_dev"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Test Database (in-memory, for strategy testing and validation)
+  timescaledb_test:
+    image: timescale/timescaledb:latest-pg16
+    container_name: vegapunk_db_test
+    environment:
+      POSTGRES_USER: user
+      POSTGRES_PASSWORD: pass
+      POSTGRES_DB: vegapunk_test
+    ports:
+      - "5433:5432"
+    tmpfs:
+      - /var/lib/postgresql/data  # In-memory storage for fast tests
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U user -d vegapunk_test"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+
+  # Production Database (persistent, for live trading)
+  timescaledb_prod:
+    image: timescale/timescaledb:latest-pg16
+    container_name: vegapunk_db_prod
+    environment:
+      POSTGRES_USER: user
+      POSTGRES_PASSWORD: pass
+      POSTGRES_DB: vegapunk_prod
+    ports:
+      - "5434:5432"
+    volumes:
+      - timescale_data_prod:/var/lib/postgresql/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U user -d vegapunk_prod"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  timescale_data_dev:
+  timescale_data_prod:

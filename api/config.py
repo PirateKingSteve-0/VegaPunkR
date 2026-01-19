@@ -1,0 +1,79 @@
+"""
+Application configuration settings.
+"""
+import os
+from enum import Enum
+from pydantic_settings import BaseSettings
+from dotenv import load_dotenv
+
+load_dotenv()
+
+
+class Environment(str, Enum):
+    """Environment types for database selection."""
+    DEV = "dev"
+    TEST = "test"
+    PROD = "prod"
+
+
+class TradingMode(str, Enum):
+    """Trading mode selection."""
+    PAPER = "paper"
+    LIVE = "live"
+
+
+class Settings(BaseSettings):
+    """Application settings loaded from environment variables."""
+
+    # API Settings
+    APP_NAME: str = "VegaPunkR Trading API"
+    APP_VERSION: str = "1.0.0"
+    API_V1_PREFIX: str = "/api/v1"
+    DEBUG: bool = True
+
+    # Security - JWT token signing
+    SECRET_KEY: str = os.getenv("SECRET_KEY", "")
+    ALGORITHM: str = "HS256"
+    ACCESS_TOKEN_EXPIRE_MINUTES: int = 60 * 24  # 24 hours
+
+    # Database URLs for all environments
+    DATABASE_DEV_URL: str = os.getenv("DATABASE_DEV_URL", "postgresql://user:pass@localhost:5432/vegapunk_dev")
+    DATABASE_TEST_URL: str = os.getenv("DATABASE_TEST_URL", "postgresql://user:pass@localhost:5433/vegapunk_test")
+    DATABASE_PROD_URL: str = os.getenv("DATABASE_PROD_URL", "postgresql://user:pass@localhost:5434/vegapunk_prod")
+
+    # Legacy (for backward compatibility)
+    DATABASE_URL: str = os.getenv("DATABASE_URL", "postgresql://user:pass@localhost:5432/vegapunk_dev")
+
+    def get_database_url(self, environment: Environment) -> str:
+        """Get database URL for specified environment."""
+        if environment == Environment.DEV:
+            return self.DATABASE_DEV_URL
+        elif environment == Environment.TEST:
+            return self.DATABASE_TEST_URL
+        elif environment == Environment.PROD:
+            return self.DATABASE_PROD_URL
+        else:
+            return self.DATABASE_DEV_URL
+
+    # Alpaca API Keys
+    ALPACA_PAPER_API_KEY: str = os.getenv("ALPACA_PAPER_API_KEY", "")
+    ALPACA_PAPER_SECRET_KEY: str = os.getenv("ALPACA_PAPER_SECRET_KEY", "")
+    ALPACA_LIVE_API_KEY: str = os.getenv("ALPACA_LIVE_API_KEY_ID", "")
+    ALPACA_LIVE_SECRET_KEY: str = os.getenv("ALPACA_LIVE_API_SECRET_KEY", "")
+
+    # Schwab API Keys
+    SCHWAB_APP_KEY: str = os.getenv("APP_KEY", "")
+    SCHWAB_APP_SECRET: str = os.getenv("APP_SECRET", "")
+    SCHWAB_CALLBACK_URL: str = os.getenv("CALLBACK_URL", "https://127.0.0.1:8182")
+    SCHWAB_TOKEN_PATH: str = os.getenv("TOKEN_PATH", "token.json")
+
+    # Discord Webhooks
+    DISCORD_WEBHOOK_URL: str = os.getenv("DISCORD_WEBHOOK_URL", "")
+    DISCORD_WEBHOOK_URL_DEV: str = os.getenv("DISCORD_WEBHOOK_URL_DEV", "")
+
+    class Config:
+        env_file = ".env"
+        case_sensitive = True
+
+
+settings = Settings()

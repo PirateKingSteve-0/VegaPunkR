@@ -1,0 +1,38 @@
+# Database
+sqlalchemy>=2.0.0
+alembic>=1.12.0
+psycopg2-binary>=2.9.0  # PostgreSQL adapter
+
+# Environment
+python-dotenv>=1.0.0
+
+# Security
+bcrypt>=4.0.0
+
+# Testing
+pytest>=7.4.0
+pytest-cov>=4.1.0
+
+# API
+fastapi>=0.104.0
+uvicorn[standard]>=0.24.0
+pydantic[email]>=2.0.0
+pydantic-settings>=2.0.0
+email-validator>=2.0.0
+python-jose[cryptography]>=3.3.0  # JWT tokens
+passlib[bcrypt]>=1.7.4  # Password hashing
+python-multipart>=0.0.6  # Form data support
+
+# Brokerage APIs
+schwab-py>=1.0.0  # Schwab API for account info and execution
+
+# Market Data & Websockets
+pytz>=2023.3  # Timezone handling for market hours
+websockets>=12.0  # Websocket client for real-time data streams
+msgpack>=1.0.7  # Message serialization for Alpaca websockets
+numpy>=1.24.0  # Required by Alpaca SDK for data models
+pandas>=2.0.0  # Data analysis and time-series handling
+requests>=2.31.0  # HTTP library for REST API calls
+
+# Background Jobs & Scheduling
+APScheduler>=3.10.0  # Background job scheduler for strategy execution

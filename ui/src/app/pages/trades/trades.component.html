@@ -1,0 +1,97 @@
+<div class="trades-container">
+  <div class="header">
+    <h1>Trade History</h1>
+    <button mat-raised-button color="primary">
+      <mat-icon>file_download</mat-icon>
+      Export
+    </button>
+  </div>
+
+  <mat-card class="filters-card">
+    <mat-card-content>
+      <div class="filters">
+        <mat-form-field appearance="outline">
+          <mat-label>Symbol</mat-label>
+          <input matInput placeholder="Filter by symbol">
+        </mat-form-field>
+
+        <mat-form-field appearance="outline">
+          <mat-label>Start Date</mat-label>
+          <input matInput [matDatepicker]="startPicker">
+          <mat-datepicker-toggle matIconSuffix [for]="startPicker"></mat-datepicker-toggle>
+          <mat-datepicker #startPicker></mat-datepicker>
+        </mat-form-field>
+
+        <mat-form-field appearance="outline">
+          <mat-label>End Date</mat-label>
+          <input matInput [matDatepicker]="endPicker">
+          <mat-datepicker-toggle matIconSuffix [for]="endPicker"></mat-datepicker-toggle>
+          <mat-datepicker #endPicker></mat-datepicker>
+        </mat-form-field>
+      </div>
+    </mat-card-content>
+  </mat-card>
+
+  <mat-card>
+    <mat-card-content>
+      <div *ngIf="trades.length === 0" class="empty-state">
+        <mat-icon>swap_horiz</mat-icon>
+        <p>No trades yet</p>
+        <p class="subtitle">Your trade history will appear here</p>
+      </div>
+
+      <table mat-table [dataSource]="trades" *ngIf="trades.length > 0" class="trades-table">
+        <ng-container matColumnDef="timestamp">
+          <th mat-header-cell *matHeaderCellDef>Time</th>
+          <td mat-cell *matCellDef="let trade">{{ trade.timestamp | date:'short' }}</td>
+        </ng-container>
+
+        <ng-container matColumnDef="symbol">
+          <th mat-header-cell *matHeaderCellDef>Symbol</th>
+          <td mat-cell *matCellDef="let trade">{{ trade.symbol }}</td>
+        </ng-container>
+
+        <ng-container matColumnDef="side">
+          <th mat-header-cell *matHeaderCellDef>Side</th>
+          <td mat-cell *matCellDef="let trade">
+            <mat-chip [color]="trade.side === 'BUY' ? 'primary' : 'warn'" class="side-chip">
+              {{ trade.side }}
+            </mat-chip>
+          </td>
+        </ng-container>
+
+        <ng-container matColumnDef="type">
+          <th mat-header-cell *matHeaderCellDef>Type</th>
+          <td mat-cell *matCellDef="let trade">{{ trade.type }}</td>
+        </ng-container>
+
+        <ng-container matColumnDef="quantity">
+          <th mat-header-cell *matHeaderCellDef>Quantity</th>
+          <td mat-cell *matCellDef="let trade">{{ trade.quantity }}</td>
+        </ng-container>
+
+        <ng-container matColumnDef="price">
+          <th mat-header-cell *matHeaderCellDef>Price</th>
+          <td mat-cell *matCellDef="let trade">{{ trade.price | currency }}</td>
+        </ng-container>
+
+        <ng-container matColumnDef="total">
+          <th mat-header-cell *matHeaderCellDef>Total</th>
+          <td mat-cell *matCellDef="let trade">{{ trade.total | currency }}</td>
+        </ng-container>
+
+        <ng-container matColumnDef="status">
+          <th mat-header-cell *matHeaderCellDef>Status</th>
+          <td mat-cell *matCellDef="let trade">
+            <mat-chip [color]="trade.status === 'FILLED' ? 'accent' : 'primary'">
+              {{ trade.status }}
+            </mat-chip>
+          </td>
+        </ng-container>
+
+        <tr mat-header-row *matHeaderRowDef="displayedColumns"></tr>
+        <tr mat-row *matRowDef="let row; columns: displayedColumns;"></tr>
+      </table>
+    </mat-card-content>
+  </mat-card>
+</div>
