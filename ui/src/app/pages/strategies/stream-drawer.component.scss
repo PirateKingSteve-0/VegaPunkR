@@ -1,0 +1,162 @@
+.stream-drawer {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  background: #fafafa;
+
+  .drawer-header {
+    padding: 16px;
+
+    .header-top {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 8px;
+
+      h3 {
+        margin: 0;
+        font-size: 16px;
+        font-weight: 600;
+        color: #333;
+      }
+
+      .status-dot {
+        width: 10px;
+        height: 10px;
+        border-radius: 50%;
+        transition: background-color 0.3s ease;
+        flex-shrink: 0;
+      }
+    }
+
+    .strategy-info {
+      display: flex;
+      flex-direction: column;
+      gap: 2px;
+
+      .strategy-name {
+        font-size: 13px;
+        font-weight: 500;
+        color: #555;
+      }
+
+      .symbols {
+        font-size: 11px;
+        color: #888;
+        font-family: 'Roboto Mono', monospace;
+        padding-top: 10px;
+      }
+    }
+  }
+
+  .drawer-controls {
+    padding: 10px 16px;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex-wrap: wrap;
+
+    .filter-toggles {
+      font-size: 12px;
+    }
+  }
+
+  .event-feed {
+    flex: 1;
+    overflow-y: auto;
+    padding: 6px 0;
+
+    .empty-feed {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      height: 200px;
+      color: #bbb;
+
+      mat-icon {
+        font-size: 40px;
+        width: 40px;
+        height: 40px;
+        margin-bottom: 8px;
+      }
+
+      p {
+        margin: 0;
+        font-size: 13px;
+      }
+    }
+
+    .event-row {
+      display: flex;
+      align-items: baseline;
+      gap: 8px;
+      padding: 3px 14px;
+      border-left: 3px solid transparent;
+      font-family: 'Roboto Mono', monospace;
+      font-size: 12px;
+      line-height: 1.6;
+
+      &:hover {
+        background: rgba(0, 0, 0, 0.03);
+      }
+
+      &.event-quote {
+        border-left-color: #2196f3;
+
+        .event-badge {
+          color: #2196f3;
+        }
+      }
+
+      &.event-trade {
+        border-left-color: #4caf50;
+
+        .event-badge {
+          color: #4caf50;
+        }
+      }
+
+      .event-badge {
+        font-size: 9px;
+        font-weight: 700;
+        text-transform: uppercase;
+        width: 36px;
+        flex-shrink: 0;
+        letter-spacing: 0.5px;
+      }
+
+      .event-symbol {
+        font-weight: 600;
+        color: #333;
+        width: 100px;
+        flex-shrink: 0;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+
+      .event-data {
+        flex: 1;
+        display: flex;
+        gap: 14px;
+        color: #555;
+
+        strong {
+          color: #111;
+          font-weight: 600;
+        }
+
+        .muted {
+          color: #aaa;
+        }
+      }
+
+      .event-time {
+        color: #bbb;
+        font-size: 10px;
+        flex-shrink: 0;
+      }
+    }
+  }
+}

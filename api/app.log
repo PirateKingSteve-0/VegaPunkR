@@ -1,0 +1,51 @@
+2026-04-24 09:45:08,262 INFO engine.trading_client_manager: Trading Client Manager initialized
+INFO:     Will watch for changes in these directories: ['/home/gorillapops/Github/VegaPunkR/api']
+INFO:     Uvicorn running on http://0.0.0.0:8000 (Press CTRL+C to quit)
+INFO:     Started reloader process [137507] using WatchFiles
+2026-04-24 09:45:09,274 INFO engine.trading_client_manager: Trading Client Manager initialized
+2026-04-24 09:45:09,374 INFO watchfiles.main: 1 change detected
+2026-04-24 09:45:09,725 INFO watchfiles.main: 1 change detected
+INFO:     Started server process [137569]
+INFO:     Waiting for application startup.
+2026-04-24 09:45:09,877 INFO engine.tradier_stream_manager: TradierStreamManager started
+2026-04-24 09:45:09,911 INFO engine.stream_driven_worker: Stream task started for strategy 2
+2026-04-24 09:45:09,911 INFO engine.stream_driven_worker: StreamDrivenWorker started — 1 active strategies
+2026-04-24 09:45:09,911 INFO app: VegaPunkR startup complete
+INFO:     Application startup complete.
+2026-04-24 09:45:10,075 INFO watchfiles.main: 1 change detected
+2026-04-24 09:45:10,351 INFO engine.tradier_stream_manager: Tradier stream session acquired: 47831304-b770-4501-b444-146ed11ff2ee
+2026-04-24 09:45:10,426 INFO watchfiles.main: 1 change detected
+2026-04-24 09:45:10,776 INFO watchfiles.main: 1 change detected
+2026-04-24 09:45:11,126 INFO watchfiles.main: 1 change detected
+2026-04-24 09:45:11,442 WARNING engine.stream_driven_worker: No suitable contracts found for TSLA on 2026-04-24
+2026-04-24 09:45:11,442 INFO engine.stream_router: Strategy 2 registered for symbols: ['TSLA']
+2026-04-24 09:45:11,442 INFO engine.tradier_stream_manager: Stream subscription sent: ['TSLA']
+2026-04-24 09:45:11,477 INFO watchfiles.main: 1 change detected
+2026-04-24 09:45:11,827 INFO watchfiles.main: 1 change detected
+2026-04-24 09:45:12,178 INFO watchfiles.main: 1 change detected
+2026-04-24 09:45:12,528 INFO watchfiles.main: 1 change detected
+2026-04-24 09:45:12,878 INFO watchfiles.main: 1 change detected
+2026-04-24 09:45:13,229 INFO watchfiles.main: 1 change detected
+2026-04-24 09:45:13,579 INFO watchfiles.main: 1 change detected
+2026-04-24 09:45:13,594 WARNING engine.stream_driven_worker: No suitable contracts found for TSLA on 2026-04-24
+2026-04-24 09:45:13,929 INFO watchfiles.main: 1 change detected
+2026-04-24 09:45:14,280 INFO watchfiles.main: 1 change detected
+2026-04-24 09:45:14,630 INFO watchfiles.main: 1 change detected
+2026-04-24 09:45:14,981 INFO watchfiles.main: 1 change detected
+2026-04-24 09:45:15,331 INFO watchfiles.main: 1 change detected
+2026-04-24 09:45:15,682 INFO watchfiles.main: 1 change detected
+2026-04-24 09:45:16,032 INFO watchfiles.main: 1 change detected
+2026-04-24 09:45:16,382 INFO watchfiles.main: 1 change detected
+2026-04-24 09:45:16,733 INFO watchfiles.main: 1 change detected
+2026-04-24 09:45:17,083 INFO watchfiles.main: 1 change detected
+2026-04-24 09:45:17,433 INFO watchfiles.main: 1 change detected
+2026-04-24 09:45:17,784 INFO watchfiles.main: 1 change detected
+2026-04-24 09:45:18,134 INFO watchfiles.main: 1 change detected
+2026-04-24 09:45:18,485 INFO watchfiles.main: 1 change detected
+2026-04-24 09:45:18,835 INFO watchfiles.main: 1 change detected
+2026-04-24 09:45:19,185 INFO watchfiles.main: 1 change detected
+2026-04-24 09:45:19,536 INFO watchfiles.main: 1 change detected
+2026-04-24 09:45:19,886 INFO watchfiles.main: 1 change detected
+2026-04-24 09:45:20,237 INFO watchfiles.main: 1 change detected
+2026-04-24 09:45:20,587 INFO watchfiles.main: 1 change detected
+2026-04-24 09:45:20,937 INFO watchfiles.main: 1 change detected

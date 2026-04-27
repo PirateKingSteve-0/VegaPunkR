@@ -21,6 +21,7 @@ from sqlalchemy.orm import Session
 
 from models import User, Strategy
 from config import TradingMode
+from utils.market_hours import is_market_open, get_market_status
 
 logger = logging.getLogger(__name__)
 
@@ -179,39 +180,14 @@ class LiveTradingSafeguards:
     @staticmethod
     def check_market_hours() -> Tuple[bool, str]:
         """
-        Check if market is currently open
+        Check if market is currently open (DST-aware, holiday-aware).
 
         Returns:
             Tuple[bool, str]: (is_open, message)
         """
-        now = datetime.utcnow()
-
-        # US market hours: 9:30 AM - 4:00 PM ET
-        # Convert to UTC (approximate - doesn't handle DST perfectly)
-        # During standard time: ET = UTC - 5
-        # During daylight time: ET = UTC - 4
-
-        # Simplified: market hours in UTC (adjust based on DST)
-        # Standard time: 14:30 - 21:00 UTC
-        # Daylight time: 13:30 - 20:00 UTC
-
-        # For now, use standard time approximation
-        market_open_utc = time(14, 30)
-        market_close_utc = time(21, 0)
-
-        current_time = now.time()
-
-        # Check if weekend
-        if now.weekday() >= 5:  # Saturday = 5, Sunday = 6
-            return (False, "Market is closed (weekend)")
-
-        # Check if within trading hours
-        if current_time < market_open_utc:
-            return (False, f"Market opens at {market_open_utc} UTC")
-
-        if current_time > market_close_utc:
-            return (False, f"Market closed at {market_close_utc} UTC")
-
+        if not is_market_open():
+            status = get_market_status()
+            return (False, status.get('message', 'Market is closed'))
         return (True, "Market is open")
 
     @staticmethod

@@ -14,6 +14,7 @@ from sqlalchemy.orm import Session
 from models import User, Strategy, Trade, Position
 from engine.trading_client_manager import TradingClientManager
 from engine.signal_generator import Signal
+from engine.event_logger import log_event
 
 logger = logging.getLogger(__name__)
 
@@ -56,7 +57,9 @@ class OrderManager:
         user: User,
         strategy: Strategy,
         signal: Signal,
-        qty: int
+        qty: int,
+        option_symbol: Optional[str] = None,
+        estimated_price: Optional[float] = None,
     ) -> OrderResult:
         """
         Execute a trading signal by placing an order
@@ -88,7 +91,8 @@ class OrderManager:
                 symbol=symbol,
                 qty=qty,
                 side=side,
-                order_type=order_type
+                order_type=order_type,
+                option_symbol=option_symbol,
             )
 
             if not order_response:
@@ -99,7 +103,7 @@ class OrderManager:
 
             # Extract order details
             order_id = self._extract_order_id(order_response)
-            filled_price = self._extract_filled_price(order_response, signal.price)
+            filled_price = self._extract_filled_price(order_response, estimated_price or signal.price)
             filled_qty = self._extract_filled_qty(order_response, qty)
 
             # Record trade in database
@@ -112,6 +116,22 @@ class OrderManager:
                 order_id=order_id
             )
 
+            log_event(
+                db=self.db,
+                user_id=user.id,
+                event_type="ORDER_PLACED",
+                title=f"{side.upper()} {filled_qty}x {symbol}",
+                symbol=symbol,
+                strategy_id=strategy.id,
+                severity="info",
+                event_data={
+                    "order_id": order_id,
+                    "price": filled_price,
+                    "qty": filled_qty,
+                    "signal_type": signal.signal_type,
+                },
+            )
+
             # Update or create position
             if signal.signal_type == 'entry':
                 self._update_position_entry(
@@ -120,7 +140,8 @@ class OrderManager:
                     symbol=symbol,
                     qty=filled_qty,
                     price=filled_price,
-                    trade=trade
+                    trade=trade,
+                    option_symbol=option_symbol,
                 )
             elif signal.signal_type == 'exit':
                 self._update_position_exit(
@@ -147,6 +168,16 @@ class OrderManager:
 
         except Exception as e:
             logger.error(f"Error executing signal: {str(e)}", exc_info=True)
+            log_event(
+                db=self.db,
+                user_id=user.id,
+                event_type="ORDER_FAILED",
+                title=f"Order failed: {side.upper()} {qty}x {symbol}",
+                detail=str(e),
+                symbol=symbol,
+                strategy_id=strategy.id,
+                severity="error",
+            )
             return OrderResult(
                 success=False,
                 message=f"Order execution failed: {str(e)}"
@@ -154,7 +185,11 @@ class OrderManager:
 
     def _extract_order_id(self, order_response: Dict) -> Optional[str]:
         """Extract order ID from API response"""
-        # Alpaca format
+        # Tradier format: { "id": 123456, "status": "ok" }
+        if isinstance(order_response, dict) and 'id' in order_response:
+            return str(order_response['id'])
+
+        # Alpaca SDK object
         if hasattr(order_response, 'id'):
             return str(order_response.id)
 
@@ -162,7 +197,6 @@ class OrderManager:
         if isinstance(order_response, dict) and 'orderId' in order_response:
             return str(order_response['orderId'])
 
-        # Fallback
         return str(order_response) if order_response else None
 
     def _extract_filled_price(
@@ -170,8 +204,16 @@ class OrderManager:
         order_response: Dict,
         estimated_price: Optional[float]
     ) -> float:
-        """Extract filled price from API response"""
-        # Alpaca format
+        """Extract filled price from API response.
+
+        Tradier market orders return no fill price immediately — fall back to
+        the mid-price estimate from market data so P&L tracking is reasonable.
+        """
+        # Tradier: avg_fill_price populated once filled
+        if isinstance(order_response, dict) and order_response.get('avg_fill_price'):
+            return float(order_response['avg_fill_price'])
+
+        # Alpaca SDK object
         if hasattr(order_response, 'filled_avg_price') and order_response.filled_avg_price:
             return float(order_response.filled_avg_price)
 
@@ -179,12 +221,16 @@ class OrderManager:
         if isinstance(order_response, dict) and 'price' in order_response:
             return float(order_response['price'])
 
-        # Fallback to estimated price
+        # Fallback to bid/ask mid estimate
         return estimated_price or 0.0
 
     def _extract_filled_qty(self, order_response: Dict, requested_qty: int) -> int:
         """Extract filled quantity from API response"""
-        # Alpaca format
+        # Tradier: exec_quantity field
+        if isinstance(order_response, dict) and order_response.get('exec_quantity'):
+            return int(float(order_response['exec_quantity']))
+
+        # Alpaca SDK object
         if hasattr(order_response, 'filled_qty') and order_response.filled_qty:
             return int(order_response.filled_qty)
 
@@ -192,7 +238,7 @@ class OrderManager:
         if isinstance(order_response, dict) and 'quantity' in order_response:
             return int(order_response['quantity'])
 
-        # Fallback to requested quantity (assume full fill)
+        # Assume full fill for market orders
         return requested_qty
 
     def _create_trade_record(
@@ -239,7 +285,8 @@ class OrderManager:
         symbol: str,
         qty: int,
         price: float,
-        trade: Trade
+        trade: Trade,
+        option_symbol: Optional[str] = None,
     ):
         """Update or create position for entry trade.
 
@@ -253,6 +300,8 @@ class OrderManager:
             Position.symbol == symbol
         ).with_for_update().first()  # Lock the row
 
+        is_new = position is None
+
         if position:
             # Add to existing position
             total_qty = position.qty + qty
@@ -263,6 +312,9 @@ class OrderManager:
             position.avg_entry_price = new_avg_price
             position.current_price = price
             position.unrealized_pnl = (price - new_avg_price) * total_qty
+            # Backfill option_symbol if it was missing (e.g. position created before this fix)
+            if option_symbol and not position.option_symbol:
+                position.option_symbol = option_symbol
 
             logger.info(
                 f"Updated position: {symbol} qty={total_qty}, avg_price=${new_avg_price:.2f}"
@@ -273,6 +325,7 @@ class OrderManager:
                 user_id=user.id,
                 strategy_id=strategy.id,
                 symbol=symbol,
+                option_symbol=option_symbol,
                 qty=qty,
                 avg_entry_price=price,
                 current_price=price,
@@ -288,6 +341,18 @@ class OrderManager:
 
         self.db.commit()
         self.db.refresh(position)
+
+        if is_new:
+            log_event(
+                db=self.db,
+                user_id=user.id,
+                event_type="POSITION_OPENED",
+                title=f"Opened {symbol}",
+                symbol=symbol,
+                strategy_id=strategy.id,
+                severity="success",
+                event_data={"qty": qty, "price": price},
+            )
 
         return position
 
@@ -329,10 +394,13 @@ class OrderManager:
         position.qty -= qty
         position.current_price = price
 
+        fully_closed = False
+
         # If position fully closed, set unrealized P&L to 0
         if position.qty <= 0:
             position.qty = 0
             position.unrealized_pnl = 0.0
+            fully_closed = True
             logger.info(f"Position fully closed: {symbol}, P&L=${exit_pnl:.2f}")
         else:
             # Recalculate unrealized P&L for remaining position
@@ -345,6 +413,18 @@ class OrderManager:
         self.db.refresh(position)
         self.db.refresh(trade)
 
+        if fully_closed:
+            log_event(
+                db=self.db,
+                user_id=user.id,
+                event_type="POSITION_CLOSED",
+                title=f"Closed {symbol}  P&L {exit_pnl:+.2f}",
+                symbol=symbol,
+                strategy_id=strategy.id,
+                severity="success" if exit_pnl >= 0 else "warning",
+                event_data={"qty": qty, "exit_price": price, "pnl": exit_pnl},
+            )
+
         return position
 
     async def close_position(
@@ -352,7 +432,8 @@ class OrderManager:
         user: User,
         strategy: Strategy,
         position: Position,
-        reason: str = "Manual close"
+        reason: str = "Manual close",
+        option_symbol: Optional[str] = None,
     ) -> OrderResult:
         """
         Close an entire position
@@ -385,7 +466,8 @@ class OrderManager:
                 symbol=position.symbol,
                 qty=position.qty,
                 side=side,
-                order_type='market'
+                order_type='market',
+                option_symbol=option_symbol,
             )
 
             if not order_response:
@@ -439,6 +521,18 @@ class OrderManager:
                 f"Price=${filled_price:.2f}"
             )
 
+            log_event(
+                db=self.db,
+                user_id=user.id,
+                event_type="POSITION_CLOSED",
+                title=f"Closed {position.symbol}  P&L {pnl:+.2f}",
+                detail=reason,
+                symbol=position.symbol,
+                strategy_id=strategy.id,
+                severity="success" if pnl >= 0 else "warning",
+                event_data={"qty": filled_qty, "exit_price": filled_price, "pnl": pnl, "order_id": order_id},
+            )
+
             return OrderResult(
                 success=True,
                 message=f"Position closed: {position.symbol} P&L=${pnl:.2f}",
@@ -450,6 +544,16 @@ class OrderManager:
 
         except Exception as e:
             logger.error(f"Error closing position: {str(e)}", exc_info=True)
+            log_event(
+                db=self.db,
+                user_id=user.id,
+                event_type="ORDER_FAILED",
+                title=f"Failed to close {position.symbol}",
+                detail=str(e),
+                symbol=position.symbol,
+                strategy_id=strategy.id,
+                severity="error",
+            )
             return OrderResult(
                 success=False,
                 message=f"Failed to close position: {str(e)}"

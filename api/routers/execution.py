@@ -8,21 +8,23 @@ from typing import Dict
 from database import get_db
 from auth import get_current_user
 from models import User, Strategy
-from engine.strategy_executor import StrategyExecutor
+from engine.stream_driven_worker import get_stream_driven_worker
+from engine.tradier_stream_manager import get_stream_manager
 
 router = APIRouter(prefix="/execution", tags=["execution"])
 
-# Global strategy executor instance (singleton pattern)
-# In production, this would be managed by the background worker
-_executor_instance = None
 
-
-def get_executor(db: Session = Depends(get_db)) -> StrategyExecutor:
-    """Get or create strategy executor instance"""
-    global _executor_instance
-    if _executor_instance is None:
-        _executor_instance = StrategyExecutor(db)
-    return _executor_instance
+def _get_strategy_for_user(strategy_id: int, user: User, db: Session) -> Strategy:
+    strategy = db.query(Strategy).filter(
+        Strategy.id == strategy_id,
+        Strategy.user_id == user.id
+    ).first()
+    if not strategy:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Strategy {strategy_id} not found"
+        )
+    return strategy
 
 
 @router.post("/strategies/{strategy_id}/start")
@@ -30,65 +32,34 @@ async def start_strategy(
     strategy_id: int,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
-    executor: StrategyExecutor = Depends(get_executor)
 ):
     """
-    Start executing a strategy
-
-    This enables the strategy for automated execution by the background worker.
-    The strategy must be active and belong to the current user.
-
-    Returns:
-        - success: Whether the operation succeeded
-        - message: Status message
-        - started_at: Timestamp when strategy execution started
+    Start the stream-driven execution task for a strategy.
+    The strategy must already be marked active (is_active=True).
     """
-    # Verify strategy exists and belongs to user
-    strategy = db.query(Strategy).filter(
-        Strategy.id == strategy_id,
-        Strategy.user_id == current_user.id
-    ).first()
+    strategy = _get_strategy_for_user(strategy_id, current_user, db)
 
-    if not strategy:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Strategy {strategy_id} not found"
-        )
-
-    # Verify strategy is active
     if not strategy.is_active:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Strategy must be active to start execution. Enable it first."
+            detail="Strategy must be active before starting execution. Toggle it active first."
         )
 
-    # Check paper vs live mode consistency
     if current_user.selected_trading_mode == "live" and strategy.is_paper_trading:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Cannot run paper strategy in live trading mode. Switch to paper mode first."
+            detail="Cannot run a paper strategy in live trading mode."
         )
 
-    # Start the strategy
-    result = executor.start_strategy(strategy_id)
-
-    if not result['success']:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=result['message']
-        )
+    worker = get_stream_driven_worker()
+    await worker.start_strategy(strategy_id)
 
     return {
         "success": True,
-        "message": result['message'],
-        "started_at": result.get('started_at'),
-        "strategy": {
-            "id": strategy.id,
-            "name": strategy.name,
-            "type": strategy.strategy_type,
-            "is_paper_trading": strategy.is_paper_trading
-        },
-        "trading_mode": current_user.selected_trading_mode
+        "message": f"Strategy '{strategy.name}' execution started",
+        "strategy_id": strategy_id,
+        "task_running": strategy_id in worker._tasks,
+        "trading_mode": current_user.selected_trading_mode,
     }
 
 
@@ -97,130 +68,120 @@ async def stop_strategy(
     strategy_id: int,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
-    executor: StrategyExecutor = Depends(get_executor)
 ):
     """
-    Stop executing a strategy
-
-    This stops automated execution but does not close open positions.
-    Use close_all_positions endpoint to close positions.
-
-    Returns:
-        - success: Whether the operation succeeded
-        - message: Status message
+    Stop the execution task for a strategy. Does not close open positions.
     """
-    # Verify strategy exists and belongs to user
-    strategy = db.query(Strategy).filter(
-        Strategy.id == strategy_id,
-        Strategy.user_id == current_user.id
-    ).first()
+    strategy = _get_strategy_for_user(strategy_id, current_user, db)
 
-    if not strategy:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Strategy {strategy_id} not found"
-        )
-
-    # Stop the strategy
-    result = executor.stop_strategy(strategy_id)
-
-    if not result['success']:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=result['message']
-        )
+    worker = get_stream_driven_worker()
+    await worker.stop_strategy(strategy_id)
 
     return {
         "success": True,
-        "message": result['message'],
-        "strategy": {
-            "id": strategy.id,
-            "name": strategy.name
-        }
+        "message": f"Strategy '{strategy.name}' execution stopped",
+        "strategy_id": strategy_id,
+        "task_running": strategy_id in worker._tasks,
     }
 
 
 @router.get("/strategies/{strategy_id}/status")
-async def get_strategy_execution_status(
+async def get_strategy_status(
     strategy_id: int,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
-    executor: StrategyExecutor = Depends(get_executor)
 ):
     """
-    Get current execution status of a strategy
-
-    Returns:
-        - strategy_id: Strategy ID
-        - is_running: Whether strategy is currently executing
-        - started_at: When execution started
-        - last_check_at: Last time strategy was evaluated
-        - error_count: Number of consecutive errors
-        - last_error: Last error message if any
+    Check whether the stream-driven execution task for this strategy is alive.
     """
-    # Verify strategy exists and belongs to user
-    strategy = db.query(Strategy).filter(
-        Strategy.id == strategy_id,
-        Strategy.user_id == current_user.id
-    ).first()
+    strategy = _get_strategy_for_user(strategy_id, current_user, db)
 
-    if not strategy:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Strategy {strategy_id} not found"
-        )
+    worker = get_stream_driven_worker()
+    task = worker._tasks.get(strategy_id)
 
-    # Get execution status
-    status_info = executor.get_strategy_status(strategy_id)
-
-    return {
-        **status_info,
-        "strategy": {
-            "id": strategy.id,
-            "name": strategy.name,
-            "type": strategy.strategy_type,
-            "is_active": strategy.is_active,
-            "is_paper_trading": strategy.is_paper_trading
+    task_info = None
+    if task:
+        task_info = {
+            "name": task.get_name(),
+            "done": task.done(),
+            "cancelled": task.cancelled(),
+            "exception": str(task.exception()) if task.done() and not task.cancelled() and task.exception() else None,
         }
-    }
-
-
-@router.get("/strategies/{strategy_id}/risk-summary")
-async def get_strategy_risk_summary(
-    strategy_id: int,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
-    executor: StrategyExecutor = Depends(get_executor)
-):
-    """
-    Get risk metrics summary for a strategy
-
-    Returns current risk metrics including:
-    - Today's P&L
-    - Daily loss limits
-    - Open positions count
-    - Unrealized P&L
-    - Risk status (OK/WARNING)
-    """
-    # Verify strategy exists and belongs to user
-    strategy = db.query(Strategy).filter(
-        Strategy.id == strategy_id,
-        Strategy.user_id == current_user.id
-    ).first()
-
-    if not strategy:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Strategy {strategy_id} not found"
-        )
-
-    # Get risk summary
-    risk_summary = executor.get_risk_summary(current_user, strategy)
 
     return {
         "strategy_id": strategy_id,
         "strategy_name": strategy.name,
-        **risk_summary
+        "is_active": strategy.is_active,
+        "is_paper_trading": strategy.is_paper_trading,
+        "task_running": task is not None and not task.done(),
+        "task": task_info,
+    }
+
+
+@router.get("/worker/status")
+async def get_worker_status(
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Full status of the StreamDrivenWorker and Tradier stream connection.
+    Shows all running strategy tasks and which symbols are subscribed.
+    """
+    worker = get_stream_driven_worker()
+    stream_mgr = get_stream_manager()
+
+    tasks_info = []
+    for sid, task in worker._tasks.items():
+        tasks_info.append({
+            "strategy_id": sid,
+            "task_name": task.get_name(),
+            "running": not task.done(),
+            "done": task.done(),
+            "cancelled": task.cancelled(),
+        })
+
+    return {
+        "worker_running": worker._running,
+        "active_tasks": len([t for t in worker._tasks.values() if not t.done()]),
+        "tasks": tasks_info,
+        "stream": {
+            "connected": stream_mgr._ws is not None,
+            "session_id": stream_mgr._session_id,
+            "subscribed_symbols": stream_mgr.active_symbols(),
+        },
+    }
+
+
+@router.get("/active-strategies")
+async def get_active_strategies(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    All active strategies for the current user with their live execution task status.
+    """
+    worker = get_stream_driven_worker()
+
+    strategies = db.query(Strategy).filter(
+        Strategy.user_id == current_user.id,
+        Strategy.is_active == True
+    ).all()
+
+    results = []
+    for strategy in strategies:
+        task = worker._tasks.get(strategy.id)
+        results.append({
+            "id": strategy.id,
+            "name": strategy.name,
+            "type": strategy.strategy_type,
+            "instruments": strategy.instruments,
+            "is_paper_trading": strategy.is_paper_trading,
+            "task_running": task is not None and not task.done(),
+        })
+
+    return {
+        "count": len(results),
+        "strategies": results,
+        "user_trading_mode": current_user.selected_trading_mode,
     }
 
 
@@ -230,89 +191,37 @@ async def execute_strategy_tick_manual(
     market_data: Dict,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
-    executor: StrategyExecutor = Depends(get_executor)
 ):
     """
-    Manually execute one tick of strategy logic (for testing)
-
-    This endpoint is primarily for testing and debugging.
-    In production, the background worker calls execute_strategy_tick automatically.
-
-    Body:
-        market_data: Dict with current market data
-            {
-                "symbol": "SPY",
-                "price": 450.25,
-                "volume": 1000000,
-                "bid": 450.24,
-                "ask": 450.26,
-                "delta": 0.65 (optional, for options),
-                "open_interest": 5000 (optional, for options),
-                "tick_value": 850 (optional, $TICK indicator)
-            }
-
-    Returns:
-        - strategy_id: Strategy ID
-        - timestamp: Execution timestamp
-        - signals_generated: List of signals generated
-        - orders_placed: List of orders executed
-        - positions_closed: List of positions closed
-        - errors: List of errors if any
+    Manually inject one market_data tick into a strategy (testing/debugging only).
     """
-    # Verify strategy exists and belongs to user
-    strategy = db.query(Strategy).filter(
-        Strategy.id == strategy_id,
-        Strategy.user_id == current_user.id
-    ).first()
+    from engine.strategy_executor import StrategyExecutor
 
-    if not strategy:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Strategy {strategy_id} not found"
-        )
-
-    # Execute strategy tick
+    strategy = _get_strategy_for_user(strategy_id, current_user, db)
+    executor = StrategyExecutor(db)
     results = await executor.execute_strategy_tick(
         user=current_user,
         strategy=strategy,
-        market_data=market_data
+        market_data=market_data,
     )
-
     return results
 
 
-@router.get("/active-strategies")
-async def get_active_strategies(
+@router.get("/strategies/{strategy_id}/risk-summary")
+async def get_strategy_risk_summary(
+    strategy_id: int,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
-    executor: StrategyExecutor = Depends(get_executor)
 ):
-    """
-    Get all active strategies for the current user with their execution status
+    """Risk metrics summary for a strategy."""
+    from engine.strategy_executor import StrategyExecutor
 
-    Returns:
-        List of strategies with their execution status
-    """
-    # Get all active strategies for user
-    strategies = db.query(Strategy).filter(
-        Strategy.user_id == current_user.id,
-        Strategy.is_active == True
-    ).all()
-
-    results = []
-    for strategy in strategies:
-        status_info = executor.get_strategy_status(strategy.id)
-        results.append({
-            "id": strategy.id,
-            "name": strategy.name,
-            "type": strategy.strategy_type,
-            "is_paper_trading": strategy.is_paper_trading,
-            "max_positions": strategy.max_positions,
-            "execution_status": status_info
-        })
+    strategy = _get_strategy_for_user(strategy_id, current_user, db)
+    executor = StrategyExecutor(db)
+    risk_summary = executor.get_risk_summary(current_user, strategy)
 
     return {
-        "count": len(results),
-        "strategies": results,
-        "user_trading_mode": current_user.selected_trading_mode
+        "strategy_id": strategy_id,
+        "strategy_name": strategy.name,
+        **risk_summary,
     }

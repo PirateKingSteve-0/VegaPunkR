@@ -1,0 +1,98 @@
+<div class="stream-drawer">
+  <div class="drawer-header">
+    <div class="header-top">
+      <h3>Data Stream</h3>
+      <div
+        class="status-dot"
+        [style.background-color]="statusColor(status$ | async)"
+        [matTooltip]="statusLabel(status$ | async)"
+      ></div>
+    </div>
+    <div class="strategy-info">
+      <span class="strategy-name">{{ strategy.name }}</span>
+      <span class="symbols">{{ strategy.instruments?.join(', ') }}</span>
+    </div>
+  </div>
+
+  <mat-divider></mat-divider>
+
+  <div class="drawer-controls">
+    @switch (status$ | async) {
+      @case ('disconnected') {
+        <button mat-raised-button color="primary" (click)="connect()">
+          <mat-icon>wifi</mat-icon>
+          Connect
+        </button>
+      }
+      @case ('connecting') {
+        <button mat-raised-button disabled>
+          <mat-icon>hourglass_empty</mat-icon>
+          Connecting…
+        </button>
+      }
+      @case ('connected') {
+        <button mat-stroked-button color="warn" (click)="disconnect()">
+          <mat-icon>wifi_off</mat-icon>
+          Disconnect
+        </button>
+      }
+      @case ('error') {
+        <button mat-raised-button color="warn" (click)="connect()">
+          <mat-icon>error_outline</mat-icon>
+          Retry
+        </button>
+      }
+    }
+
+    <mat-button-toggle-group class="filter-toggles" multiple>
+      <mat-button-toggle
+        value="quote"
+        [checked]="activeFilters.has('quote')"
+        (change)="toggleFilter('quote')"
+      >Quote</mat-button-toggle>
+      <mat-button-toggle
+        value="trade"
+        [checked]="activeFilters.has('trade')"
+        (change)="toggleFilter('trade')"
+      >Trade</mat-button-toggle>
+    </mat-button-toggle-group>
+
+    <button mat-icon-button (click)="clearEvents()" matTooltip="Clear feed">
+      <mat-icon>clear_all</mat-icon>
+    </button>
+  </div>
+
+  <mat-divider></mat-divider>
+
+  <div class="event-feed" #eventFeed>
+    @if (events.length === 0) {
+      <div class="empty-feed">
+        @if ((status$ | async) === 'connected') {
+          <mat-icon>hourglass_top</mat-icon>
+          <p>Waiting for events…</p>
+        } @else {
+          <mat-icon>stream</mat-icon>
+          <p>Connect to start streaming</p>
+        }
+      </div>
+    }
+
+    @for (event of events; track event.id) {
+      <div class="event-row" [class]="'event-' + event.type">
+        <span class="event-badge">{{ event.type }}</span>
+        <span class="event-symbol">{{ event.symbol }}</span>
+        <span class="event-data">
+          @if (event.type === 'quote') {
+            <span>B: <strong>{{ event.bid }}</strong>&times;{{ event.bidsz }}</span>
+            <span>A: <strong>{{ event.ask }}</strong>&times;{{ event.asksz }}</span>
+          }
+          @if (event.type === 'trade') {
+            <span>{{ event.price }}</span>
+            <span class="muted">sz {{ event.size }}</span>
+          }
+        </span>
+        <span class="event-time" matTooltip="ET">{{ event.eventTime | date:'HH:mm:ss.SSS':'America/New_York' }}</span>
+      </div>
+    }
+  </div>
+</div>

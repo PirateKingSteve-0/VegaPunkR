@@ -1,4 +1,4 @@
-import { Component, OnInit, inject } from '@angular/core';
+import { Component, OnInit, ViewChild, inject } from '@angular/core';
 import { CommonModule } from '@angular/common';
 import { Router } from '@angular/router';
 import { MatCardModule } from '@angular/material/card';
@@ -11,9 +11,11 @@ import { MatMenuModule } from '@angular/material/menu';
 import { MatTooltipModule } from '@angular/material/tooltip';
 import { MatDividerModule } from '@angular/material/divider';
 import { MatDialog, MatDialogModule } from '@angular/material/dialog';
+import { MatSidenavModule, MatSidenav } from '@angular/material/sidenav';
 import { Strategy } from '../../models/strategy.model';
 import { StrategyService } from '../../services/strategy.service';
 import { TemplateGalleryModalComponent } from './template-gallery-modal.component';
+import { StreamDrawerComponent } from './stream-drawer.component';
 
 @Component({
   selector: 'app-strategy-list',
@@ -29,12 +31,16 @@ import { TemplateGalleryModalComponent } from './template-gallery-modal.componen
     MatMenuModule,
     MatTooltipModule,
     MatDividerModule,
-    MatDialogModule
+    MatDialogModule,
+    MatSidenavModule,
+    StreamDrawerComponent,
   ],
   templateUrl: './strategy-list.component.html',
   styleUrls: ['./strategy-list.component.scss']
 })
 export class StrategyListComponent implements OnInit {
+  @ViewChild('streamSidenav') streamSidenav!: MatSidenav;
+
   private strategyService = inject(StrategyService);
   private router = inject(Router);
   private dialog = inject(MatDialog);
@@ -42,6 +48,7 @@ export class StrategyListComponent implements OnInit {
   strategies: Strategy[] = [];
   isLoading = true;
   displayedColumns: string[] = ['name', 'type', 'status', 'symbols', 'updated', 'actions'];
+  activeStreamStrategy: Strategy | null = null;
 
   ngOnInit(): void {
     this.loadStrategies();
@@ -113,6 +120,15 @@ export class StrategyListComponent implements OnInit {
         alert('Failed to update strategy status');
       }
     });
+  }
+
+  openStream(strategy: Strategy): void {
+    this.activeStreamStrategy = strategy;
+    this.streamSidenav.open();
+  }
+
+  closeStream(): void {
+    this.streamSidenav.close();
   }
 
   getStatusColor(isActive: boolean): string {

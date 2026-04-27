@@ -15,7 +15,11 @@ from sqlalchemy import text
 sys.path.insert(0, os.path.dirname(__file__))
 
 from models import Base
-from database import engine
+from database import engines
+from config import Environment
+
+# Default to DEV environment for setup
+engine = engines[Environment.DEV]
 
 
 def init_db():

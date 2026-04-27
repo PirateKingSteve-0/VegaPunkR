@@ -4,13 +4,16 @@ Aligned with Strategy.params_json structure from strategy_templates.py
 """
 import logging
 from typing import Dict, List, Optional, Tuple
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 import numpy as np
 from collections import deque
 
 from models import Strategy
+from utils.market_hours import MarketHours
 
 logger = logging.getLogger(__name__)
+
+_market_hours = MarketHours()
 
 
 class Signal:
@@ -52,6 +55,10 @@ class SignalGenerator:
         self.price_history: Dict[str, deque] = {}
         self.volume_history: Dict[str, deque] = {}
 
+        # Intraday VWAP accumulators — reset each trading day
+        # { symbol: { 'date': date, 'sum_pv': float, 'sum_v': int } }
+        self._vwap_accumulators: Dict[str, dict] = {}
+
         # Configuration
         self.max_history_length = 100  # Keep last 100 bars
 
@@ -82,6 +89,19 @@ class SignalGenerator:
 
         params = strategy.params_json
         indicators = {}
+
+        # 0. Enforce opening noise blackout window
+        entry_after_open_minutes = params.get('entry_after_open_minutes', 0)
+        if entry_after_open_minutes:
+            current_et = _market_hours.get_current_et_time()
+            market_open_et = current_et.replace(hour=9, minute=30, second=0, microsecond=0)
+            minutes_since_open = (current_et - market_open_et).total_seconds() / 60
+            if minutes_since_open < entry_after_open_minutes:
+                logger.debug(
+                    f"{symbol}: Opening noise window — {minutes_since_open:.1f} min since open "
+                    f"(waiting for {entry_after_open_minutes} min)"
+                )
+                return None
 
         # 1. Check EMA condition
         ema_period = params.get('ema_period', 9)
@@ -140,7 +160,7 @@ class SignalGenerator:
                     return None
 
         # 4. Check delta range for options
-        if additional_data and 'delta' in additional_data:
+        if additional_data and additional_data.get('delta') is not None:
             delta = abs(additional_data['delta'])
             delta_min = params.get('delta_min', 0.0)
             delta_max = params.get('delta_max', 1.0)
@@ -154,7 +174,7 @@ class SignalGenerator:
         # 5. Check liquidity filters for options
         if additional_data:
             # Open interest check
-            if 'open_interest' in additional_data:
+            if additional_data.get('open_interest') is not None:
                 min_oi = params.get('min_open_interest', 0)
                 if additional_data['open_interest'] < min_oi:
                     logger.debug(f"{symbol}: Open interest {additional_data['open_interest']} < {min_oi}")
@@ -162,18 +182,17 @@ class SignalGenerator:
                 indicators['open_interest'] = additional_data['open_interest']
 
             # Bid-ask spread check
-            if 'bid' in additional_data and 'ask' in additional_data:
-                bid = additional_data['bid']
-                ask = additional_data['ask']
-                if ask > 0:
-                    spread = (ask - bid) / ask
-                    max_spread = params.get('max_bid_ask_spread', 1.0)
+            bid = additional_data.get('bid')
+            ask = additional_data.get('ask')
+            if bid is not None and ask is not None and ask > 0:
+                spread = (ask - bid) / ask
+                max_spread = params.get('max_bid_ask_spread', 1.0)
 
-                    indicators['bid_ask_spread'] = spread
+                indicators['bid_ask_spread'] = spread
 
-                    if spread > max_spread:
-                        logger.debug(f"{symbol}: Bid-ask spread {spread:.2%} > {max_spread:.2%}")
-                        return None
+                if spread > max_spread:
+                    logger.debug(f"{symbol}: Bid-ask spread {spread:.2%} > {max_spread:.2%}")
+                    return None
 
         # 6. Check $TICK indicator if configured
         use_tick = params.get('use_tick_indicator', False)
@@ -227,7 +246,7 @@ class SignalGenerator:
             indicators=indicators
         )
 
-        logger.info(f"ENTRY SIGNAL: {signal}")
+        logger.debug(f"Entry signal generated: {signal}")
         return signal
 
     def check_exit_signal(
@@ -273,7 +292,7 @@ class SignalGenerator:
         }
 
         # 1. Take Profit check
-        take_profit_pct = params.get('take_profit_pct', None)
+        take_profit_pct = params.get('take_profit_pct') or params.get('take_profit_percentage')
         if take_profit_pct and pnl_pct >= take_profit_pct:
             return Signal(
                 signal_type='exit',
@@ -286,7 +305,7 @@ class SignalGenerator:
             )
 
         # 2. Stop Loss check
-        stop_loss_pct = params.get('stop_loss_pct', None)
+        stop_loss_pct = params.get('stop_loss_pct') or params.get('stop_loss_percentage')
         if stop_loss_pct and pnl_pct <= -stop_loss_pct:
             return Signal(
                 signal_type='exit',
@@ -351,19 +370,14 @@ class SignalGenerator:
         # 5. Exit before market close (for 0DTE strategies)
         exit_before_close_minutes = params.get('exit_before_close_minutes', None)
         if exit_before_close_minutes:
-            now = datetime.utcnow()
-            # US market close is 4:00 PM ET (20:00 UTC during standard time, 19:00 UTC during DST)
-            # Simplified: assume 4 PM ET = 21:00 UTC (adjust based on DST if needed)
-            market_close_hour = 21  # This should be configurable
-            market_close_time = now.replace(
-                hour=market_close_hour,
-                minute=0,
-                second=0,
-                microsecond=0
+            current_et = _market_hours.get_current_et_time()
+            close_time = _market_hours.get_market_close_time_et()
+            market_close_et = current_et.replace(
+                hour=close_time.hour, minute=close_time.minute, second=0, microsecond=0
             )
-            exit_time = market_close_time - timedelta(minutes=exit_before_close_minutes)
+            exit_time_et = market_close_et - timedelta(minutes=exit_before_close_minutes)
 
-            if now >= exit_time:
+            if current_et >= exit_time_et:
                 return Signal(
                     signal_type='exit',
                     action='sell' if position_side == 'long' else 'buy',
@@ -380,13 +394,23 @@ class SignalGenerator:
     # ========== Technical Indicator Calculations ==========
 
     def _update_history(self, symbol: str, price: float, volume: int):
-        """Update price and volume history for indicator calculations"""
+        """Update price/volume history and intraday VWAP accumulator."""
         if symbol not in self.price_history:
             self.price_history[symbol] = deque(maxlen=self.max_history_length)
             self.volume_history[symbol] = deque(maxlen=self.max_history_length)
 
         self.price_history[symbol].append(price)
         self.volume_history[symbol].append(volume)
+
+        # Intraday VWAP — cumulative from market open, resets each day
+        today = date.today()
+        acc = self._vwap_accumulators.get(symbol)
+        if acc is None or acc["date"] != today:
+            self._vwap_accumulators[symbol] = {"date": today, "sum_pv": 0.0, "sum_v": 0}
+            acc = self._vwap_accumulators[symbol]
+        if volume > 0:
+            acc["sum_pv"] += price * volume
+            acc["sum_v"] += volume
 
     def _calculate_ema(self, symbol: str, period: int) -> Optional[float]:
         """Calculate Exponential Moving Average"""
@@ -407,24 +431,11 @@ class SignalGenerator:
         return ema
 
     def _calculate_vwap(self, symbol: str) -> Optional[float]:
-        """Calculate Volume Weighted Average Price"""
-        if symbol not in self.price_history or symbol not in self.volume_history:
+        """Intraday VWAP — cumulative sum(price * volume) / sum(volume) from market open."""
+        acc = self._vwap_accumulators.get(symbol)
+        if acc is None or acc["sum_v"] == 0:
             return None
-
-        prices = list(self.price_history[symbol])
-        volumes = list(self.volume_history[symbol])
-
-        if len(prices) < 2:
-            return None
-
-        # VWAP = sum(price * volume) / sum(volume)
-        total_pv = sum(p * v for p, v in zip(prices, volumes))
-        total_volume = sum(volumes)
-
-        if total_volume == 0:
-            return None
-
-        return total_pv / total_volume
+        return acc["sum_pv"] / acc["sum_v"]
 
     def _calculate_avg_volume(self, symbol: str, period: int = 20) -> Optional[float]:
         """Calculate average volume over period"""
@@ -506,12 +517,12 @@ class SignalGenerator:
         return min(confidence, 0.95)
 
     def clear_history(self, symbol: Optional[str] = None):
-        """Clear price history for a symbol or all symbols"""
+        """Clear price history and VWAP state for a symbol or all symbols."""
         if symbol:
-            if symbol in self.price_history:
-                del self.price_history[symbol]
-            if symbol in self.volume_history:
-                del self.volume_history[symbol]
+            self.price_history.pop(symbol, None)
+            self.volume_history.pop(symbol, None)
+            self._vwap_accumulators.pop(symbol, None)
         else:
             self.price_history.clear()
             self.volume_history.clear()
+            self._vwap_accumulators.clear()

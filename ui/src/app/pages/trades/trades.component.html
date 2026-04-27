@@ -1,97 +1,113 @@
-<div class="trades-container">
+<div class="events-container">
   <div class="header">
-    <h1>Trade History</h1>
-    <button mat-raised-button color="primary">
-      <mat-icon>file_download</mat-icon>
-      Export
+    <h1>Event Log</h1>
+    <button mat-raised-button color="primary" (click)="loadEvents()">
+      <mat-icon>refresh</mat-icon>
+      Refresh
     </button>
   </div>
 
   <mat-card class="filters-card">
     <mat-card-content>
       <div class="filters">
+
+        <mat-form-field appearance="outline">
+          <mat-label>Event Type</mat-label>
+          <mat-select [formControl]="eventTypeControl">
+            <mat-option value="">All</mat-option>
+            <mat-option *ngFor="let t of eventTypeOptions" [value]="t">
+              {{ formatEventType(t) }}
+            </mat-option>
+          </mat-select>
+        </mat-form-field>
+
         <mat-form-field appearance="outline">
           <mat-label>Symbol</mat-label>
-          <input matInput placeholder="Filter by symbol">
+          <input matInput placeholder="e.g. AAPL" [formControl]="symbolControl">
         </mat-form-field>
 
         <mat-form-field appearance="outline">
           <mat-label>Start Date</mat-label>
-          <input matInput [matDatepicker]="startPicker">
+          <input matInput [matDatepicker]="startPicker" [formControl]="startDateControl">
           <mat-datepicker-toggle matIconSuffix [for]="startPicker"></mat-datepicker-toggle>
           <mat-datepicker #startPicker></mat-datepicker>
         </mat-form-field>
 
         <mat-form-field appearance="outline">
           <mat-label>End Date</mat-label>
-          <input matInput [matDatepicker]="endPicker">
+          <input matInput [matDatepicker]="endPicker" [formControl]="endDateControl">
           <mat-datepicker-toggle matIconSuffix [for]="endPicker"></mat-datepicker-toggle>
           <mat-datepicker #endPicker></mat-datepicker>
         </mat-form-field>
+
       </div>
     </mat-card-content>
   </mat-card>
 
   <mat-card>
     <mat-card-content>
-      <div *ngIf="trades.length === 0" class="empty-state">
-        <mat-icon>swap_horiz</mat-icon>
-        <p>No trades yet</p>
-        <p class="subtitle">Your trade history will appear here</p>
+
+      <div *ngIf="loading" class="empty-state">
+        <mat-spinner diameter="40"></mat-spinner>
       </div>
 
-      <table mat-table [dataSource]="trades" *ngIf="trades.length > 0" class="trades-table">
-        <ng-container matColumnDef="timestamp">
+      <div *ngIf="!loading && events.length === 0" class="empty-state">
+        <mat-icon>feed</mat-icon>
+        <p>No events yet</p>
+        <p class="subtitle">Strategy activity, orders, and position changes will appear here</p>
+      </div>
+
+      <table mat-table [dataSource]="events" *ngIf="!loading && events.length > 0" class="events-table">
+
+        <ng-container matColumnDef="created_at">
           <th mat-header-cell *matHeaderCellDef>Time</th>
-          <td mat-cell *matCellDef="let trade">{{ trade.timestamp | date:'short' }}</td>
+          <td mat-cell *matCellDef="let e">{{ e.created_at | date:'MM/dd/yy HH:mm:ss' }}</td>
+        </ng-container>
+
+        <ng-container matColumnDef="event_type">
+          <th mat-header-cell *matHeaderCellDef>Type</th>
+          <td mat-cell *matCellDef="let e">
+            <span class="type-badge" [ngClass]="e.event_type.toLowerCase().replace('_', '-')">
+              {{ formatEventType(e.event_type) }}
+            </span>
+          </td>
+        </ng-container>
+
+        <ng-container matColumnDef="severity">
+          <th mat-header-cell *matHeaderCellDef>Severity</th>
+          <td mat-cell *matCellDef="let e">
+            <span class="severity-dot" [ngClass]="e.severity"></span>
+            {{ e.severity }}
+          </td>
+        </ng-container>
+
+        <ng-container matColumnDef="title">
+          <th mat-header-cell *matHeaderCellDef>Event</th>
+          <td mat-cell *matCellDef="let e">
+            <span class="event-title">{{ e.title }}</span>
+            <span *ngIf="e.detail" class="event-detail">{{ e.detail }}</span>
+          </td>
         </ng-container>
 
         <ng-container matColumnDef="symbol">
           <th mat-header-cell *matHeaderCellDef>Symbol</th>
-          <td mat-cell *matCellDef="let trade">{{ trade.symbol }}</td>
-        </ng-container>
-
-        <ng-container matColumnDef="side">
-          <th mat-header-cell *matHeaderCellDef>Side</th>
-          <td mat-cell *matCellDef="let trade">
-            <mat-chip [color]="trade.side === 'BUY' ? 'primary' : 'warn'" class="side-chip">
-              {{ trade.side }}
-            </mat-chip>
-          </td>
-        </ng-container>
-
-        <ng-container matColumnDef="type">
-          <th mat-header-cell *matHeaderCellDef>Type</th>
-          <td mat-cell *matCellDef="let trade">{{ trade.type }}</td>
-        </ng-container>
-
-        <ng-container matColumnDef="quantity">
-          <th mat-header-cell *matHeaderCellDef>Quantity</th>
-          <td mat-cell *matCellDef="let trade">{{ trade.quantity }}</td>
-        </ng-container>
-
-        <ng-container matColumnDef="price">
-          <th mat-header-cell *matHeaderCellDef>Price</th>
-          <td mat-cell *matCellDef="let trade">{{ trade.price | currency }}</td>
-        </ng-container>
-
-        <ng-container matColumnDef="total">
-          <th mat-header-cell *matHeaderCellDef>Total</th>
-          <td mat-cell *matCellDef="let trade">{{ trade.total | currency }}</td>
-        </ng-container>
-
-        <ng-container matColumnDef="status">
-          <th mat-header-cell *matHeaderCellDef>Status</th>
-          <td mat-cell *matCellDef="let trade">
-            <mat-chip [color]="trade.status === 'FILLED' ? 'accent' : 'primary'">
-              {{ trade.status }}
-            </mat-chip>
-          </td>
+          <td mat-cell *matCellDef="let e">{{ e.symbol || '—' }}</td>
         </ng-container>
 
         <tr mat-header-row *matHeaderRowDef="displayedColumns"></tr>
-        <tr mat-row *matRowDef="let row; columns: displayedColumns;"></tr>
+        <tr mat-row *matRowDef="let row; columns: displayedColumns;" [ngClass]="row.severity"></tr>
       </table>
+
+      <mat-paginator
+        *ngIf="!loading"
+        [length]="total"
+        [pageSize]="pageSize"
+        [pageSizeOptions]="[25, 50, 100, 200]"
+        [pageIndex]="pageIndex"
+        (page)="onPage($event)"
+        aria-label="Select page">
+      </mat-paginator>
+
     </mat-card-content>
   </mat-card>
 </div>

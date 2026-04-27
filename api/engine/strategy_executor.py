@@ -24,6 +24,7 @@ from models import User, Strategy, Position
 from engine.risk_manager import RiskManager, RiskCheckResult
 from engine.signal_generator import SignalGenerator, Signal
 from engine.order_manager import OrderManager, OrderResult
+from utils.market_hours import is_market_open
 
 logger = logging.getLogger(__name__)
 
@@ -60,6 +61,48 @@ class StrategyExecutor:
 
         # Track execution state for each strategy
         self.execution_states: Dict[int, ExecutionState] = {}
+
+    async def execute_exit_tick(
+        self,
+        user: User,
+        strategy: Strategy,
+        market_data: Dict,
+    ) -> Dict:
+        """Exit-only tick — called when a position is already open. Skips entry evaluation."""
+        state = self._get_or_create_state(strategy.id)
+        state.last_check_at = datetime.utcnow()
+
+        results: Dict = {
+            'strategy_id': strategy.id,
+            'timestamp': datetime.utcnow().isoformat(),
+            'signals_generated': [],
+            'orders_placed': [],
+            'positions_closed': [],
+            'errors': [],
+        }
+
+        if not is_market_open():
+            return results
+
+        symbol = market_data.get('symbol')
+        current_price = market_data.get('price', 0.0)
+        if not symbol or current_price <= 0:
+            return results
+
+        # Use option mid price for P&L on options positions
+        bid = market_data.get('bid', 0) or 0
+        ask = market_data.get('ask', 0) or 0
+        if market_data.get('option_symbol') and ask > 0:
+            current_price = (bid + ask) / 2
+
+        try:
+            await self._check_exit_signals(user, strategy, symbol, current_price, market_data, results)
+            self.order_manager.update_position_prices(user, strategy, symbol, current_price)
+        except Exception as e:
+            results['errors'].append(str(e))
+            logger.error(f"Exit tick error strategy {strategy.id}: {e}", exc_info=True)
+
+        return results
 
     async def execute_strategy_tick(
         self,
@@ -103,7 +146,12 @@ class StrategyExecutor:
         }
 
         try:
-            # 1. Check if strategy is active
+            # 1. Hard gate — no orders outside market hours
+            if not is_market_open():
+                logger.debug(f"Strategy {strategy.id}: market closed, skipping tick")
+                return results
+
+            # 2. Check if strategy is active
             if not strategy.is_active:
                 results['errors'].append("Strategy is not active")
                 return results
@@ -116,18 +164,20 @@ class StrategyExecutor:
                 results['errors'].append("Invalid market data")
                 return results
 
-            # 2. Check for entry signals (if we have room for more positions)
+            # 3. Check for entry signals (if we have room for more positions)
             await self._check_entry_signals(
                 user, strategy, symbol, current_price, current_volume,
                 market_data, results
             )
 
-            # 3. Check open positions for exit signals
-            await self._check_exit_signals(
-                user, strategy, symbol, current_price, market_data, results
-            )
+            # 4. Check open positions for exit signals — but NOT on the same tick we
+            # just entered, so we don't immediately exit a freshly opened position
+            if not results['orders_placed']:
+                await self._check_exit_signals(
+                    user, strategy, symbol, current_price, market_data, results
+                )
 
-            # 4. Update position prices for P&L tracking
+            # 5. Update position prices for P&L tracking
             self.order_manager.update_position_prices(
                 user, strategy, symbol, current_price
             )
@@ -143,8 +193,8 @@ class StrategyExecutor:
             state.error_count += 1
             state.last_error = error_msg
 
-            # Stop strategy if too many consecutive errors
-            if state.error_count >= 5:
+            # Stop strategy after too many consecutive errors
+            if state.error_count >= 20:
                 strategy.is_active = False
                 self.db.commit()
                 logger.critical(
@@ -171,7 +221,7 @@ class StrategyExecutor:
             Position.qty > 0
         ).count()
 
-        max_positions = strategy.max_positions or 3
+        max_positions = strategy.max_positions or 1
         if open_positions_count >= max_positions:
             logger.debug(f"Max positions ({max_positions}) reached for strategy {strategy.id}")
             return
@@ -196,11 +246,27 @@ class StrategyExecutor:
             'reason': entry_signal.reason
         })
 
-        # Calculate position size
+        # For options strategies use the option premium for sizing, not the underlying price
+        _is_options = any(k in strategy.strategy_type.lower() for k in ('option', '0dte', 'scalping'))
+        if _is_options:
+            bid = market_data.get('bid', 0) or 0
+            ask = market_data.get('ask', 0) or 0
+            if ask <= 0:
+                logger.debug(f"{symbol}: Option price not yet available, skipping entry")
+                return
+            sizing_price = (bid + ask) / 2
+            logger.info(
+                f"ENTRY SIGNAL: {symbol} option={market_data.get('option_symbol')} "
+                f"mid=${sizing_price:.2f} reason={entry_signal.reason}"
+            )
+        else:
+            sizing_price = current_price
+            logger.info(f"ENTRY SIGNAL: {symbol} price=${sizing_price:.2f} reason={entry_signal.reason}")
+
         qty = self.risk_manager.calculate_position_size(
             user=user,
             strategy=strategy,
-            current_price=current_price
+            current_price=sizing_price
         )
 
         if qty <= 0:
@@ -213,7 +279,7 @@ class StrategyExecutor:
             strategy=strategy,
             symbol=symbol,
             qty=qty,
-            estimated_price=current_price,
+            estimated_price=sizing_price,
             side=entry_signal.action
         )
 
@@ -222,12 +288,15 @@ class StrategyExecutor:
             logger.warning(f"Trade rejected: {risk_check.reason}")
             return
 
-        # Execute the signal
+        # Execute the signal — pass sizing_price so the DB stores the option premium,
+        # not the underlying price that signal.price carries
         order_result = await self.order_manager.execute_signal(
             user=user,
             strategy=strategy,
             signal=entry_signal,
-            qty=qty
+            qty=qty,
+            option_symbol=market_data.get('option_symbol'),
+            estimated_price=sizing_price,
         )
 
         if order_result.success:
@@ -264,16 +333,34 @@ class StrategyExecutor:
             # Determine position side
             position_side = 'long'  # Currently only supporting long positions
 
+            # For options positions use the option mid price for P&L, not the underlying.
+            # Entry price is stored as option premium; comparing against underlying price
+            # produces nonsensical P&L percentages (e.g. 12000%).
+            exit_price = current_price
+            bid = market_data.get('bid', 0) or 0
+            ask = market_data.get('ask', 0) or 0
+            option_symbol = position.option_symbol or market_data.get('option_symbol')
+            if option_symbol:
+                if ask > 0:
+                    exit_price = (bid + ask) / 2
+                else:
+                    # Stream hasn't delivered a quote yet — fall back to Tradier REST
+                    rest_price = await self._fetch_option_price(option_symbol)
+                    if rest_price > 0:
+                        exit_price = rest_price
+                    else:
+                        continue  # Truly no price available, skip this tick
+
             # Get current high/low for trailing stops (simplified - use current price)
-            current_high = market_data.get('high', current_price)
-            current_low = market_data.get('low', current_price)
+            current_high = market_data.get('high', exit_price)
+            current_low = market_data.get('low', exit_price)
 
             # Check for exit signal
             exit_signal = self.signal_generator.check_exit_signal(
                 strategy=strategy,
                 symbol=symbol,
                 entry_price=position.avg_entry_price,
-                current_price=current_price,
+                current_price=exit_price,
                 entry_timestamp=position.opened_at,
                 position_side=position_side,
                 current_high=current_high,
@@ -281,8 +368,17 @@ class StrategyExecutor:
             )
 
             if not exit_signal:
+                logger.debug(
+                    f"No exit: {symbol} entry=${position.avg_entry_price:.4f} "
+                    f"current=${exit_price:.4f} pnl={(exit_price - position.avg_entry_price) / position.avg_entry_price * 100:.2f}%"
+                )
                 continue  # No exit signal
 
+            logger.info(
+                f"EXIT SIGNAL: {symbol} entry=${position.avg_entry_price:.4f} "
+                f"current=${exit_price:.4f} pnl={(exit_price - position.avg_entry_price) / position.avg_entry_price * 100:.2f}% "
+                f"reason={exit_signal.reason}"
+            )
             results['signals_generated'].append({
                 'type': 'exit',
                 'symbol': symbol,
@@ -291,12 +387,16 @@ class StrategyExecutor:
                 'reason': exit_signal.reason
             })
 
+            # Use the stored option_symbol from the position (not the currently-selected contract)
+            close_option_symbol = position.option_symbol or market_data.get('option_symbol')
+
             # Close the position
             order_result = await self.order_manager.close_position(
                 user=user,
                 strategy=strategy,
                 position=position,
-                reason=exit_signal.reason
+                reason=exit_signal.reason,
+                option_symbol=close_option_symbol,
             )
 
             if order_result.success:
@@ -402,6 +502,44 @@ class StrategyExecutor:
         if strategy_id not in self.execution_states:
             self.execution_states[strategy_id] = ExecutionState(strategy_id)
         return self.execution_states[strategy_id]
+
+    async def _fetch_option_price(self, option_symbol: str) -> float:
+        """Fetch option mid price from Tradier REST when stream quote is unavailable."""
+        try:
+            import asyncio as _asyncio
+            from tradier_integration.client import get_tradier_client
+            client = get_tradier_client()
+
+            def _get_quote():
+                live_url = client._base_url if 'live' in getattr(client, '_base_url', '') else None
+                from config import settings
+                url = f"{settings.TRADIER_LIVE_BASE_URL.rstrip('/')}/v1/markets/quotes"
+                import requests
+                resp = requests.get(
+                    url,
+                    params={"symbols": option_symbol, "greeks": "false"},
+                    headers={
+                        "Authorization": f"Bearer {settings.TRADIER_LIVE_API_KEY}",
+                        "Accept": "application/json",
+                    },
+                )
+                resp.raise_for_status()
+                quotes = resp.json().get("quotes", {}).get("quote", {})
+                if isinstance(quotes, list):
+                    quotes = quotes[0] if quotes else {}
+                bid = float(quotes.get("bid") or 0)
+                ask = float(quotes.get("ask") or 0)
+                if ask > 0:
+                    return (bid + ask) / 2
+                return float(quotes.get("last") or 0)
+
+            price = await _asyncio.to_thread(_get_quote)
+            if price > 0:
+                logger.debug(f"REST fallback price for {option_symbol}: ${price:.2f}")
+            return price
+        except Exception as e:
+            logger.warning(f"REST option price fetch failed for {option_symbol}: {e}")
+            return 0.0
 
     def get_risk_summary(self, user: User, strategy: Strategy) -> Dict:
         """Get risk metrics summary for a strategy"""

@@ -1,72 +1,71 @@
 <div class="positions-container">
   <div class="header">
     <h1>Positions</h1>
+    <span class="subtitle">Refreshes every {{ poll_interval / 1000 }} seconds</span>
   </div>
 
   <mat-card>
     <mat-card-content>
-      <div *ngIf="positions.length === 0" class="empty-state">
+
+      <div *ngIf="loading" class="empty-state">
+        <mat-spinner diameter="40"></mat-spinner>
+      </div>
+
+      <div *ngIf="!loading && positions.length === 0" class="empty-state">
         <mat-icon>account_balance</mat-icon>
         <p>No open positions</p>
         <p class="subtitle">Your active trading positions will appear here</p>
       </div>
 
-      <table mat-table [dataSource]="positions" *ngIf="positions.length > 0" class="positions-table">
+      <table mat-table [dataSource]="positions" *ngIf="!loading && positions.length > 0" class="positions-table">
+
         <ng-container matColumnDef="symbol">
           <th mat-header-cell *matHeaderCellDef>Symbol</th>
-          <td mat-cell *matCellDef="let position">{{ position.symbol }}</td>
-        </ng-container>
-
-        <ng-container matColumnDef="side">
-          <th mat-header-cell *matHeaderCellDef>Side</th>
-          <td mat-cell *matCellDef="let position">
-            <mat-chip [color]="position.side === 'LONG' ? 'primary' : 'warn'">
-              {{ position.side }}
-            </mat-chip>
-          </td>
+          <td mat-cell *matCellDef="let p">{{ p.symbol }}</td>
         </ng-container>
 
         <ng-container matColumnDef="quantity">
-          <th mat-header-cell *matHeaderCellDef>Quantity</th>
-          <td mat-cell *matCellDef="let position">{{ position.quantity }}</td>
+          <th mat-header-cell *matHeaderCellDef>Qty</th>
+          <td mat-cell *matCellDef="let p">{{ p.qty }}</td>
         </ng-container>
 
         <ng-container matColumnDef="entryPrice">
-          <th mat-header-cell *matHeaderCellDef>Entry Price</th>
-          <td mat-cell *matCellDef="let position">{{ position.entryPrice | currency }}</td>
+          <th mat-header-cell *matHeaderCellDef>Entry</th>
+          <td mat-cell *matCellDef="let p">{{ p.avg_entry_price | currency }}</td>
         </ng-container>
 
         <ng-container matColumnDef="currentPrice">
-          <th mat-header-cell *matHeaderCellDef>Current Price</th>
-          <td mat-cell *matCellDef="let position">{{ position.currentPrice | currency }}</td>
+          <th mat-header-cell *matHeaderCellDef>Current</th>
+          <td mat-cell *matCellDef="let p">{{ p.current_price | currency }}</td>
         </ng-container>
 
         <ng-container matColumnDef="pnl">
           <th mat-header-cell *matHeaderCellDef>P&L</th>
-          <td mat-cell *matCellDef="let position" [class.profit]="position.pnl > 0" [class.loss]="position.pnl < 0">
-            {{ position.pnl | currency }}
+          <td mat-cell *matCellDef="let p"
+              [class.profit]="p.unrealized_pl > 0"
+              [class.loss]="p.unrealized_pl < 0">
+            {{ p.unrealized_pl | currency }}
           </td>
         </ng-container>
 
         <ng-container matColumnDef="pnlPercent">
           <th mat-header-cell *matHeaderCellDef>P&L %</th>
-          <td mat-cell *matCellDef="let position" [class.profit]="position.pnlPercent > 0" [class.loss]="position.pnlPercent < 0">
-            {{ position.pnlPercent }}%
+          <td mat-cell *matCellDef="let p"
+              [class.profit]="pnlPercent(p) > 0"
+              [class.loss]="pnlPercent(p) < 0">
+            {{ pnlPercent(p) }}%
           </td>
         </ng-container>
 
-        <ng-container matColumnDef="actions">
-          <th mat-header-cell *matHeaderCellDef>Actions</th>
-          <td mat-cell *matCellDef="let position">
-            <button mat-icon-button color="warn">
-              <mat-icon>close</mat-icon>
-            </button>
-          </td>
+        <ng-container matColumnDef="openedAt">
+          <th mat-header-cell *matHeaderCellDef>Opened</th>
+          <td mat-cell *matCellDef="let p">{{ p.date_acquired | date:'MM/dd h:mm:ss a zzz' }}</td>
         </ng-container>
 
         <tr mat-header-row *matHeaderRowDef="displayedColumns"></tr>
         <tr mat-row *matRowDef="let row; columns: displayedColumns;"></tr>
       </table>
+
     </mat-card-content>
   </mat-card>
 </div>

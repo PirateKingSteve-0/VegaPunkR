@@ -4435,3 +4435,582 @@ None. All components are production-ready.
 
 ---
 
+## Session — 2026-04-23: Real-Time Stream Architecture Overhaul
+
+### Context
+
+Reviewed the TSLA 0DTE scalping strategy and identified two core problems:
+1. The strategy was polling Alpaca REST every 60 seconds — far too slow for 0DTE scalping
+2. The Tradier WebSocket stream existed only in the browser (display only), completely disconnected from the backend strategy executor
+
+### What Was Built
+
+#### Backend: Single WS → Fan-out Architecture
+
+Replaced the APScheduler polling model with an event-driven architecture:
+
+**`api/engine/stream_router.py`** — `StreamRouter`
+- Single fan-out router keyed by symbol
+- Strategy tasks and UI SSE connections each get their own bounded `asyncio.Queue`
+- Events dropped on full queues (stale 0DTE ticks are worthless — drop over block)
+
+**`api/engine/tradier_stream_manager.py`** — `TradierStreamManager`
+- Single persistent WebSocket to `wss://ws.tradier.com/v1/markets/events`
+- Symbol subscriptions are ref-counted — safe to subscribe/unsubscribe from multiple concurrent tasks
+- Auto-reconnects on failure with 5s backoff
+
+**`api/engine/stream_driven_worker.py`** — `StreamDrivenWorker`
+- One persistent `asyncio.Task` per active strategy (replaces 60s scheduler)
+- `StrategyMarketState` accumulates trade/quote events into a `market_data` snapshot
+- Tracks underlying price/volume separately from option contract bid/ask
+- Greeks (delta, OI) refreshed from REST every 5 minutes
+- Fires `StrategyExecutor.execute_strategy_tick()` on every underlying trade tick
+
+**`api/tradier_integration/router.py`** — SSE endpoint added
+- `GET /api/v1/tradier/stream/events?symbols=TSLA&token=<jwt>`
+- Browser EventSource connects here; backend pipes filtered events from `StreamRouter`
+- Heartbeat every 25s to keep connection alive through proxies
+
+**`api/app.py`** — lifespan wiring
+- `TradierStreamManager` and `StreamDrivenWorker` start at app startup
+- Startup failures caught and logged as non-fatal (DB or Tradier unavailable in dev)
+
+#### Signal Generator Fix
+
+**`api/engine/signal_generator.py`** — VWAP corrected
+- Previously: rolling average of last 100 tick prices (wrong)
+- Now: intraday cumulative `sum(price × volume) / sum(volume)` anchored to market open, resets each day
+
+#### Frontend: Direct WS → Backend SSE
+
+**`ui/src/app/services/market-stream.service.ts`**
+- Removed direct `wss://ws.tradier.com` connection from browser
+- Now uses native `EventSource` pointed at the backend SSE endpoint
+- One Tradier session total regardless of how many browser tabs are open
+
+**`ui/src/app/pages/strategies/stream-drawer.component.ts`** — batched rendering
+- Events collected outside Angular's zone (`NgZone.runOutsideAngular`)
+- Flushed to view every 100ms — ~10 renders/second instead of per-event
+- `ChangeDetectionStrategy.OnPush` + `markForCheck()` on each flush
+- Monotonic `eventCounter` as `@for` track key — eliminates NG0955 duplicate key errors
+
+### Key Design Decisions
+
+- **One Tradier WS per server process** — ref-counted symbols stay subscribed as long as any consumer needs them
+- **Persistent async tasks, not scheduled polls** — strategy wakes on data, not on a timer
+- **Bounded queues with drop-on-full** — stale 0DTE ticks are worthless; drop rather than accumulate backlog
+- **SSE over WebSocket for browser→backend** — browser only receives; SSE reconnects automatically
+- **100ms UI batch flush** — balances smoothness against rendering overhead at high tick rates
+
+### Remaining Known Gaps
+
+- [ ] Only CALLs supported — PUT support TODO in `enhanced_service.py`
+- [ ] No intraday contract re-selection if delta drifts out of range
+- [ ] Greeks still fetched from Alpaca REST, not Tradier options chain
+- [ ] `strategy_worker.py` (old polling worker) has stale `SessionLocal` import — not used at runtime but should be cleaned up
+
+---
+
+## Session Date: April 22, 2026
+
+### Live Market Data Stream — Strategies View
+
+Added a real-time Tradier WebSocket data stream viewer accessible directly from the Strategies page.
+
+---
+
+### What We Built
+
+#### Backend — Tradier Stream Session Endpoint
+
+**[api/tradier_integration/client.py](api/tradier_integration/client.py)**
+- Added `_post()` helper method to `TradierClient`
+- Added `create_stream_session()` — calls `POST /v1/markets/events/session` against the **live** Tradier endpoint and returns `{ sessionid, url }`
+- Always uses the live API endpoint regardless of `TRADIER_ENV` — sandbox does not support market data streaming
+
+**[api/tradier_integration/router.py](api/tradier_integration/router.py)**
+- Added `POST /api/v1/tradier/stream/session` — auth-guarded endpoint that creates a Tradier streaming session server-side, keeping the API key out of the browser
+
+#### Frontend — MarketStreamService
+
+**[ui/src/app/services/market-stream.service.ts](ui/src/app/services/market-stream.service.ts)**
+- Singleton Angular service (`providedIn: 'root'`) managing a **single** shared stream connection (Tradier enforces one session at a time)
+- Uses **EventSource (SSE)** for browser→backend — browser only receives data; SSE reconnects automatically on transient errors, unlike raw WebSocket
+- Exposes `events$: Observable<StreamEvent>` and `status$: Observable<ConnectionStatus>`
+- `connect(symbols)` — starts stream or adds symbols to existing connection
+- `disconnect()` — closes connection and clears subscribed symbols
+- Heartbeat events filtered out silently
+
+#### Frontend — StreamDrawerComponent
+
+**[ui/src/app/pages/strategies/stream-drawer.component.ts/html/scss](ui/src/app/pages/strategies/stream-drawer.component.ts)**
+- Side panel that subscribes to `MarketStreamService.events$` filtered to the opened strategy's symbols
+- Connect / Disconnect / Retry buttons driven by `status$`
+- Toggle filters for `quote` and `trade` event types (both on by default)
+- Clear feed button
+- Scrolling event feed, auto-scrolls to newest event
+- Event timestamps sourced from Tradier's `biddate` (quotes) or `date` (trades) fields, displayed in **America/New_York (Eastern Time)** via Angular date pipe timezone parameter
+- Events capped at 300 in memory (oldest dropped) to avoid unbounded growth
+
+#### Frontend — StrategyListComponent Updates
+
+**[ui/src/app/pages/strategies/strategy-list.component.ts/html/scss](ui/src/app/pages/strategies/strategy-list.component.ts)**
+- Wrapped content in `mat-sidenav-container` with a right-side `mode="over"` drawer
+- Added **"Data Stream"** action to the strategy action menu — only visible when `strategy.is_active`
+- `openStream(strategy)` / `closeStream()` methods wire the drawer to the selected strategy
+- Used `::ng-deep .mat-drawer.mat-sidenav { position: fixed }` to ensure the drawer spans full viewport height regardless of the table content height beneath it (nested `mat-sidenav-container` height inheritance issue)
+
+---
+
+### Key Design Decisions
+
+- **Tradier sandbox doesn't support streaming** — sandbox key returns 401 on session creation. Live key always used for market data regardless of paper/live trading mode. Market data is read-only and has no cost impact.
+- **SSE over direct WebSocket in the browser** — the frontend connects to a backend SSE endpoint rather than directly to `wss://ws.tradier.com`. This keeps credentials server-side and leverages SSE's built-in reconnect behavior.
+- **Single shared connection** — all strategy drawers share one `MarketStreamService` instance. Opening a second strategy's drawer adds its symbols to the existing connection via Tradier's re-subscription mechanism (resend payload with updated symbol list).
+- **ET timestamps** — all event times shown in Eastern Time since that is where US market hours are defined.
+
+### Known Gaps
+
+- [ ] Drawer currently disconnects the entire shared connection when "Disconnect" is clicked — if multiple strategy drawers were open, this would affect all of them. Ref-counting needed if multi-drawer is ever supported.
+- [ ] No backend SSE proxy endpoint exists yet — `market-stream.service.ts` was refactored to use EventSource pointing at `/tradier/stream/events`, but that endpoint has not been implemented on the backend. Direct WebSocket to Tradier is the current working path.
+
+---
+
+## Session — 2026-04-23: First Live Paper Trade & Full Execution Pipeline Fix
+
+### Overview
+
+End-to-end paper trade executed successfully for the first time: TSLA Apr 24 2026 $370 Call, 1 contract, entered at ~$6.30 via Tradier sandbox. This session closed every gap between "strategy is active" and "order hits the broker" — contract selection, position sizing, signal gating, order routing, and result visibility in the UI.
+
+---
+
+### What We Built / Fixed
+
+#### 1. Tradier Option Contract Selection
+
+**[api/engine/stream_driven_worker.py](api/engine/stream_driven_worker.py)**  
+**[api/tradier_integration/client.py](api/tradier_integration/client.py)**
+
+The previous `_select_option_contract` implementation pointed at Alpaca's API and returned nothing.
+
+Replaced with a full Tradier implementation:
+- Calls `GET /v1/markets/options/expirations` — uses today's date as expiry, falls back to nearest future expiry if no 0DTE available
+- Calls `GET /v1/markets/options/chains?greeks=true` — filters to call contracts within `delta_min`/`delta_max` range, `min_open_interest`, and `max_bid_ask_spread` from `strategy.params_json`
+- Scores remaining candidates by `abs(delta - target_delta)`, returns the OCC symbol of the best match (e.g. `TSLA260424C00370000`)
+
+Both `get_option_expirations()` and `get_option_chain()` added to `TradierClient` — always call the **live** Tradier endpoint since sandbox does not carry market data.
+
+#### 2. Strategy Type Detection Fix
+
+**[api/engine/strategy_executor.py](api/engine/strategy_executor.py)**  
+**[api/engine/risk_manager.py](api/engine/risk_manager.py)**
+
+`strategy_type = "scalping_0dte"` never matched the old `'option' in type` guard. Fixed both files to use a keyword list:
+
+```python
+_is_options = any(k in strategy.strategy_type.lower() for k in ('option', '0dte', 'scalping'))
+```
+
+Without this fix the executor used the raw underlying price ($373) for sizing instead of the option premium (~$6), and the risk manager never applied the 100× contract multiplier.
+
+#### 3. Position Sizing Chain — All Bugs Fixed
+
+**[api/engine/risk_manager.py](api/engine/risk_manager.py)**
+
+Multiple compounding sizing bugs were producing `qty=0`:
+
+| Root Cause | Fix |
+|---|---|
+| `max_trade_percentage=0.02` (treated as 0.02%) | Updated to `2.0` in strategy params |
+| `account_size_usd=0.0` (never set) | Account auto-sync added (see below) |
+| Underlying price used instead of option premium | `sizing_price = (bid + ask) / 2` when `_is_options` |
+| `validate_pre_trade` recalculated size from underlying | Pass `sizing_price` to both `calculate_position_size` and `validate_pre_trade` |
+| "At least 1" fallback ignored 100× multiplier | `one_unit_cost = current_price * 100 if _is_options else current_price` |
+
+Options formula: `max_contracts = int(effective_capital / (current_price * 100 * safety_factor))`
+
+#### 4. Account Size Auto-Sync from Tradier
+
+**[api/routers/trading.py](api/routers/trading.py)**
+
+Every `GET /api/v1/trading/account` call now fetches the live Tradier balance and writes `portfolio_value → user.account_size_usd` via `db.commit()`. This keeps the risk manager's capital base in sync with the actual paper/live account without manual intervention.
+
+#### 5. Toggle Endpoint Auto-Starts / Stops Worker Task
+
+**[api/routers/strategies.py](api/routers/strategies.py)**
+
+Made `toggle_strategy` async. When a strategy is activated it now calls `worker.start_strategy(strategy_id)` so the stream subscription and task begin immediately without requiring a server restart. Deactivation calls `worker.stop_strategy(strategy_id)`.
+
+#### 6. `option_symbol` Stored on Position
+
+**[api/models.py](api/models.py)**  
+**[api/engine/order_manager.py](api/engine/order_manager.py)**  
+**[api/engine/strategy_executor.py](api/engine/strategy_executor.py)**  
+**[api/schemas.py](api/schemas.py)**  
+**[api/alembic/versions/1c3159917f07_add_option_symbol_to_positions.py](api/alembic/versions/1c3159917f07_add_option_symbol_to_positions.py)**
+
+`Position.option_symbol = Column(String, nullable=True)` added. The selected OCC symbol is stored on the position at entry time. Exit logic uses `position.option_symbol` (falling back to the current selection only if null) so exit orders always close the correct contract even if the worker restarts and selects a different strike.
+
+Migration applied via `alembic stamp head` → `alembic revision --autogenerate` → `alembic upgrade head` (DB had tables but had never been stamped).
+
+#### 7. Application Logging
+
+**[api/app.py](api/app.py)**
+
+`logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")` added before FastAPI init. Previously uvicorn swallowed all `logger.info` calls, making it impossible to observe execution flow.
+
+#### 8. Positions Page
+
+**[ui/src/app/pages/positions/positions.component.ts](ui/src/app/pages/positions/positions.component.ts)**  
+**[ui/src/app/pages/positions/positions.component.html](ui/src/app/pages/positions/positions.component.html)**
+
+Polls `GET /api/v1/positions` every 10 seconds. Filters `qty > 0`, calculates unrealized P&L and P&L%. Columns: symbol, option_symbol, quantity, entry price, current price, P&L, P&L%, opened at (local time). Date formatted as `MM/dd h:mm:ss a zzz` (12-hour local time with timezone label).
+
+---
+
+### Strategy Params Updated
+
+```json
+{
+  "delta_min": 0.40,
+  "delta_max": 0.90,
+  "max_bid_ask_spread": 0.50,
+  "min_open_interest": 0,
+  "entry_after_open_minutes": 15,
+  "exit_before_close_minutes": 15,
+  "max_trade_percentage": 2.0,
+  "stop_loss_pct": 20.0
+}
+```
+
+`max_positions = 1` — one position at a time per strategy (correct for a scalper; no reason to stack multiple contracts on the same signal).
+
+---
+
+### Key Design Decisions
+
+- **Option premium for sizing, not underlying price** — 1 options contract = premium × 100. Using the $373 underlying to size a $6 option would produce wildly wrong quantities.
+- **Always store option_symbol at entry** — the worker selects the best contract at task startup. If it restarts mid-position it might pick a different strike; using the stored symbol ensures the exit closes what was actually opened.
+- **Live Tradier endpoint for market data regardless of trading mode** — sandbox has no market data. Trading mode (paper vs live) only affects which account the order is routed to.
+- **Account size synced from broker** — risk percentages are meaningless if the capital base is stale or zero. Auto-syncing on every account GET ensures sizing always reflects actual buying power.
+
+---
+
+### First Successful Paper Trade
+
+- **Symbol**: TSLA Apr 24 2026 $370 Call (`TSLA260424C00370000`)
+- **Entry**: ~$6.30 × 100 = $630 cost basis
+- **Account**: Tradier sandbox ($100,000 paper)
+- **Status**: Position visible in Tradier sandbox UI showing cost basis $630, value $565 (−$65, −10.32%) due to theta decay on a near-expiry contract with TSLA at $373
+
+---
+
+#### 9. System Event Log
+
+**[api/models.py](api/models.py)**  
+**[api/engine/event_logger.py](api/engine/event_logger.py)** *(new)*  
+**[api/routers/events.py](api/routers/events.py)** *(new)*  
+**[api/engine/order_manager.py](api/engine/order_manager.py)**  
+**[api/routers/strategies.py](api/routers/strategies.py)**  
+**[api/app.py](api/app.py)**  
+**[ui/src/app/pages/trades/trades.component.ts](ui/src/app/pages/trades/trades.component.ts)**  
+**[ui/src/app/pages/trades/trades.component.html](ui/src/app/pages/trades/trades.component.html)**  
+**[ui/src/app/pages/trades/trades.component.scss](ui/src/app/pages/trades/trades.component.scss)**  
+**[ui/src/app/app.routes.ts](ui/src/app/app.routes.ts)**  
+**[ui/src/app/pages/dashboard/dashboard.component.ts](ui/src/app/pages/dashboard/dashboard.component.ts)**
+
+Replaced the placeholder Trades page with a general-purpose **System Event Log**. The motivation was that the Tradier Account History endpoint only works for live accounts (never returns data for sandbox), and the local `Trade` table only records fills — it doesn't capture the broader system lifecycle. The concept was expanded to a master log that captures anything meaningful: orders, positions, strategy lifecycle, errors.
+
+**New `SystemEvent` DB model** — fields: `event_type`, `severity` (`info`/`success`/`warning`/`error`), `title`, `detail`, `symbol`, `strategy_id`, `event_data` (JSON), `created_at`. Run `python setup_db.py init` to create the table (picked up automatically via `Base.metadata.create_all`).
+
+**`event_logger.py`** — thin helper module. Any file imports `log_event(db, user_id, event_type, title, ...)` and calls it in one line after a successful `db.commit()`. All exceptions are swallowed and rollback is attempted, so logging never crashes the caller.
+
+**Event types and where they fire:**
+
+| Event | Fired from |
+|---|---|
+| `ORDER_PLACED` | `OrderManager.execute_signal()` after successful trade record commit |
+| `ORDER_FAILED` | `OrderManager.execute_signal()` and `close_position()` except blocks |
+| `POSITION_OPENED` | `OrderManager._update_position_entry()` — only on new position creation, not add-to |
+| `POSITION_CLOSED` | `OrderManager._update_position_exit()` and `close_position()` — only when `qty` drops to 0 |
+| `STRATEGY_STARTED` | `strategies.toggle_strategy_status()` when `is_active` flips to `True` |
+| `STRATEGY_STOPPED` | `strategies.toggle_strategy_status()` when `is_active` flips to `False` |
+
+**`GET /api/v1/events`** — paginated, filterable by `event_type`, `severity`, `symbol`, `strategy_id`, `start`, `end`. Returns `{ total, page, limit, events[] }`.
+
+**Frontend** — `/dashboard/events` route (was `/trades`), nav item "Events" with `event_note` icon. Table columns: timestamp, color-coded type badge, severity dot, event title + detail stacked, symbol. Row background tinted by severity. Filter bar: event type dropdown, symbol text, date range pickers. Paginator bound to real server-side `total`.
+
+**Key design decisions:**
+- `log_event` always called *after* a successful `db.commit()` — if the main operation rolled back, the event doesn't get written (correct behaviour).
+- `POSITION_CLOSED` severity is `success` if P&L ≥ 0, `warning` if negative — gives instant visual feedback on outcome.
+- The `Trade` DB table and `RiskEvent` table are left unchanged. The event log is additive; existing functionality is untouched.
+- Route renamed `/trades` → `/events` because "trades" was too narrow for what the page became.
+
+---
+
+## Session — 2026-04-23: Bug Fixes (CORS, Positions Page, Events 500)
+
+### 1. CORS Fix — Wildcard + Credentials
+
+**[api/app.py](api/app.py)**
+
+`allow_origins=["*"]` combined with `allow_credentials=True` is rejected by all browsers — the CORS spec forbids wildcard origins when credentials are involved. The browser was returning `Status code: (null)` on every request, making it look like the server was unreachable.
+
+Fixed by replacing the wildcard with explicit origins:
+
+```python
+allow_origins=[
+    "http://localhost:4200",
+    "http://127.0.0.1:4200",
+]
+```
+
+Confirmed with a direct `OPTIONS` preflight curl — server now returns `Access-Control-Allow-Origin: http://localhost:4200` correctly.
+
+**Note:** Any browser errors showing "CORS header missing" on a `5xx` response are a side effect of FastAPI not injecting CORS headers into unhandled exception responses — the root cause is always the server error, not a real CORS misconfiguration.
+
+---
+
+### 2. User Password Reset
+
+Only one user existed in the dev DB (`kingofpirates92@gmail.com`, role `admin`). Password was unknown. Reset via:
+
+```bash
+python api/manage_users.py update --email kingofpirates92@gmail.com --password admin123
+```
+
+Login: `kingofpirates92@gmail.com` / `admin123`
+
+---
+
+### 3. Positions Page — Wrong Endpoint + Field Name Mismatch
+
+**[ui/src/app/pages/positions/positions.component.ts](ui/src/app/pages/positions/positions.component.ts)**
+**[ui/src/app/pages/positions/positions.component.html](ui/src/app/pages/positions/positions.component.html)**
+
+Two bugs caused the positions page to show nothing:
+
+| Problem | Detail |
+|---|---|
+| Wrong API endpoint | Component called `/api/v1/positions` (DB table) which had a `qty: 0` record — filtered out by `p.qty > 0`. The live position was at `/api/v1/trading/positions` (Tradier). |
+| Field name mismatch | Component expected `unrealized_pnl` and `opened_at`; Tradier response uses `unrealized_pl` and `date_acquired`. |
+
+Fixed by updating the `DbPosition` interface to match the Tradier response shape, pointing the component at `/api/v1/trading/positions`, and updating all template and method references accordingly.
+
+---
+
+### 4. Events Page — `system_events` Table Missing
+
+**[api/routers/events.py](api/routers/events.py)**
+
+`GET /api/v1/events` was returning `500 Internal Server Error` with the traceback:
+
+```
+psycopg2.errors.UndefinedTable: relation "system_events" does not exist
+```
+
+The `SystemEvent` model existed in `models.py` but the table had never been created in the dev database (the `setup_db init` had not been re-run after the model was added). Fixed by running:
+
+```bash
+python api/setup_db.py init
+```
+
+`Base.metadata.create_all` only creates missing tables — existing data was untouched. Endpoint now returns `200` with an empty events list.
+
+---
+
+## Session — 2026-04-23: Market Hours Enforcement & Tradier Clock Integration
+
+### Problem
+Strategies were generating pending orders after market close. The root cause was that `execute_strategy_tick` had **no market hours gate** — it processed entry and exit signals purely based on whether a tick arrived, regardless of whether the exchange was open. The `check_market_hours()` in `trading_safeguards.py` was only called from API routers (strategy start confirmation), never from the worker loop that actually fires orders.
+
+Additionally, the exit-before-close logic in `signal_generator.py` was using a hardcoded UTC offset (`hour=21`) to represent 4 PM ET — which was wrong by one hour during DST (April–October, i.e., most of the trading year).
+
+---
+
+### What We Built
+
+#### 1. Tradier `/v1/markets/clock` as Authoritative Market State
+
+**[api/tradier_integration/client.py](api/tradier_integration/client.py)**
+**[api/utils/market_hours.py](api/utils/market_hours.py)**
+
+Added `get_market_clock()` to `TradierClient`. The endpoint returns `state` (`pre`/`open`/`post`/`closed`), `next_state`, `next_change` (actual next state-change time, e.g. `"13:00"` on a half-day), and a human-readable `description`.
+
+`MarketHours` now uses this as its primary source instead of hand-rolled pytz logic:
+
+- `is_market_open()` — checks `state == "open"` from Tradier. Falls back to local timezone logic if API is unavailable.
+- `get_market_close_time_et()` — **new method**. When state is `open` and `next_state` is `postmarket`, parses Tradier's `next_change` as the actual close time. Returns `16:00` as default. Correctly handles early-close days (Thanksgiving eve, Christmas Eve) that the hardcoded UTC approach could never handle.
+- `get_market_status()` now surfaces `market_state`, `next_state`, and `next_change` from the Tradier response alongside existing fields.
+
+**Cache behaviour:**
+- **60s TTL** — Tradier API called at most once per minute; all other calls are a `time.monotonic()` comparison + dict lookup.
+- **30s error backoff** — if the API call fails, `_clock_error_until` is set. All calls within the 30s window skip the network and fall back to local pytz immediately. Prevents hammering the API during an outage. Backoff clears on the next successful call.
+
+Added 2026 market holidays to the local fallback list (the list only covered through 2025).
+
+#### 2. Market Hours Gate — Three Independent Layers
+
+**[api/engine/stream_driven_worker.py](api/engine/stream_driven_worker.py)**
+**[api/engine/strategy_executor.py](api/engine/strategy_executor.py)**
+**[api/engine/signal_generator.py](api/engine/signal_generator.py)**
+
+| Layer | Location | What it blocks |
+|---|---|---|
+| Worker | `stream_driven_worker.py` — before `state.apply(event)` | Drops raw event before any state is updated; cheapest possible check |
+| Executor | `strategy_executor.py` — first line of `execute_strategy_tick` | Hard gate before signal generation or risk checks run; safety net if executor is ever called directly |
+| Opening window | `signal_generator.check_entry_signal()` | No new entries until `entry_after_open_minutes` minutes past 9:30 AM ET |
+| Pre-close exit | `signal_generator.check_exit_signal()` | Force-exits all positions `exit_before_close_minutes` before actual close (now DST-correct and early-close-aware) |
+
+Both the worker and executor checks call `is_market_open()` which hits the Tradier clock (60s cache). Since `_market_hours` is a module-level singleton, the cache is shared — only one API call per 60s regardless of how many strategies are running.
+
+#### 3. Opening Noise Window — No Entries in First 30 Minutes
+
+**[api/strategy_templates.py](api/strategy_templates.py)**
+**[api/engine/signal_generator.py](api/engine/signal_generator.py)**
+
+Added `entry_after_open_minutes: 30` to all 8 strategy templates. The first 30 minutes after open (9:30–10:00 AM ET) have wide spreads, erratic price discovery from the opening auction, and high false-signal rates.
+
+`check_entry_signal()` checks this as the first condition before any indicator math. Uses `_market_hours.get_current_et_time()` for DST-aware comparison against 9:30 AM ET.
+
+#### 4. DST-Correct Exit-Before-Close
+
+**[api/engine/signal_generator.py](api/engine/signal_generator.py)**
+**[api/engine/trading_safeguards.py](api/engine/trading_safeguards.py)**
+
+The old exit-before-close computed `market_close_time` as `now.replace(hour=21)` in UTC — correct only during standard time. During DST (April–October) the market closes at 20:00 UTC, so the exit was firing an hour late.
+
+Fixed: `check_exit_signal()` now calls `_market_hours.get_market_close_time_et()` for the actual ET close time and uses `get_current_et_time()` for all comparisons. `trading_safeguards.check_market_hours()` replaced with a one-liner delegating to `is_market_open()`.
+
+### Files Changed
+
+| File | Change |
+|---|---|
+| `api/tradier_integration/client.py` | Added `get_market_clock()` |
+| `api/utils/market_hours.py` | Tradier clock as primary source; `get_market_close_time_et()`; 60s TTL + 30s error backoff; 2026 holidays |
+| `api/engine/signal_generator.py` | Opening noise window check; DST-correct exit-before-close |
+| `api/engine/strategy_executor.py` | Market hours hard gate as first check in `execute_strategy_tick` |
+| `api/engine/stream_driven_worker.py` | Market hours gate before event is applied to state |
+| `api/engine/trading_safeguards.py` | `check_market_hours()` delegates to `is_market_open()` |
+| `api/strategy_templates.py` | `entry_after_open_minutes: 30` added to all 8 templates |
+
+---
+
+## Session Date: April 24, 2026
+
+### TSLA 0DTE Scalping — Debugging, Rapid-Loop Root Cause, and Stability Fixes
+
+#### Context
+Continuing from the April 23 session. User manually closed all open TSLA option positions in Tradier. DB was stale (still showed qty=3). A large number of unexpected orders had fired during the day — including a rapid buy/sell loop (~80+ orders in 30 seconds at 10:57 AM ET) and 20-contract orders — traced to a stale bid/ask bug.
+
+---
+
+### Root Cause: Stale Bid/Ask Rapid Loop
+
+**The bug:** When a position was exited and a new contract selected, `state.option_bid` and `state.option_ask` still held values from the *previous* contract. The new entry used those stale prices to compute `sizing_price` and stored that as `avg_entry_price`. When the first real quote arrived for the new contract (a different price), the P&L comparison showed a huge fake loss/gain and the stop-loss fired immediately — then the system re-entered and the cycle repeated, producing dozens of orders per minute.
+
+**The fix** — `api/engine/stream_driven_worker.py`:
+- Reset `state.option_bid = 0.0` and `state.option_ask = 0.0` whenever `state.option_symbol` is cleared (after exit or on new contract selection)
+- The existing `ask <= 0 → skip entry` guard in `_check_entry_signals` then blocks all entries until a real quote arrives for the new contract
+
+---
+
+### Root Cause: 20-Contract Orders
+
+Position sizing is capped by `strategy.params_json.get('max_contracts', 3)`. When params were wiped to only `{stop_loss_percentage, take_profit_percentage}`, the `max_contracts` default of 3 applied. The 20-contract orders happened when params were missing `max_trade_percentage` — combined with a very cheap option price, the dollar-based sizing calculated an inflated qty that bypassed the cap in an edge case.
+
+**The fix:** Added `max_contracts: 3` and `risk_per_trade_pct: 1.0` explicitly to strategy params so position size is always bounded.
+
+---
+
+### Root Cause: Params Getting Wiped on UI Edit
+
+The `PUT /strategies/{id}` endpoint was doing a full `setattr` overwrite on every field including `params_json`. When the UI sent an update (e.g., adjusting TP/SL), it only included the visible fields, silently wiping `delta_min`, `delta_max`, `exit_before_close_minutes`, `entry_after_open_minutes`, etc.
+
+**The fix** — `api/routers/strategies.py`:
+```python
+if field == 'params_json' and isinstance(value, dict) and isinstance(strategy.params_json, dict):
+    merged = {**strategy.params_json, **value}
+    strategy.params_json = merged
+    flag_modified(strategy, 'params_json')
+```
+Params now **merge** rather than replace — UI edits only touch keys they know about.
+
+---
+
+### Strategy Params Restored (Full Set)
+
+```python
+{
+    'stop_loss_percentage': 20,
+    'take_profit_percentage': 15,
+    'max_positions': 1,
+    'exit_before_close_minutes': 15,
+    'max_trade_percentage': 2.0,
+    'delta_min': 0.50,
+    'delta_max': 0.65,
+    'min_open_interest': 0,
+    'max_bid_ask_spread': 0.50,
+    'entry_after_open_minutes': 15,
+    'max_contracts': 3,
+    'risk_per_trade_pct': 1.0,
+}
+```
+
+---
+
+### Other Fixes
+
+**Strategy refreshes every 30s in-flight** — `api/engine/stream_driven_worker.py`
+Previously `strategy.params_json` was only re-read from DB on the 60s idle heartbeat. During active market hours the queue is never idle, so param updates from the UI wouldn't be picked up without a server restart. Added a `strategy_refreshed_at` timestamp and `db.refresh(strategy)` every 30 seconds inside the event loop.
+
+**Contract selection cooldown** — `api/engine/stream_driven_worker.py`
+`_select_option_contract` was being called on every underlying trade tick (multiple times per second) when no contract was found. Added a 30-second cooldown: if the options chain returns no suitable contract, the next attempt waits 30 seconds before trying again.
+
+**Misleading "ENTRY SIGNAL" log fixed** — `api/engine/signal_generator.py` + `api/engine/strategy_executor.py`
+The signal generator logged `ENTRY SIGNAL` before the option ask-price guard, so it appeared in logs even when no order would actually be placed. Moved the signal_generator log to DEBUG. Added an INFO-level log in `_check_entry_signals` *after* the `ask > 0` check passes, so `ENTRY SIGNAL` only appears when an order is genuinely about to be submitted.
+
+**Exit reason logging** — `api/engine/strategy_executor.py`
+Every exit now logs: `entry=$X current=$Y pnl=Z% reason=<take profit|stop loss|...>` at INFO level, making it easy to see exactly what triggered each close.
+
+**Contract selection diagnostics** — `api/engine/stream_driven_worker.py`
+`_select_option_contract` now logs a detailed breakdown when it fails:
+```
+No suitable contracts for TSLA 2026-04-24 — 152 calls scanned: 152 wrong delta (need 0.5–0.65), 0 no ask, 0 spread too wide (>50%), 0 low OI | delta range seen: 0.000–1.000 | closest to target: strike=372.5 delta=0.670 (TSLA260424C00372500)
+```
+
+---
+
+### max_positions vs Contracts Clarification
+
+`max_positions=1` limits the system to **1 open position entry** at a time — it does not limit the number of contracts in that position. The number of contracts per position is controlled by:
+- `risk_per_trade_pct` (% of account allocated per trade)
+- `max_contracts` (hard cap)
+- The option's current mid price (cheaper options → more contracts per dollar)
+
+At 1% of a ~$99k account with safety factor 2×, each trade targets ~$495 notional. With a $2.00 option that's ~2 contracts; with a $0.50 option that's ~4 contracts (capped at 3 by `max_contracts`).
+
+---
+
+### 0DTE Delta Gap Observation
+
+At 12:51 PM ET, all 152 TSLA calls were outside the 0.50–0.65 delta window:
+- `$372.50` strike: delta=0.670 (just above max)
+- `$375.00` strike: delta≈0.40 (just below min)
+
+TSLA's price sat between two $2.50-interval strikes, and the 0DTE high-gamma curve creates a delta jump from 0.67 → 0.40 across that gap with no contract landing in 0.50–0.65. The system correctly waited, retrying every 30 seconds. No orders were placed.
+
+---
+
+### Files Modified
+
+| File | Change |
+|------|--------|
+| `api/engine/stream_driven_worker.py` | Stale bid/ask reset on contract clear; 30s contract selection cooldown; 30s strategy param refresh; detailed selection diagnostics |
+| `api/engine/strategy_executor.py` | Exit reason logging; ENTRY SIGNAL log moved to after ask guard |
+| `api/engine/signal_generator.py` | ENTRY SIGNAL log demoted to DEBUG |
+| `api/routers/strategies.py` | params_json merge instead of replace on PUT |
+
+---
+
+

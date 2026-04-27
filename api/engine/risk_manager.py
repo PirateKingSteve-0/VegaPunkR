@@ -80,7 +80,8 @@ class RiskManager:
             return 0
 
         # For options: more conservative sizing due to theta decay
-        if 'option' in strategy.strategy_type.lower():
+        _is_options = any(k in strategy.strategy_type.lower() for k in ('option', '0dte', 'scalping'))
+        if _is_options:
             # Limit to max capital / (price * safety factor)
             safety_factor = 2.0  # More conservative for options
             max_contracts = int(effective_capital / (current_price * 100 * safety_factor))
@@ -92,9 +93,11 @@ class RiskManager:
         strategy_max = strategy.params_json.get('max_contracts', 3)
         final_qty = min(max_contracts, strategy_max)
 
-        # Ensure at least 1 if we have enough capital
-        if final_qty < 1 and effective_capital >= current_price:
-            final_qty = 1
+        # Ensure at least 1 if we have enough capital for one unit
+        if final_qty < 1:
+            one_unit_cost = current_price * 100 if _is_options else current_price
+            if effective_capital >= one_unit_cost:
+                final_qty = 1
 
         logger.info(
             f"Position sizing: account=${account_size}, risk={effective_risk_pct}%, "

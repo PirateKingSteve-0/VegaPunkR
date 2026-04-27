@@ -46,7 +46,7 @@ class Strategy(Base):
 
     # Strategy settings
     timeframe = Column(String, default='1d')  # '1m', '5m', '1h', '1d', etc.
-    max_positions = Column(Integer, default=5)
+    max_positions = Column(Integer, default=1)
     stop_loss_percentage = Column(Float)  # e.g., 0.02 = 2%
     take_profit_percentage = Column(Float)  # e.g., 0.05 = 5%
 
@@ -70,6 +70,7 @@ class Position(Base):
     id = Column(Integer, primary_key=True, index=True)
     user_id = Column(Integer, ForeignKey('users.id'), nullable=False)
     symbol = Column(String, nullable=False, index=True)
+    option_symbol = Column(String, nullable=True)  # OCC symbol e.g. TSLA260424C00370000
     qty = Column(Integer, nullable=False)
 
     # Entry details
@@ -166,6 +167,29 @@ class PerformanceMetrics(Base):
     updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
 
     strategy = relationship("Strategy", back_populates="performance_metrics")
+
+
+class SystemEvent(Base):
+    __tablename__ = 'system_events'
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey('users.id'), nullable=False)
+
+    # Event classification
+    event_type = Column(String, nullable=False, index=True)
+    # ORDER_PLACED | ORDER_FAILED | POSITION_OPENED | POSITION_CLOSED
+    # STRATEGY_STARTED | STRATEGY_STOPPED | STRATEGY_ERROR | RISK_ALERT
+    severity = Column(String, default='info')  # 'info' | 'success' | 'warning' | 'error'
+
+    # Human-readable content
+    title = Column(String, nullable=False)
+    detail = Column(String)
+
+    # Context
+    symbol = Column(String, index=True)
+    strategy_id = Column(Integer, ForeignKey('strategies.id'), nullable=True)
+    event_data = Column(JSON, default=dict)  # price, qty, pnl, order_id, etc.
+
+    created_at = Column(DateTime, server_default=func.now(), index=True)
 
 
 class RiskEvent(Base):

@@ -7,15 +7,16 @@ and provides seamless switching between them without server restart.
 The manager maintains client instances and routes order execution to the
 appropriate API based on the user's selected trading mode.
 """
+import asyncio
 import logging
 import sys
 from pathlib import Path
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 
 # Add parent directory to path to allow imports
 sys.path.append(str(Path(__file__).parent.parent))
 
-from config import settings, TradingMode
+from config import TradingMode
 from models import User
 
 logger = logging.getLogger(__name__)
@@ -52,7 +53,7 @@ class TradingClientManager:
             user: User object with selected_trading_mode
 
         Returns:
-            Trading client instance (Alpaca or Schwab)
+            Trading client instance (Tradier or Schwab)
 
         Raises:
             ValueError: If trading mode is invalid
@@ -64,32 +65,25 @@ class TradingClientManager:
 
         # Get or create client for this mode
         if trading_mode == "paper":
-            return self._get_alpaca_client()
+            return self._get_tradier_client()
         else:
             return self._get_schwab_client()
 
-    def _get_alpaca_client(self):
+    def _get_tradier_client(self):
         """
-        Get or create Alpaca Paper Trading client.
+        Get or create Tradier client (sandbox for paper mode, live for production).
 
         Returns:
-            Alpaca TradingClient instance
+            TradierClient instance
         """
         if TradingMode.PAPER not in self._clients:
             try:
-                from alpaca.trading.client import TradingClient
+                from tradier_integration.client import TradierClient
 
-                self._clients[TradingMode.PAPER] = TradingClient(
-                    api_key=settings.ALPACA_PAPER_API_KEY,
-                    secret_key=settings.ALPACA_PAPER_SECRET_KEY,
-                    paper=True
-                )
-                logger.info("✅ Alpaca Paper Trading client initialized")
-            except ImportError as e:
-                logger.error(f"Failed to import Alpaca client: {e}")
-                raise
+                self._clients[TradingMode.PAPER] = TradierClient()
+                logger.info("✅ Tradier client initialized")
             except Exception as e:
-                logger.error(f"Failed to initialize Alpaca client: {e}")
+                logger.error(f"Failed to initialize Tradier client: {e}")
                 raise
 
         return self._clients[TradingMode.PAPER]
@@ -147,41 +141,52 @@ class TradingClientManager:
 
         try:
             if trading_mode == "paper":
-                # Alpaca API
-                from alpaca.trading.requests import MarketOrderRequest, LimitOrderRequest
-                from alpaca.trading.enums import OrderSide, TimeInForce
-
-                if order_type == "market":
-                    order_data = MarketOrderRequest(
-                        symbol=symbol,
-                        qty=qty,
-                        side=OrderSide.BUY if side == "buy" else OrderSide.SELL,
-                        time_in_force=TimeInForce.DAY
+                option_symbol = kwargs.get("option_symbol")
+                if not option_symbol:
+                    raise ValueError(
+                        f"option_symbol is required for paper option orders (underlying: {symbol}). "
+                        "Ensure the strategy has a valid option contract selected."
                     )
-                elif order_type == "limit":
-                    order_data = LimitOrderRequest(
-                        symbol=symbol,
-                        qty=qty,
-                        side=OrderSide.BUY if side == "buy" else OrderSide.SELL,
-                        time_in_force=TimeInForce.DAY,
-                        limit_price=kwargs.get("limit_price")
-                    )
-                else:
-                    raise ValueError(f"Unsupported order type: {order_type}")
 
-                order = client.submit_order(order_data)
-                logger.info(f"✅ Alpaca order placed: {order.id}")
+                # Map generic buy/sell to Tradier option sides
+                # Only long positions supported — buy_to_open on entry, sell_to_close on exit
+                side_map = {
+                    "buy":  "buy_to_open",
+                    "sell": "sell_to_close",
+                }
+                tradier_side = side_map.get(side)
+                if not tradier_side:
+                    raise ValueError(f"Unsupported option side: {side}")
+
+                # For limit orders pass the midpoint price; market is default
+                limit_price = kwargs.get("limit_price")
+
+                order = await asyncio.to_thread(
+                    client.place_option_order,
+                    symbol=symbol,
+                    option_symbol=option_symbol,
+                    side=tradier_side,
+                    quantity=qty,
+                    order_type=order_type,
+                    duration="day",
+                    price=limit_price,
+                )
+
+                logger.info(
+                    f"Tradier option order placed: id={order.get('id')} "
+                    f"status={order.get('status')} "
+                    f"{tradier_side} {qty}x {option_symbol}"
+                )
                 return order
 
             else:
-                # Schwab API
+                # Schwab Live API
                 order_payload = {
                     "symbol": symbol,
                     "quantity": qty,
                     "side": side,
                     "order_type": order_type,
                 }
-
                 if order_type == "limit":
                     order_payload["limit_price"] = kwargs.get("limit_price")
 
@@ -208,18 +213,25 @@ class TradingClientManager:
 
         try:
             if trading_mode == "paper":
-                # Alpaca API
-                account = client.get_account()
+                # Tradier Sandbox
+                balances = client.get_balances()
+                margin = balances.get("margin") or balances.get("cash") or {}
+                buying_power = (
+                    margin.get("stock_buying_power")
+                    or margin.get("cash_available_for_trading")
+                    or balances.get("total_cash", 0)
+                )
                 return {
-                    "account_number": account.account_number,
-                    "cash": float(account.cash),
-                    "buying_power": float(account.buying_power),
-                    "portfolio_value": float(account.portfolio_value),
-                    "equity": float(account.equity),
-                    "api": "Alpaca Paper"
+                    "account_number": balances.get("account_number", ""),
+                    "cash": float(balances.get("total_cash", 0)),
+                    "buying_power": float(buying_power),
+                    "portfolio_value": float(balances.get("total_equity", 0)),
+                    "equity": float(balances.get("total_equity", 0)),
+                    "open_pl": float(balances.get("open_pl", 0)),
+                    "api": "Tradier Sandbox"
                 }
             else:
-                # Schwab API (sync methods)
+                # Schwab Live
                 account = client.get_account_info()
                 if not account:
                     raise Exception("Failed to get Schwab account info")
@@ -230,10 +242,59 @@ class TradingClientManager:
                     "buying_power": balances.get("buyingPower", 0),
                     "portfolio_value": balances.get("liquidationValue", 0),
                     "equity": balances.get("equity", 0),
+                    "open_pl": 0,
                     "api": "Schwab Live"
                 }
         except Exception as e:
             logger.error(f"❌ Failed to get account info: {e}")
+            raise
+
+    async def get_history(
+        self,
+        user: User,
+        page: int = 1,
+        limit: int = 25,
+        symbol: Optional[str] = None,
+        start: Optional[str] = None,
+        end: Optional[str] = None,
+    ):
+        """
+        Get transaction history from the appropriate trading API.
+        Note: Tradier detailed history is only available for live accounts.
+        """
+        client = self.get_client(user)
+        trading_mode = user.selected_trading_mode or "paper"
+
+        try:
+            if trading_mode == "paper":
+                events = client.get_history(
+                    page=page,
+                    limit=limit,
+                    symbol=symbol,
+                    start=start,
+                    end=end,
+                )
+                result = []
+                for e in events:
+                    desc = (e.get("description") or "").lower()
+                    side = "BUY" if "bought" in desc else ("SELL" if "sold" in desc else "")
+                    result.append({
+                        "date": e.get("date"),
+                        "type": e.get("type"),
+                        "symbol": e.get("symbol"),
+                        "side": side,
+                        "quantity": e.get("quantity"),
+                        "price": e.get("price"),
+                        "amount": e.get("amount"),
+                        "description": e.get("description"),
+                        "commission": e.get("commission"),
+                    })
+                return result
+            else:
+                # Schwab Live: not yet implemented
+                return []
+        except Exception as e:
+            logger.error(f"❌ Failed to get history: {e}")
             raise
 
     async def get_positions(self, user: User):
@@ -251,22 +312,24 @@ class TradingClientManager:
 
         try:
             if trading_mode == "paper":
-                # Alpaca API
-                positions = client.get_all_positions()
+                # Tradier Sandbox
+                positions = client.get_positions()
                 return [
                     {
-                        "symbol": pos.symbol,
-                        "qty": int(pos.qty),
-                        "avg_entry_price": float(pos.avg_entry_price),
-                        "current_price": float(pos.current_price),
-                        "unrealized_pl": float(pos.unrealized_pl),
-                        "unrealized_plpc": float(pos.unrealized_plpc),
-                        "api": "Alpaca Paper"
+                        "symbol": pos.get("symbol", ""),
+                        "qty": float(pos.get("quantity", 0)),
+                        "avg_entry_price": float(pos.get("cost_basis", 0)) / max(float(pos.get("quantity", 1)), 1),
+                        "current_price": 0.0,  # Tradier positions endpoint doesn't include live price
+                        "unrealized_pl": 0.0,
+                        "unrealized_plpc": 0.0,
+                        "cost_basis": float(pos.get("cost_basis", 0)),
+                        "date_acquired": pos.get("date_acquired", ""),
+                        "api": "Tradier Sandbox"
                     }
                     for pos in positions
                 ]
             else:
-                # Schwab API (sync methods, returns simplified format)
+                # Schwab Live
                 positions = client.get_positions()
                 if positions is None:
                     raise Exception("Failed to get Schwab positions")

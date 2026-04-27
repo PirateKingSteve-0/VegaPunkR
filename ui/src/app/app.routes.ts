@@ -42,7 +42,7 @@ export const routes: Routes = [
         loadComponent: () => import('./pages/positions/positions.component').then(m => m.PositionsComponent)
       },
       {
-        path: 'trades',
+        path: 'events',
         loadComponent: () => import('./pages/trades/trades.component').then(m => m.TradesComponent)
       },
       {

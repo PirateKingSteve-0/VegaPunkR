@@ -1,24 +1,37 @@
 """
 Market Hours Detection and Timezone Handling
 Determines when US stock and options markets are open/closed
-Extracted from alpaca-data-main and adapted for async usage
+
+Primary source: Tradier /v1/markets/clock (authoritative — handles holidays
+and early closes). Falls back to local pytz logic if the API is unavailable.
 """
 
+import logging
 from datetime import datetime, time
+from typing import Dict, Optional
+
 import pytz
-from typing import Dict
+
+logger = logging.getLogger(__name__)
 
 
 class MarketHours:
-    """US Market hours detection with timezone awareness"""
+    """US Market hours detection with timezone awareness."""
+
+    CLOCK_CACHE_TTL = 60  # seconds between Tradier clock refreshes
 
     def __init__(self):
         """Initialize with US Eastern timezone"""
         self.eastern = pytz.timezone('US/Eastern')
 
-        # US Market hours (Eastern Time)
+        # US Market hours (Eastern Time) — used as fallback
         self.market_open = time(9, 30)    # 9:30 AM ET
         self.market_close = time(16, 0)   # 4:00 PM ET
+
+        # Tradier clock cache
+        self._clock_cache: Optional[Dict] = None
+        self._clock_cache_time: float = 0.0
+        self._clock_error_until: float = 0.0  # back off until this monotonic time on API failure
 
         # Market holidays (major ones - update annually)
         self.holidays_2024 = [
@@ -47,6 +60,41 @@ class MarketHours:
             datetime(2025, 12, 25), # Christmas
         ]
 
+        self.holidays_2026 = [
+            datetime(2026, 1, 1),   # New Year's Day
+            datetime(2026, 1, 19),  # MLK Day
+            datetime(2026, 2, 16),  # Presidents Day
+            datetime(2026, 4, 3),   # Good Friday
+            datetime(2026, 5, 25),  # Memorial Day
+            datetime(2026, 6, 19),  # Juneteenth
+            datetime(2026, 7, 3),   # Independence Day (observed, July 4 is Saturday)
+            datetime(2026, 9, 7),   # Labor Day
+            datetime(2026, 11, 26), # Thanksgiving
+            datetime(2026, 12, 25), # Christmas
+        ]
+
+    CLOCK_ERROR_BACKOFF = 30  # seconds to wait before retrying after an API failure
+
+    def _get_tradier_clock(self) -> Optional[Dict]:
+        """Fetch market clock from Tradier with a 60s TTL cache and 30s error backoff."""
+        import time as _time
+        now = _time.monotonic()
+        if self._clock_cache is not None and (now - self._clock_cache_time) < self.CLOCK_CACHE_TTL:
+            return self._clock_cache
+        if now < self._clock_error_until:
+            return None  # still in backoff window, use local fallback
+        try:
+            from tradier_integration.client import get_tradier_client
+            clock = get_tradier_client().get_market_clock()
+            self._clock_cache = clock
+            self._clock_cache_time = now
+            self._clock_error_until = 0.0  # clear any previous backoff
+            return clock
+        except Exception as exc:
+            self._clock_error_until = now + self.CLOCK_ERROR_BACKOFF
+            logger.warning(f"Tradier clock unavailable, retrying in {self.CLOCK_ERROR_BACKOFF}s: {exc}")
+            return None
+
     def get_current_et_time(self) -> datetime:
         """Get current time in Eastern timezone"""
         utc_now = datetime.utcnow().replace(tzinfo=pytz.utc)
@@ -63,44 +111,66 @@ class MarketHours:
 
         # Check if holiday
         date_only = dt.date()
-        holidays = self.holidays_2024 + self.holidays_2025
+        holidays = self.holidays_2024 + self.holidays_2025 + self.holidays_2026
         holiday_dates = [h.date() for h in holidays]
 
         return date_only not in holiday_dates
 
     def is_market_open(self, dt: datetime = None) -> bool:
-        """Check if US stock/options markets are currently open"""
+        """Check if US stock/options markets are currently open.
+
+        Uses Tradier /v1/markets/clock as the authoritative source — it handles
+        all holidays and early closes automatically. Falls back to local timezone
+        logic if the API is unavailable.
+        """
+        clock = self._get_tradier_clock()
+        if clock is not None:
+            return clock.get("state") == "open"
+
+        # Fallback: local timezone logic
         if dt is None:
             dt = self.get_current_et_time()
-
-        # Must be a trading day
         if not self.is_market_day(dt):
             return False
-
-        # Check time
         current_time = dt.time()
         return self.market_open <= current_time <= self.market_close
 
+    def get_market_close_time_et(self) -> time:
+        """Return today's actual market close time in ET.
+
+        On early-close days (e.g. day before Thanksgiving, Christmas Eve),
+        Tradier reports the real close via next_change. Falls back to 16:00.
+        """
+        clock = self._get_tradier_clock()
+        if clock and clock.get("state") == "open" and clock.get("next_state") in ("postmarket", "post"):
+            next_change = str(clock.get("next_change", ""))
+            if ":" in next_change:
+                try:
+                    h, m = next_change.split(":")[:2]
+                    return time(int(h), int(m))
+                except (ValueError, IndexError):
+                    pass
+        return self.market_close
+
     def get_market_status(self) -> Dict[str, any]:
-        """Get comprehensive market status"""
+        """Get comprehensive market status."""
         current_et = self.get_current_et_time()
-        is_trading_day = self.is_market_day(current_et)
-        is_open = self.is_market_open(current_et)
+        is_open = self.is_market_open()
 
         status = {
             'current_time_et': current_et.strftime('%Y-%m-%d %H:%M:%S %Z'),
-            'is_trading_day': is_trading_day,
+            'is_trading_day': is_open or self.is_market_day(current_et),
             'is_market_open': is_open,
             'market_hours': f"{self.market_open.strftime('%H:%M')} - {self.market_close.strftime('%H:%M')} ET",
             'available_streams': self._get_available_streams(is_open)
         }
 
-        # Add helpful messages
-        if not is_trading_day:
-            if current_et.weekday() >= 5:
-                status['message'] = "Markets closed: Weekend"
-            else:
-                status['message'] = "Markets closed: Holiday"
+        clock = self._get_tradier_clock()
+        if clock:
+            status['message'] = clock.get('description', 'Market status from Tradier')
+            status['market_state'] = clock.get('state')
+            status['next_state'] = clock.get('next_state')
+            status['next_change'] = clock.get('next_change')
         elif not is_open:
             current_time = current_et.time()
             if current_time < self.market_open:

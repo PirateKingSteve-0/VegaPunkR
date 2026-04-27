@@ -1,3 +1,21 @@
+.strategy-sidenav-container {
+  height: 100%;
+
+  ::ng-deep .mat-drawer.mat-sidenav {
+    position: fixed;
+    top: 0;
+    bottom: 0;
+    height: 100vh;
+  }
+
+  .drawer-close {
+    position: absolute;
+    top: 8px;
+    right: 8px;
+    z-index: 1;
+  }
+}
+
 .strategy-list-container {
   .header {
     display: flex;

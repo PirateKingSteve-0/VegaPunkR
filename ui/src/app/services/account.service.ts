@@ -10,7 +10,8 @@ export interface AccountInfo {
   buying_power: number;
   portfolio_value: number;
   equity: number;
-  api: string;  // "Alpaca Paper" or "Schwab Live"
+  open_pl: number;
+  api: string;  // "Tradier Sandbox", "Tradier Live", or "Schwab Live"
 }
 
 export interface Position {
@@ -20,6 +21,8 @@ export interface Position {
   current_price: number;
   unrealized_pl: number;
   unrealized_plpc: number;
+  cost_basis?: number;
+  date_acquired?: string;
   api: string;
 }
 

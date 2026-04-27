@@ -32,7 +32,9 @@ from datetime import datetime
 sys.path.insert(0, os.path.dirname(__file__))
 
 from models import User
-from database import SessionLocal
+from database import SessionLocals
+from config import Environment
+SessionLocal = SessionLocals[Environment.DEV]
 
 
 def hash_password(password: str) -> str:

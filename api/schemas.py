@@ -136,6 +136,7 @@ class PositionResponse(PositionBase):
     id: int
     user_id: int
     strategy_id: Optional[int] = None
+    option_symbol: Optional[str] = None
     current_price: Optional[float] = None
     unrealized_pnl: Optional[float] = None
     opened_at: datetime

@@ -61,6 +61,14 @@ class Settings(BaseSettings):
     ALPACA_LIVE_API_KEY: str = os.getenv("ALPACA_LIVE_API_KEY_ID", "")
     ALPACA_LIVE_SECRET_KEY: str = os.getenv("ALPACA_LIVE_API_SECRET_KEY", "")
 
+    # Tradier API Keys
+    TRADIER_SANDBOX_API_KEY: str = os.getenv("TRADIER_SANDBOX_API_KEY", "")
+    TRADIER_SANDBOX_ACCOUNT_NUMBER: str = os.getenv("TRADIER_SANDBOX_ACCOUNT_NUMBER", "")
+    TRADIER_SANDBOX_BASE_URL: str = os.getenv("TRADIER_SANDBOX_BASE_URL", "https://sandbox.tradier.com")
+    TRADIER_LIVE_API_KEY: str = os.getenv("TRADIER_LIVE_API_KEY", "")
+    TRADIER_LIVE_BASE_URL: str = os.getenv("TRADIER_LIVE_BASE_URL", "https://api.tradier.com")
+    TRADIER_ENV: str = os.getenv("TRADIER_ENV", "sandbox")
+
     # Schwab API Keys
     SCHWAB_APP_KEY: str = os.getenv("APP_KEY", "")
     SCHWAB_APP_SECRET: str = os.getenv("APP_SECRET", "")
@@ -74,6 +82,7 @@ class Settings(BaseSettings):
     class Config:
         env_file = ".env"
         case_sensitive = True
+        extra = "ignore"
 
 
 settings = Settings()

@@ -10,6 +10,7 @@ from models import Strategy, User
 from schemas import StrategyCreate, StrategyUpdate, StrategyResponse
 from auth import get_current_user
 from strategy_templates import StrategyTemplates
+from engine.event_logger import log_event
 
 router = APIRouter(prefix="/strategies", tags=["Strategies"])
 
@@ -171,7 +172,15 @@ def update_strategy(
     # Update fields if provided
     update_data = strategy_data.model_dump(exclude_unset=True)
     for field, value in update_data.items():
-        setattr(strategy, field, value)
+        if field == 'params_json' and isinstance(value, dict) and isinstance(strategy.params_json, dict):
+            # Merge params so that keys not sent by the UI (e.g. delta_min, exit_before_close_minutes)
+            # are not silently wiped — UI edits only touch the keys they know about
+            merged = {**strategy.params_json, **value}
+            from sqlalchemy.orm.attributes import flag_modified
+            strategy.params_json = merged
+            flag_modified(strategy, 'params_json')
+        else:
+            setattr(strategy, field, value)
 
     db.commit()
     db.refresh(strategy)
@@ -206,14 +215,17 @@ def delete_strategy(
 
 
 @router.post("/{strategy_id}/toggle", response_model=StrategyResponse)
-def toggle_strategy_status(
+async def toggle_strategy_status(
     strategy_id: int,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
     """
     Toggle strategy active status (activate/deactivate).
+    Also starts or stops the execution task in the StreamDrivenWorker.
     """
+    from engine.stream_driven_worker import get_stream_driven_worker
+
     strategy = db.query(Strategy).filter(
         Strategy.id == strategy_id,
         Strategy.user_id == current_user.id
@@ -228,5 +240,21 @@ def toggle_strategy_status(
     strategy.is_active = not strategy.is_active
     db.commit()
     db.refresh(strategy)
+
+    worker = get_stream_driven_worker()
+    if strategy.is_active:
+        await worker.start_strategy(strategy_id)
+    else:
+        await worker.stop_strategy(strategy_id)
+
+    log_event(
+        db=db,
+        user_id=current_user.id,
+        event_type="STRATEGY_STARTED" if strategy.is_active else "STRATEGY_STOPPED",
+        title=f"{'Started' if strategy.is_active else 'Stopped'} \"{strategy.name}\"",
+        strategy_id=strategy.id,
+        severity="info",
+        event_data={"strategy_type": strategy.strategy_type, "is_paper": strategy.is_paper_trading},
+    )
 
     return strategy
