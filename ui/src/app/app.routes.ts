@@ -42,6 +42,10 @@ export const routes: Routes = [
         loadComponent: () => import('./pages/positions/positions.component').then(m => m.PositionsComponent)
       },
       {
+        path: 'watchlists',
+        loadComponent: () => import('./pages/watchlists/watchlists.component').then(m => m.WatchlistsComponent)
+      },
+      {
         path: 'events',
         loadComponent: () => import('./pages/trades/trades.component').then(m => m.TradesComponent)
       },

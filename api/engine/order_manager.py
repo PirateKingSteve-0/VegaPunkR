@@ -6,8 +6,9 @@ to the correct trading API based on user.selected_trading_mode:
   - Paper mode: Alpaca Paper Trading API
   - Live mode: Schwab Live Trading API
 """
+import asyncio
 import logging
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 from datetime import datetime
 from sqlalchemy.orm import Session
 
@@ -85,6 +86,38 @@ class OrderManager:
         )
 
         try:
+            # Lock-out: once a position is open on (user, strategy, symbol),
+            # block further entries so we lock in to sell-to-close instead of
+            # stacking more contracts. Row-level lock prevents the race where
+            # two ticks both see qty=0 and both place orders.
+            if signal.signal_type == 'entry':
+                existing = self.db.query(Position).filter(
+                    Position.user_id == user.id,
+                    Position.strategy_id == strategy.id,
+                    Position.symbol == symbol,
+                ).with_for_update().first()
+                if existing and existing.qty > 0:
+                    self.db.rollback()  # release the row lock immediately
+                    msg = (
+                        f"Entry skipped: position already open on {symbol} "
+                        f"(qty={existing.qty}, contract={existing.option_symbol}). "
+                        "Locked to exit-only."
+                    )
+                    logger.info(msg)
+                    log_event(
+                        db=self.db,
+                        user_id=user.id,
+                        event_type="ENTRY_SKIPPED",
+                        title=f"Entry skipped: {symbol} already open",
+                        detail=msg,
+                        symbol=symbol,
+                        strategy_id=strategy.id,
+                        severity="info",
+                        event_data={"existing_qty": existing.qty},
+                    )
+                    return OrderResult(success=False, message=msg)
+                self.db.rollback()  # release the lock before the broker call
+
             # Place order via TradingClientManager (handles paper/live routing)
             order_response = await self.trading_client.place_order(
                 user=user,
@@ -183,6 +216,57 @@ class OrderManager:
                 message=f"Order execution failed: {str(e)}"
             )
 
+    async def _await_terminal_order(
+        self,
+        order_id: Optional[str],
+        user: User,
+        timeout_s: float = 30.0,
+        poll_interval_s: float = 1.5,
+    ) -> Optional[Dict]:
+        """Poll the broker for an order until it reaches a terminal status.
+
+        Returns the order dict on terminal status, or None if the order id
+        is missing, the broker is non-Tradier, or the timeout elapses.
+
+        Terminal statuses per docs/tradier/accounts/order.md: filled,
+        rejected, canceled, expired. Any other status (pending, open,
+        partially_filled) means we keep waiting.
+        """
+        if not order_id:
+            return None
+
+        # Only Tradier is wired up for status polling today. Schwab path
+        # falls through and the caller treats the original response as the
+        # source of truth (existing behavior pre-change).
+        trading_mode = user.selected_trading_mode or "paper"
+        if trading_mode != "paper":
+            return None
+
+        try:
+            client = self.trading_client.get_client(user)
+        except Exception as e:
+            logger.warning(f"Cannot poll order status — client unavailable: {e}")
+            return None
+
+        terminal = {"filled", "rejected", "canceled", "expired"}
+        deadline = asyncio.get_event_loop().time() + timeout_s
+
+        while asyncio.get_event_loop().time() < deadline:
+            try:
+                order = await asyncio.to_thread(client.get_order, order_id)
+            except Exception as e:
+                logger.warning(f"get_order({order_id}) failed: {e}")
+                await asyncio.sleep(poll_interval_s)
+                continue
+
+            status = (order.get("status") or "").lower()
+            if status in terminal:
+                return order
+
+            await asyncio.sleep(poll_interval_s)
+
+        return None
+
     def _extract_order_id(self, order_response: Dict) -> Optional[str]:
         """Extract order ID from API response"""
         # Tradier format: { "id": 123456, "status": "ok" }
@@ -240,6 +324,39 @@ class OrderManager:
 
         # Assume full fill for market orders
         return requested_qty
+
+    def _reconcile_exit_reason(
+        self,
+        reason: Optional[str],
+        pnl: float,
+        filled_price: float,
+        entry_price: float,
+    ) -> Optional[str]:
+        """
+        Sanity-check the exit signal reason against the realized P&L.
+
+        Exit signals are evaluated on a price snapshot (bid for longs after the
+        Fix-A change, but the bid can still pull between signal evaluation and
+        fill). When the realized P&L disagrees with the signal — e.g. a "Take
+        profit hit" signal but a losing fill — the bare signal reason is
+        misleading on the events page. Rewrite to surface the divergence.
+        """
+        if not reason:
+            return reason
+        lower = reason.lower()
+        if pnl < 0 and "take profit" in lower:
+            return (
+                f"Take-profit signal triggered, but market fill realized "
+                f"P&L {pnl:+.2f} (filled @ {filled_price:.2f}, entry @ "
+                f"{entry_price:.2f}). Bid likely pulled between signal and fill."
+            )
+        if pnl > 0 and "stop loss" in lower:
+            return (
+                f"Stop-loss signal triggered, but market fill realized "
+                f"P&L {pnl:+.2f} (filled @ {filled_price:.2f}, entry @ "
+                f"{entry_price:.2f}). Bid likely bounced between signal and fill."
+            )
+        return reason
 
     def _create_trade_record(
         self,
@@ -302,8 +419,11 @@ class OrderManager:
 
         is_new = position is None
 
-        if position:
-            # Add to existing position
+        if position and position.qty > 0:
+            # This branch should be unreachable: execute_signal pre-flights an
+            # entry-lockout. If we land here, the broker accepted the order
+            # despite an open position (true race). Average so accounting matches
+            # the contracts we actually own, but flag loudly.
             total_qty = position.qty + qty
             total_cost = (position.avg_entry_price * position.qty) + (price * qty)
             new_avg_price = total_cost / total_qty
@@ -312,13 +432,35 @@ class OrderManager:
             position.avg_entry_price = new_avg_price
             position.current_price = price
             position.unrealized_pnl = (price - new_avg_price) * total_qty
-            # Backfill option_symbol if it was missing (e.g. position created before this fix)
             if option_symbol and not position.option_symbol:
                 position.option_symbol = option_symbol
 
-            logger.info(
-                f"Updated position: {symbol} qty={total_qty}, avg_price=${new_avg_price:.2f}"
+            logger.critical(
+                f"STACKED ENTRY (race condition): {symbol} now qty={total_qty}, "
+                f"avg_price=${new_avg_price:.2f} — entry-lockout failed"
             )
+            log_event(
+                db=self.db,
+                user_id=user.id,
+                event_type="POSITION_STACKED",
+                title=f"Position stacked unexpectedly: {symbol}",
+                detail="Entry placed despite open position — investigate race",
+                symbol=symbol,
+                strategy_id=strategy.id,
+                severity="error",
+                event_data={"qty": total_qty, "added": qty},
+            )
+        elif position:
+            # Existing position with qty=0 (closed) — reuse the row for the new entry
+            position.qty = qty
+            position.avg_entry_price = price
+            position.current_price = price
+            position.unrealized_pnl = 0.0
+            position.opened_at = datetime.utcnow()
+            position.option_symbol = option_symbol
+            is_new = True  # treat as a fresh open for event logging
+
+            logger.info(f"Reopened position: {symbol} qty={qty}, price=${price:.2f}")
         else:
             # Create new position
             position = Position(
@@ -476,10 +618,77 @@ class OrderManager:
                     message=f"Failed to place closing order for {position.symbol}"
                 )
 
-            # Extract order details
+            # Re-validate the response body for broker-level errors. Tradier
+            # returns 200 with {"errors": ...} for application errors; the
+            # client raises on those, but this is a defense-in-depth check
+            # for any path that returns a dict with errors without raising.
+            if isinstance(order_response, dict) and order_response.get("errors"):
+                err = order_response["errors"]
+                msg = f"Close rejected by broker: {err}"
+                logger.error(msg)
+                log_event(
+                    db=self.db,
+                    user_id=user.id,
+                    event_type="CLOSE_REJECTED",
+                    title=f"Close rejected: {position.symbol}",
+                    detail=str(err),
+                    symbol=position.symbol,
+                    strategy_id=strategy.id,
+                    severity="error",
+                )
+                return OrderResult(success=False, message=msg)
+
             order_id = self._extract_order_id(order_response)
-            filled_price = self._extract_filled_price(order_response, position.current_price)
-            filled_qty = self._extract_filled_qty(order_response, position.qty)
+
+            # Poll Tradier for terminal status before mutating local position state.
+            # Submission status of "ok"/"pending"/"open" only means accepted —
+            # the order can still be rejected, canceled, or expire. We must
+            # confirm it filled before zeroing local qty.
+            terminal_order = await self._await_terminal_order(order_id, user)
+            if terminal_order is None:
+                # Could not confirm fill — leave local qty intact so reconciliation
+                # can pick this up on the next 60s tick rather than us claiming
+                # the position is closed when it may not be
+                msg = (
+                    f"Close order {order_id} status not confirmed within timeout — "
+                    "leaving local position open for reconciliation"
+                )
+                logger.warning(msg)
+                log_event(
+                    db=self.db,
+                    user_id=user.id,
+                    event_type="CLOSE_UNCONFIRMED",
+                    title=f"Close unconfirmed: {position.symbol}",
+                    detail=msg,
+                    symbol=position.symbol,
+                    strategy_id=strategy.id,
+                    severity="warning",
+                    event_data={"order_id": order_id},
+                )
+                return OrderResult(success=False, message=msg, order_id=order_id)
+
+            terminal_status = (terminal_order.get("status") or "").lower()
+            if terminal_status != "filled":
+                msg = (
+                    f"Close order {order_id} did not fill (status={terminal_status}). "
+                    "Local position left open."
+                )
+                logger.error(msg)
+                log_event(
+                    db=self.db,
+                    user_id=user.id,
+                    event_type="CLOSE_FAILED",
+                    title=f"Close failed: {position.symbol}",
+                    detail=msg,
+                    symbol=position.symbol,
+                    strategy_id=strategy.id,
+                    severity="error",
+                    event_data={"order_id": order_id, "status": terminal_status},
+                )
+                return OrderResult(success=False, message=msg, order_id=order_id)
+
+            filled_price = self._extract_filled_price(terminal_order, position.current_price)
+            filled_qty = self._extract_filled_qty(terminal_order, position.qty)
 
             # Calculate final P&L
             pnl = (filled_price - position.avg_entry_price) * filled_qty
@@ -521,12 +730,15 @@ class OrderManager:
                 f"Price=${filled_price:.2f}"
             )
 
+            detail_text = self._reconcile_exit_reason(
+                reason, pnl, filled_price, position.avg_entry_price
+            )
             log_event(
                 db=self.db,
                 user_id=user.id,
                 event_type="POSITION_CLOSED",
                 title=f"Closed {position.symbol}  P&L {pnl:+.2f}",
-                detail=reason,
+                detail=detail_text,
                 symbol=position.symbol,
                 strategy_id=strategy.id,
                 severity="success" if pnl >= 0 else "warning",

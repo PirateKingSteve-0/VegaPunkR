@@ -333,15 +333,20 @@ class StrategyExecutor:
             # Determine position side
             position_side = 'long'  # Currently only supporting long positions
 
-            # For options positions use the option mid price for P&L, not the underlying.
-            # Entry price is stored as option premium; comparing against underlying price
-            # produces nonsensical P&L percentages (e.g. 12000%).
+            # For long option positions evaluate exits at the bid — that's the
+            # realistic fill price for a market sell. Using mid overstates what
+            # we can actually realize; with wide spreads it can fire take-profit
+            # while the bid-side fill is a loss. Entry price is the option premium,
+            # so comparing against the underlying produces nonsensical %s anyway.
             exit_price = current_price
             bid = market_data.get('bid', 0) or 0
             ask = market_data.get('ask', 0) or 0
             option_symbol = position.option_symbol or market_data.get('option_symbol')
             if option_symbol:
-                if ask > 0:
+                if bid > 0:
+                    exit_price = bid
+                elif ask > 0:
+                    # One-sided book — fall back to mid (which is just ask/2 here)
                     exit_price = (bid + ask) / 2
                 else:
                     # Stream hasn't delivered a quote yet — fall back to Tradier REST

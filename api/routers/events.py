@@ -1,7 +1,7 @@
 """
 System event log endpoint.
 """
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import List, Optional
 
 from fastapi import APIRouter, Depends, Query
@@ -68,7 +68,10 @@ def get_events(
                 "symbol": e.symbol,
                 "strategy_id": e.strategy_id,
                 "event_data": e.event_data,
-                "created_at": e.created_at.isoformat() if e.created_at else None,
+                "created_at": (
+                    e.created_at.replace(tzinfo=timezone.utc).isoformat()
+                    if e.created_at else None
+                ),
             }
             for e in events
         ],

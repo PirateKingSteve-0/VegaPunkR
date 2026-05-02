@@ -1,0 +1,57 @@
+<div class="chart-dialog">
+  <div class="dialog-header">
+    <div class="title-row">
+      <h2>{{ position.symbol }}</h2>
+      <span class="meta">
+        Qty {{ position.qty }} · Entry {{ position.avg_entry_price | currency }}
+        · Acquired {{ position.date_acquired | date:'MMM d, y' }}
+        <ng-container *ngIf="position.close_date && position.exit_price != null">
+          · Exit {{ position.exit_price | currency }} on {{ position.close_date | date:'MMM d, y' }}
+        </ng-container>
+      </span>
+    </div>
+    <button mat-icon-button (click)="dialogRef.close()" aria-label="Close">
+      <mat-icon>close</mat-icon>
+    </button>
+  </div>
+
+  <div class="range-row">
+    <mat-button-toggle-group [value]="range" (change)="setRange($event.value)">
+      <mat-button-toggle
+        *ngFor="let r of ranges"
+        [value]="r.key"
+        [disabled]="isRangeDisabled(r.key)"
+        [matTooltip]="rangeTooltip(r)">
+        {{ r.label }}
+      </mat-button-toggle>
+    </mat-button-toggle-group>
+
+    <mat-button-toggle-group
+      *ngIf="isOptionSymbol(position.symbol)"
+      class="mode-group"
+      [value]="chartMode"
+      (change)="setChartMode($event.value)">
+      <mat-button-toggle value="contract"
+        matTooltip="Chart the option contract's premium (daily only)">
+        Contract
+      </mat-button-toggle>
+      <mat-button-toggle value="underlying"
+        [matTooltip]="'Chart the underlying ' + (extractUnderlying(position.symbol) || '') + ' equity (intraday available)'">
+        Underlying
+      </mat-button-toggle>
+    </mat-button-toggle-group>
+  </div>
+
+  <div class="chart-host">
+    <div #chartContainer class="chart-canvas"></div>
+
+    <div *ngIf="loading" class="overlay">
+      <mat-spinner diameter="40"></mat-spinner>
+    </div>
+
+    <div *ngIf="error && !loading" class="overlay error">
+      <mat-icon>error_outline</mat-icon>
+      <p>{{ error }}</p>
+    </div>
+  </div>
+</div>

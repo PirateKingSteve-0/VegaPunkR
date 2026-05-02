@@ -26,6 +26,7 @@ logger = logging.getLogger(__name__)
 
 _GREEKS_REFRESH_INTERVAL = timedelta(minutes=5)
 _MARKET_CLOSED_LOG_INTERVAL = timedelta(minutes=1)
+_RECONCILE_INTERVAL = timedelta(seconds=60)
 
 
 @dataclass
@@ -224,6 +225,7 @@ class StreamDrivenWorker:
                 strategy_refreshed_at = datetime.utcnow()
                 contract_retry_at: Optional[datetime] = None  # throttle failed contract-selection retries
                 last_market_closed_log: Optional[datetime] = None
+                last_closed_reconcile_at: Optional[datetime] = None
 
                 try:
                     while self._running and strategy.is_active:
@@ -247,6 +249,13 @@ class StreamDrivenWorker:
                             if last_market_closed_log is None or now - last_market_closed_log >= _MARKET_CLOSED_LOG_INTERVAL:
                                 logger.info(f"Strategy {strategy_id}: market closed, waiting")
                                 last_market_closed_log = now
+                            # After-hours stream events keep the queue warm so the
+                            # 60s timeout-driven reconcile never fires.  Reconcile
+                            # here on a 60s throttle so manual closes done after
+                            # the bell still get caught and logged.
+                            if last_closed_reconcile_at is None or now - last_closed_reconcile_at >= _RECONCILE_INTERVAL:
+                                await self._reconcile_position(strategy_id, state, db)
+                                last_closed_reconcile_at = now
                             continue
 
                         state.apply(event)
@@ -387,6 +396,7 @@ class StreamDrivenWorker:
             else:
                 # No position in Tradier — zero out DB if stale
                 if db_pos and db_pos.qty > 0:
+                    closed_contract = db_pos.option_symbol
                     logger.info(
                         f"Strategy {strategy_id}: DB shows open position but "
                         "Tradier has none — clearing (was manually closed)"
@@ -394,6 +404,20 @@ class StreamDrivenWorker:
                     db_pos.qty = 0
                     db_pos.unrealized_pnl = 0.0
                     db.commit()
+
+                    log_event(
+                        db=db,
+                        user_id=db_pos.user_id,
+                        event_type="POSITION_MANUALLY_CLOSED",
+                        title=f"Position closed manually: {closed_contract or underlying}",
+                        symbol=db_pos.symbol,
+                        strategy_id=strategy_id,
+                        severity="warning",
+                        event_data={
+                            "option_symbol": closed_contract,
+                            "detected_at": "startup_sync",
+                        },
+                    )
 
         except Exception as e:
             logger.warning(f"Startup Tradier sync failed for strategy {strategy_id}: {e}")
@@ -426,9 +450,14 @@ class StreamDrivenWorker:
             from tradier_integration.client import get_tradier_client
             client = get_tradier_client()
             tradier_positions = await asyncio.to_thread(client.get_positions)
-            held_symbols = {p.get("symbol") for p in tradier_positions}
 
-            if contract not in held_symbols:
+            held = {
+                p.get("symbol"): int(float(p.get("quantity", 0) or 0))
+                for p in tradier_positions
+            }
+            tradier_qty = held.get(contract, 0)
+
+            if tradier_qty <= 0:
                 logger.warning(
                     f"Strategy {strategy_id}: {contract} not found in Tradier — "
                     "position was manually closed externally"
@@ -450,6 +479,38 @@ class StreamDrivenWorker:
 
                 # Clear so next entry picks a fresh contract
                 state.option_symbol = None
+
+            elif tradier_qty < position.qty:
+                # Partial manual close — adjust local qty down to match broker
+                logger.warning(
+                    f"Strategy {strategy_id}: {contract} qty drift — "
+                    f"local={position.qty} tradier={tradier_qty} (partial manual close)"
+                )
+                position.qty = tradier_qty
+                position.unrealized_pnl = (
+                    (position.current_price or position.avg_entry_price) - position.avg_entry_price
+                ) * tradier_qty
+                db.commit()
+
+                log_event(
+                    db=db,
+                    user_id=position.user_id,
+                    event_type="POSITION_QTY_RECONCILED",
+                    title=f"Position qty adjusted: {contract}",
+                    detail=f"Local qty reduced to match Tradier ({tradier_qty})",
+                    symbol=position.symbol,
+                    strategy_id=strategy_id,
+                    severity="warning",
+                    event_data={"option_symbol": contract, "tradier_qty": tradier_qty},
+                )
+
+            elif tradier_qty > position.qty:
+                # Tradier shows more contracts than we tracked — likely a manual
+                # buy in the broker UI. Don't silently adopt them; just warn.
+                logger.warning(
+                    f"Strategy {strategy_id}: {contract} qty drift — "
+                    f"local={position.qty} tradier={tradier_qty} (extra contracts on broker)"
+                )
 
         except Exception as e:
             logger.warning(f"Position reconciliation failed for strategy {strategy_id}: {e}")

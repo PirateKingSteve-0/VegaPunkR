@@ -2,30 +2,37 @@
   <div class="header">
     <h1>Performance Analytics</h1>
     <div class="header-actions">
-      <button mat-button>
-        <mat-icon>calendar_today</mat-icon>
-        Last 30 Days
-      </button>
-      <button mat-raised-button color="primary">
-        <mat-icon>file_download</mat-icon>
-        Export Report
+      <mat-button-toggle-group
+        [value]="period()"
+        (change)="onPeriodChange($event.value)"
+        aria-label="Period">
+        <mat-button-toggle *ngFor="let p of periods" [value]="p.value">
+          {{ p.label }}
+        </mat-button-toggle>
+      </mat-button-toggle-group>
+      <button mat-stroked-button (click)="refresh()" [disabled]="loading()">
+        <mat-icon>refresh</mat-icon>
+        Refresh
       </button>
     </div>
   </div>
 
+  <div *ngIf="error()" class="error-banner">
+    <mat-icon>error_outline</mat-icon>
+    <span>{{ error() }}</span>
+  </div>
+
   <div class="metrics-grid">
-    <mat-card *ngFor="let metric of metrics" class="metric-card">
+    <mat-card *ngFor="let metric of metrics()" class="metric-card" [attr.data-tone]="metric.tone">
       <mat-card-content>
         <div class="metric-content">
           <div class="metric-icon">
-            <mat-icon color="primary">{{ metric.icon }}</mat-icon>
+            <mat-icon>{{ metric.icon }}</mat-icon>
           </div>
           <div class="metric-info">
             <div class="metric-label">{{ metric.label }}</div>
             <div class="metric-value">{{ metric.value }}</div>
-            <div class="metric-change" [class.positive]="metric.change.includes('+')">
-              {{ metric.change }}
-            </div>
+            <div *ngIf="metric.sub" class="metric-sub">{{ metric.sub }}</div>
           </div>
         </div>
       </mat-card-content>
@@ -35,58 +42,113 @@
   <mat-card class="chart-card">
     <mat-card-header>
       <mat-card-title>Equity Curve</mat-card-title>
+      <mat-card-subtitle>Account value, {{ periodLabel() }}</mat-card-subtitle>
     </mat-card-header>
     <mat-card-content>
-      <div class="chart-placeholder">
-        <mat-icon>show_chart</mat-icon>
-        <p>Portfolio equity curve visualization coming soon...</p>
+      <div class="chart-host" *ngIf="(chartData().labels?.length || 0) > 0; else chartEmpty">
+        <canvas baseChart
+          [type]="chartType"
+          [data]="chartData()"
+          [options]="chartOptions">
+        </canvas>
       </div>
+      <ng-template #chartEmpty>
+        <div class="empty-state">
+          <mat-icon>show_chart</mat-icon>
+          <p *ngIf="loading()">Loading equity curve…</p>
+          <p *ngIf="!loading()">
+            No historical balance data for this period.
+            <br />
+            <small>Tradier sandbox accounts do not return historical data.</small>
+          </p>
+        </div>
+      </ng-template>
     </mat-card-content>
   </mat-card>
 
-  <mat-card class="strategy-performance-card">
+  <mat-card class="closed-positions-card">
     <mat-card-header>
-      <mat-card-title>Strategy Performance</mat-card-title>
+      <mat-card-title>Closed Positions</mat-card-title>
+      <mat-card-subtitle>Realized gain/loss (updated nightly)</mat-card-subtitle>
     </mat-card-header>
     <mat-card-content>
-      <div *ngIf="strategyPerformance.length === 0" class="empty-state">
-        <mat-icon>psychology</mat-icon>
-        <p>No strategy performance data available</p>
+      <div *ngIf="closedPositions().length === 0" class="empty-state">
+        <mat-icon>inbox</mat-icon>
+        <p>No closed positions reported by Tradier yet.</p>
       </div>
 
-      <table mat-table [dataSource]="strategyPerformance" *ngIf="strategyPerformance.length > 0">
-        <ng-container matColumnDef="strategy">
-          <th mat-header-cell *matHeaderCellDef>Strategy</th>
-          <td mat-cell *matCellDef="let row">{{ row.strategy }}</td>
+      <table
+        mat-table
+        matSort
+        [dataSource]="closedDataSource"
+        *ngIf="closedPositions().length > 0"
+        class="closed-table">
+        <ng-container matColumnDef="symbol">
+          <th mat-header-cell *matHeaderCellDef mat-sort-header>Symbol</th>
+          <td mat-cell *matCellDef="let row">{{ row.symbol }}</td>
         </ng-container>
 
-        <ng-container matColumnDef="trades">
-          <th mat-header-cell *matHeaderCellDef>Trades</th>
-          <td mat-cell *matCellDef="let row">{{ row.trades }}</td>
+        <ng-container matColumnDef="open_date">
+          <th mat-header-cell *matHeaderCellDef mat-sort-header>Opened</th>
+          <td mat-cell *matCellDef="let row">{{ fmtDate(row.open_date) }}</td>
         </ng-container>
 
-        <ng-container matColumnDef="winRate">
-          <th mat-header-cell *matHeaderCellDef>Win Rate</th>
-          <td mat-cell *matCellDef="let row">{{ row.winRate }}%</td>
+        <ng-container matColumnDef="close_date">
+          <th mat-header-cell *matHeaderCellDef mat-sort-header>Closed</th>
+          <td mat-cell *matCellDef="let row">{{ fmtDate(row.close_date) }}</td>
         </ng-container>
 
-        <ng-container matColumnDef="avgProfit">
-          <th mat-header-cell *matHeaderCellDef>Avg Profit</th>
-          <td mat-cell *matCellDef="let row">{{ row.avgProfit | currency }}</td>
+        <ng-container matColumnDef="term">
+          <th mat-header-cell *matHeaderCellDef mat-sort-header>Term (d)</th>
+          <td mat-cell *matCellDef="let row">{{ row.term }}</td>
         </ng-container>
 
-        <ng-container matColumnDef="totalReturn">
-          <th mat-header-cell *matHeaderCellDef>Total Return</th>
+        <ng-container matColumnDef="quantity">
+          <th mat-header-cell *matHeaderCellDef mat-sort-header>Qty</th>
+          <td mat-cell *matCellDef="let row">{{ row.quantity }}</td>
+        </ng-container>
+
+        <ng-container matColumnDef="cost">
+          <th mat-header-cell *matHeaderCellDef mat-sort-header>Cost</th>
+          <td mat-cell *matCellDef="let row">{{ fmtCurrency(row.cost) }}</td>
+        </ng-container>
+
+        <ng-container matColumnDef="proceeds">
+          <th mat-header-cell *matHeaderCellDef mat-sort-header>Proceeds</th>
+          <td mat-cell *matCellDef="let row">{{ fmtCurrency(row.proceeds) }}</td>
+        </ng-container>
+
+        <ng-container matColumnDef="gain_loss">
+          <th mat-header-cell *matHeaderCellDef mat-sort-header>Gain/Loss</th>
           <td mat-cell *matCellDef="let row"
-              [class.profit]="row.totalReturn > 0"
-              [class.loss]="row.totalReturn < 0">
-            {{ row.totalReturn | currency }}
+              [class.profit]="row.gain_loss > 0"
+              [class.loss]="row.gain_loss < 0">
+            {{ fmtCurrency(row.gain_loss) }}
+          </td>
+        </ng-container>
+
+        <ng-container matColumnDef="gain_loss_percent">
+          <th mat-header-cell *matHeaderCellDef mat-sort-header>%</th>
+          <td mat-cell *matCellDef="let row"
+              [class.profit]="row.gain_loss_percent > 0"
+              [class.loss]="row.gain_loss_percent < 0">
+            {{ row.gain_loss_percent | number: '1.2-2' }}%
           </td>
         </ng-container>
 
         <tr mat-header-row *matHeaderRowDef="displayedColumns"></tr>
-        <tr mat-row *matRowDef="let row; columns: displayedColumns;"></tr>
+        <tr mat-row *matRowDef="let row; columns: displayedColumns;"
+            class="closed-row"
+            matTooltip="Click to view chart"
+            (click)="openChart(row)"></tr>
       </table>
+
+      <mat-paginator
+        *ngIf="closedPositions().length > 0"
+        [pageSizeOptions]="[10, 25, 50, 100]"
+        [pageSize]="25"
+        showFirstLastButtons>
+      </mat-paginator>
     </mat-card-content>
   </mat-card>
 </div>

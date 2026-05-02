@@ -1,0 +1,215 @@
+<div class="watchlists-container">
+  <div class="header">
+    <h1>Watchlists</h1>
+    <button mat-raised-button color="primary" (click)="startCreate()">
+      <mat-icon>add</mat-icon>
+      New Watchlist
+    </button>
+  </div>
+
+  <div class="layout">
+    <!-- Sidebar: list of watchlists -->
+    <mat-card class="sidebar">
+      <mat-card-content>
+        @if (loadingList()) {
+          <div class="centered">
+            <mat-spinner diameter="32"></mat-spinner>
+          </div>
+        } @else if (watchlists().length === 0) {
+          <div class="empty-state">
+            <mat-icon>bookmark_border</mat-icon>
+            <p>No watchlists yet</p>
+          </div>
+        } @else {
+          <mat-nav-list>
+            @for (w of watchlists(); track w.id) {
+              <a mat-list-item
+                 (click)="selectWatchlist(w)"
+                 [class.active]="selected()?.id === w.id">
+                <mat-icon matListItemIcon>list_alt</mat-icon>
+                <span matListItemTitle>{{ w.name }}</span>
+                <span matListItemLine class="muted">{{ w.id }}</span>
+              </a>
+            }
+          </mat-nav-list>
+        }
+      </mat-card-content>
+    </mat-card>
+
+    <!-- Detail / form pane -->
+    <mat-card class="detail">
+      <mat-card-content>
+        @if (showCreate()) {
+          <h2>Create Watchlist</h2>
+          <form (ngSubmit)="createWatchlist()" class="form-stack">
+            <mat-form-field appearance="outline" class="full-width">
+              <mat-label>Name</mat-label>
+              <input matInput
+                     [(ngModel)]="newName"
+                     name="newName"
+                     placeholder="e.g. Tech Movers"
+                     required
+                     [disabled]="saving()" />
+            </mat-form-field>
+
+            <mat-form-field appearance="outline" class="full-width">
+              <mat-label>Symbols (optional)</mat-label>
+              <input matInput
+                     [(ngModel)]="newSymbols"
+                     name="newSymbols"
+                     placeholder="AAPL, MSFT, NVDA"
+                     [disabled]="saving()" />
+              <mat-hint>Comma- or space-separated.</mat-hint>
+            </mat-form-field>
+
+            <div class="form-actions">
+              <button mat-button type="button"
+                      (click)="cancelCreate()"
+                      [disabled]="saving()">
+                Cancel
+              </button>
+              <button mat-raised-button color="primary" type="submit"
+                      [disabled]="saving() || !newName.trim()">
+                @if (saving()) {
+                  <mat-spinner diameter="18"></mat-spinner>
+                } @else {
+                  <ng-container>Create</ng-container>
+                }
+              </button>
+            </div>
+          </form>
+        } @else if (loadingDetail()) {
+          <div class="centered">
+            <mat-spinner diameter="32"></mat-spinner>
+          </div>
+        } @else if (selected(); as wl) {
+          <div class="detail-header">
+            <mat-form-field appearance="outline" class="rename-field">
+              <mat-label>Watchlist name</mat-label>
+              <input matInput
+                     [(ngModel)]="editName"
+                     name="editName"
+                     [disabled]="saving()" />
+            </mat-form-field>
+
+            <button mat-stroked-button color="primary"
+                    (click)="renameSelected()"
+                    [disabled]="saving() || !editName.trim() || editName.trim() === wl.name"
+                    matTooltip="Save renamed watchlist">
+              <mat-icon>save</mat-icon>
+              Rename
+            </button>
+
+            <button mat-stroked-button color="warn"
+                    (click)="deleteSelected()"
+                    [disabled]="saving()"
+                    matTooltip="Delete watchlist">
+              <mat-icon>delete</mat-icon>
+              Delete
+            </button>
+          </div>
+
+          <div class="ids-row muted">
+            <span><strong>ID:</strong> {{ wl.id }}</span>
+            <span><strong>Public ID:</strong> {{ wl.public_id }}</span>
+          </div>
+
+          <mat-divider></mat-divider>
+
+          <div class="symbols-header">
+            <h3>Symbols ({{ wl.items.length }})</h3>
+            <button mat-icon-button
+                    (click)="refreshQuotes()"
+                    [disabled]="loadingQuotes() || wl.items.length === 0"
+                    matTooltip="Refresh quotes">
+              <mat-icon>refresh</mat-icon>
+            </button>
+            @if (loadingQuotes()) {
+              <mat-spinner diameter="18"></mat-spinner>
+            }
+          </div>
+
+          <div class="add-symbol-row">
+            <mat-form-field appearance="outline" class="full-width">
+              <mat-label>Add symbols</mat-label>
+              <input matInput
+                     [(ngModel)]="newSymbolInput"
+                     name="newSymbolInput"
+                     placeholder="SPY, QQQ"
+                     (keyup.enter)="addSymbol()"
+                     [disabled]="saving()" />
+              <mat-hint>Enter to add. Comma- or space-separated.</mat-hint>
+            </mat-form-field>
+            <button mat-raised-button color="primary"
+                    (click)="addSymbol()"
+                    [disabled]="saving() || !newSymbolInput.trim()">
+              <mat-icon>add</mat-icon>
+              Add
+            </button>
+          </div>
+
+          @if (wl.items.length === 0) {
+            <div class="empty-state">
+              <mat-icon>show_chart</mat-icon>
+              <p>No symbols in this watchlist</p>
+            </div>
+          } @else {
+            <table mat-table [dataSource]="wl.items" class="quotes-table">
+              <ng-container matColumnDef="symbol">
+                <th mat-header-cell *matHeaderCellDef>Sym.</th>
+                <td mat-cell *matCellDef="let item"><strong>{{ item.symbol }}</strong></td>
+              </ng-container>
+
+              <ng-container matColumnDef="last">
+                <th mat-header-cell *matHeaderCellDef>Last</th>
+                <td mat-cell *matCellDef="let item">
+                  @if (quotes()[item.symbol]?.last != null) {
+                    {{ quotes()[item.symbol].last | number:'1.2-2' }}
+                  } @else {
+                    <span class="muted">—</span>
+                  }
+                </td>
+              </ng-container>
+
+              <ng-container matColumnDef="change">
+                <th mat-header-cell *matHeaderCellDef>Change</th>
+                <td mat-cell *matCellDef="let item"
+                    [class.profit]="(quotes()[item.symbol]?.change ?? 0) > 0"
+                    [class.loss]="(quotes()[item.symbol]?.change ?? 0) < 0">
+                  @if (quotes()[item.symbol]?.change != null) {
+                    {{ quotes()[item.symbol].change | number:'1.2-2' }}
+                    @if (quotes()[item.symbol]?.change_percentage != null) {
+                      <span class="pct">({{ quotes()[item.symbol].change_percentage | number:'1.2-2' }}%)</span>
+                    }
+                  } @else {
+                    <span class="muted">—</span>
+                  }
+                </td>
+              </ng-container>
+
+              <ng-container matColumnDef="actions">
+                <th mat-header-cell *matHeaderCellDef class="actions-col"></th>
+                <td mat-cell *matCellDef="let item" class="actions-col">
+                  <button mat-icon-button
+                          (click)="removeSymbol(item.symbol)"
+                          [disabled]="saving()"
+                          matTooltip="Remove from watchlist">
+                    <mat-icon>close</mat-icon>
+                  </button>
+                </td>
+              </ng-container>
+
+              <tr mat-header-row *matHeaderRowDef="quoteColumns"></tr>
+              <tr mat-row *matRowDef="let row; columns: quoteColumns"></tr>
+            </table>
+          }
+        } @else {
+          <div class="empty-state">
+            <mat-icon>bookmarks</mat-icon>
+            <p>Select a watchlist or create a new one</p>
+          </div>
+        }
+      </mat-card-content>
+    </mat-card>
+  </div>
+</div>

@@ -5013,4 +5013,213 @@ TSLA's price sat between two $2.50-interval strikes, and the 0DTE high-gamma cur
 
 ---
 
+## Session Date: April 29, 2026
+
+### Tradier API Reference Wired Into Repo Config
+
+Added `CLAUDE.md` at repo root pointing Claude at `docs/tradier/` (accounts, market, streaming, trading, watchlist) so any future task touching the Tradier API consults the canonical endpoint docs instead of guessing paths/fields.
+
+---
+
+### Three Bugs Fixed: Stacking, Silent Close Failures, Reconciliation Gaps
+
+**Symptoms reported by the user:**
+1. Once a position was open, every entry signal added more contracts to it instead of locking to sell-to-close.
+2. Sell-to-close orders were sometimes rejected by Tradier (200 + `errors` body), but local DB recorded them as closed.
+3. No clear story for what happens when a position is manually closed in the Tradier portal.
+
+#### Bug 1 — Position Stacking on Subsequent Entries
+
+`api/engine/order_manager.py`
+
+`_update_position_entry` averaged into an existing `Position` row whenever a signal fired, gated only by `strategy.max_positions` (a count check on `Position.qty > 0` without row-level locking). Under a true asyncio race two ticks could both see "no position" and both place orders, ending up averaged together.
+
+**Fix:** Added a row-locked pre-flight in `OrderManager.execute_signal` for entry signals:
+- `SELECT FOR UPDATE` on the `(user, strategy, symbol)` Position row.
+- If `qty > 0`, skip the entry **before** the order goes to the broker; emit `ENTRY_SKIPPED` event.
+- Lock released immediately (`db.rollback()`) so we don't hold it across the broker network call.
+
+Backstop: the `_update_position_entry` "existing position with qty > 0" branch now logs `CRITICAL` + emits `POSITION_STACKED` — it should be unreachable; if hit, it still averages so accounting matches contracts actually purchased. A separate `qty == 0` branch reuses closed Position rows for the next open (resets opened_at, entry price, option_symbol).
+
+#### Bug 2 — Sell-to-Close Treated as Success Despite Broker Rejection
+
+`api/engine/order_manager.py`, `api/tradier_integration/client.py`
+
+Tradier returns HTTP 200 with `{"errors": ...}` for application-level errors. `TradierClient.place_option_order` already raised on that, but `OrderManager.close_position` had two gaps:
+1. No re-validation of the response body (defense-in-depth across non-Tradier paths).
+2. A submitted-but-not-yet-filled status (`ok` / `pending` / `open`) was treated identically to `filled` — local qty got zeroed even if the order later rejected/canceled/expired.
+
+**Fix:**
+- New `TradierClient.get_order(order_id)` → `GET /v1/accounts/{id}/orders/{id}`.
+- New `OrderManager._await_terminal_order` polls (1.5s × up to 30s) until status is one of `filled / rejected / canceled / expired`.
+- `close_position` now: (a) re-checks response body for `errors`, (b) only zeros local qty after **confirmed** `filled`, (c) emits `CLOSE_REJECTED` / `CLOSE_FAILED` / `CLOSE_UNCONFIRMED` events on the failure branches and **leaves the local position open** so the next reconciliation tick catches it.
+- Schwab path is left untouched; only the Tradier (paper) path has the new poll wired up.
+
+#### Bug 3 — Reconciliation Only Checked Symbol Presence, Not Quantity
+
+`api/engine/stream_driven_worker.py`
+
+`_reconcile_position` ran every 60s on the heartbeat but only checked whether the option symbol existed in Tradier's positions list. A partial manual close (e.g. user closes 1 of 3 contracts in the portal) would not reconcile.
+
+**Fix:** Compare local `position.qty` against Tradier's reported quantity for that contract:
+- `tradier_qty <= 0` → `POSITION_MANUALLY_CLOSED` (existing behavior).
+- `tradier_qty < local` → `POSITION_QTY_RECONCILED`, adjust local qty down + recalc unrealized P&L.
+- `tradier_qty > local` → log warning (probably a manual broker-side buy we don't want to silently adopt).
+
+#### Saving Tradier Order/Position IDs
+
+Tradier `order_id` is already stored in `Trade.notes['order_id']` (no schema change needed). Tradier doesn't expose a stable position id, so reconciliation uses `option_symbol` as the natural key — which is sufficient now that qty drift is handled.
+
+---
+
+### Live Drift Cleanup During Session
+
+Used the same diagnostic flow we want the worker to handle automatically:
+
+1. Queried Tradier `GET /v1/accounts/VA828004/positions` → `{"positions":"null"}` (0 open).
+2. Queried local DB → 1 stale open Position (id=1, TSLA `TSLA260429C00372500` qty=2, entry $2.09).
+3. Manually zeroed it with `SELECT FOR UPDATE` + `POSITION_MANUALLY_CLOSED` event log.
+4. Re-confirmed both sides clean (Tradier null / local 0).
+
+A subsequent tick during the session opened a new TSLA position, hit the 20% stop-loss (trade id=544 sell_to_close, order 28978732 `status=filled` confirmed via `get_order`), and exited cleanly — confirming the WS streamer + exit-signal path are alive (`python app.py` pid 181043 listening on :8000) and the new close-validation path works against real Tradier responses.
+
+---
+
+### Files Modified
+
+| File | Change |
+|------|--------|
+| `CLAUDE.md` (new) | Points Claude to `docs/tradier/` for any Tradier API task |
+| `api/engine/order_manager.py` | Row-locked entry lockout; close-order response re-validation; `_await_terminal_order` poll until terminal status; `POSITION_STACKED` / `ENTRY_SKIPPED` / `CLOSE_REJECTED` / `CLOSE_FAILED` / `CLOSE_UNCONFIRMED` events |
+| `api/tradier_integration/client.py` | New `get_order(order_id)` method |
+| `api/engine/stream_driven_worker.py` | `_reconcile_position` now compares qty (partial close detection); new `POSITION_QTY_RECONCILED` event |
+
+---
+
+### Performance Page Fleshed Out (Tradier-Backed)
+
+The portal's Performance page was a static placeholder. Wired it up against the Tradier account endpoints already documented in `docs/tradier/accounts/`.
+
+**Backend additions**
+- `api/tradier_integration/client.py` — new `get_historical_balances(period)` hitting `/v1/accounts/{id}/historical-balances` (the dedicated equity-curve endpoint; the existing `get_history` was mistakenly passing `period` to `/history`, which ignores it). Period values: `WEEK | MONTH | YTD | YEAR | YEAR_3 | YEAR_5 | ALL`. Returns `{balances:[{date,value}...], delta, deltaPercent}`.
+- `api/tradier_integration/router.py` — new `GET /tradier/account/historical-balances?period=...` route. `balances` and `gainloss` routes were already present.
+
+**Frontend additions**
+- `ng2-charts@^8.0.0` added (chart.js was already on disk). Registered in `app.config.ts` via `provideCharts(withDefaultRegisterables())`.
+- New `ui/src/app/services/tradier.service.ts` exposing `getBalances`, `getHistoricalBalances`, `getGainLoss`.
+- Full rewrite of `ui/src/app/pages/performance/performance.component.{ts,html,scss}`:
+  - Period toggle group (1W / 1M / YTD / 1Y / 3Y / 5Y / All).
+  - Five metric cards (signal-driven, recompute when data or period changes): Portfolio Value + cash, Period Δ ($/%), Open P&L, Realized P&L (filtered to selected period), Win Rate (W/L counts).
+  - Equity-curve line chart over `historical-balances`, color-shifts green/red based on first-vs-last trend, currency-formatted axis ticks and tooltips.
+  - Sortable closed-positions table from `gainloss` (symbol / opened / closed / term / qty / cost / proceeds / gain $ / gain %), with profit/loss color coding.
+  - Empty/error states; explicit note that Tradier sandbox returns no historical or gainloss data.
+  - Reloads automatically when `SystemService.settings$` changes environment / trading mode (matches the overview-page pattern).
+
+**Timestamp formatting on the closed-positions table**
+- First pass used `toLocaleString` with H:M:S; user pointed out all rows showed the same time-of-day because Tradier `gainloss` only carries day-granularity dates (`YYYY-MM-DDT00:00:00.000Z`). Per Tradier's own docs: *"Will not include specific time (hours/minutes) a position or order was created or closed."*
+- Final version: parse the `YYYY-MM-DD` substring directly into a local `Date` (avoids the UTC-midnight → previous-local-day shift) and render with `toLocaleDateString` only. Dates now stay calendar-correct regardless of viewer timezone.
+
+### Files Modified
+
+| File | Change |
+|------|--------|
+| `api/tradier_integration/client.py` | New `get_historical_balances(period)` |
+| `api/tradier_integration/router.py` | New `GET /tradier/account/historical-balances` route |
+| `ui/package.json` | Added `ng2-charts@^8.0.0` |
+| `ui/src/app/app.config.ts` | Registered `provideCharts(withDefaultRegisterables())` |
+| `ui/src/app/services/tradier.service.ts` (new) | Angular client for balances / historical-balances / gainloss |
+| `ui/src/app/pages/performance/performance.component.{ts,html,scss}` | Full rewrite — period selector, metric cards, equity curve, closed-positions table |
+
+---
+
+## Session Date: April 30, 2026
+
+### Manual-close detection gap — after-hours `POSITION_MANUALLY_CLOSED` not logged
+
+**Symptom**
+User did a manual close on a SPY position after the bell. The next time they checked the event log, there was a `POSITION_OPENED` entry for that SPY trade but no matching `POSITION_MANUALLY_CLOSED` event. They expected the reconciler we'd added to catch this.
+
+**Root cause**
+Two reconcile paths exist in `api/engine/stream_driven_worker.py`, and they had complementary blind spots:
+
+1. **`_startup_sync` (worker boot)** — when DB shows an open position but Tradier doesn't, it zeroed `qty` and `unrealized_pnl` and logged a single `logger.info`, but **never emitted a `POSITION_MANUALLY_CLOSED` system event**. So if the worker restarted in the morning after an after-hours manual close, the position quietly disappeared from the DB with no visible event in the UI.
+2. **`_reconcile_position` (heartbeat)** — emits the event correctly, but is only invoked from the `asyncio.TimeoutError` branch of the main loop (i.e. only when the stream queue has been silent for 60 s).
+
+The market-closed branch in the tick loop did `continue` without reconciling. After-hours stream events (extended-hours quotes/trades) keep `q.get()` returning before the 60 s timeout, so on a typical evening the heartbeat reconcile never fires. The position then sits in DB until the next morning, when `_startup_sync` silently clears it — no event ever logged.
+
+**Fixes applied** (`api/engine/stream_driven_worker.py`)
+
+1. **`_startup_sync` now emits the event** when it clears a stale DB position. Calls `log_event` with `event_type="POSITION_MANUALLY_CLOSED"`, severity `warning`, and `event_data={"option_symbol": …, "detected_at": "startup_sync"}` so we can distinguish startup-detected closes from heartbeat-detected ones in the audit trail.
+2. **Market-closed branch now reconciles on a 60 s throttle.** Added a module-level `_RECONCILE_INTERVAL = timedelta(seconds=60)` and a per-strategy `last_closed_reconcile_at` timestamp. When `is_market_open()` is false, after the existing log throttle, the loop now calls `await self._reconcile_position(strategy_id, state, db)` if it's been ≥60 s since the last call — then `continue`s as before. After-hours manual closes are now caught and logged within ~60 s instead of waiting for the next worker restart.
+
+**Why two fixes instead of one**
+Could have just routed startup detections through the same path as heartbeat detections, but the two callsites have different inputs (`_startup_sync` already has the Tradier positions in hand and the DB position; `_reconcile_position` does its own Tradier lookup). Cheaper and clearer to emit from `_startup_sync` directly than to refactor a shared helper for one extra call.
+
+**Not addressed**
+- Did not query the DB to confirm the missing SPY event — the Postgres connection isn't wired into this shell session. User can verify the fix on the next after-hours close, or with `SELECT id, event_type, title, symbol, created_at FROM system_events WHERE symbol='SPY' ORDER BY created_at DESC LIMIT 20;`.
+- Partial-close handling in `_startup_sync` is unchanged (only the full-close branch emits the new event). Could mirror `_reconcile_position`'s partial-fill logic later if drift becomes an issue.
+
+### Files Modified
+
+| File | Change |
+|------|--------|
+| `api/engine/stream_driven_worker.py` | `_startup_sync` now emits `POSITION_MANUALLY_CLOSED`; market-closed tick branch runs `_reconcile_position` on a 60 s throttle; added `_RECONCILE_INTERVAL` constant |
+
+---
+
+### Interactive Position Charts — Positions + Performance Pages
+
+Added a click-to-open chart dialog on the Positions and Performance (closed positions) pages so the user can visualize price history with entry/exit markers without leaving the dashboard.
+
+**Backend additions** (`api/tradier_integration/`)
+- `client.py` — `get_history_pricing(symbol, interval, start, end)` → `/v1/markets/history` (daily/weekly/monthly; supports OCC option symbols).
+- `client.py` — `get_timesales(symbol, interval, start, end, session_filter)` → `/v1/markets/timesales` (1min/5min/15min, **equity tickers only** — Tradier returns Bad Gateway for OCC option symbols).
+- `router.py` — `GET /tradier/market/history` and `GET /tradier/market/timesales` routes.
+
+**Frontend additions**
+- `lightweight-charts@^5.2.0` (TradingView) added to `ui/package.json`.
+- `ui/src/app/services/tradier.service.ts` — new types `HistoryBar`, `HistoryInterval`, `IntradayBar`, `IntradayInterval`, `SessionFilter`, `TradeEvent`; new methods `getMarketHistory`, `getMarketTimesales`, `getTradeEvents` (the last hits `/account/history?type=trade&exact_match=true` for precise fill timestamps).
+- `ui/src/app/pages/positions/position-chart-dialog/` (new) — `MatDialog`-based chart component with:
+  - Range selector: 1D / 5D / 1M (timesales) · 3M / 6M / 1Y / ALL (history). Each range has a `maxAgeDays` cutoff so older positions auto-fall back to daily candles.
+  - **Contract / Underlying** mode toggle — only shown for OCC option symbols. `extractUnderlying()` regex (`^([A-Z]+)\d{6}[CP]\d{8}$`) pulls the equity ticker so the user can see the stock chart behind the option.
+  - Entry-only price line (Positions) or entry+exit price lines + markers (Performance closed). Markers reuse a single `ISeriesMarkersPluginApi` via `setMarkers()`; price lines tracked in an array and `removePriceLine()`'d before re-adding to prevent stacking on range change.
+  - 12-hour local-time x-axis formatting via lightweight-charts `localization.timeFormatter`.
+- `ui/src/app/pages/performance/performance.component.ts` — opens the dialog on row click, adds `MatPaginator` to the closed-positions table, computes per-share entry/exit (`row.cost / (qty * 100)` for options, `/ qty` for equities), fetches `getTradeEvents` for precise fill times then falls back to date-only.
+- `ui/src/app/pages/positions/positions.component.ts` — same row-click → dialog wiring (entry-only).
+
+**Bugs hit during build (and how each was fixed)**
+
+| # | Symptom | Root cause | Fix |
+|---|---------|------------|-----|
+| 1 | Stacking blue price-line labels in chart corner on every range change | `addPriceLine` returns a handle; we kept calling it without removing the old ones | Track handles in `priceLines: IPriceLine[]`, `removePriceLine` before re-add |
+| 2 | "Bad Gateway" when picking 1D on an option position | Tradier `timesales` rejects OCC symbols | Added `isOptionSymbol()` guard; intraday ranges disabled for options unless user toggles to **Underlying** mode |
+| 3 | Performance row showed entry $500 / exit $172 on a $1.72 contract | Tradier `cost`/`proceeds` are total dollars; options trade per 100-share contract | `multiplier = isOptionSymbol(symbol) ? 100 : 1`, then `entryPerShare = cost / (qty * multiplier)` |
+| 4 | Entry marker landed *after* exit marker on a same-day round-trip (daily candles) | Local TZ `formatDate` shifted ISO `2026-04-27T00:00:00.000Z` to `2026-04-26` for a PT user, hitting a weekend; `>=` snapped to Mon 4/27, `<=` snapped to Fri 4/24 | New `extractDate()` slices the raw `YYYY-MM-DD` directly from the ISO string instead of going through a `Date` |
+| 5 | Same problem on intraday bars | `barDate` was UTC-based, not ET trading-day | Compared by `etCalendarDate` via `Intl.DateTimeFormat({timeZone:'America/New_York'})` |
+| 6 | **Final root cause** — entry showing at "9 PM the day before" in PT timezone | Tradier returns **24-hour** data for some equities (TSLA in this case). First bar of `2026-04-24` ET trading day was `00:00:00 ET` = `21:00 PDT prior day` | When only date precision is available (no trade-event fill timestamp), don't snap to first/last bar of the ET calendar day — anchor to **regular market hours**: `09:30:00 ET` for entry, `16:00:00 ET` for exit. New `placeIntradayMarker(direction, fallbackDate)` helper does this. |
+
+**Why the "anchor to market hours" fix is the right call**
+Live accounts return precise `TradeEvent` fill timestamps (snap to the actual minute). Sandbox doesn't, so we have to fall back to the `close_date` from `gainloss`, which is date-only. The naive fallback ("first bar of that ET trading day") fails for any equity that streams overnight extended-hours bars, because the first bar is midnight, not the open. 9:30 AM / 4:00 PM ET is a sensible default that matches user intuition about same-day round trips.
+
+**Files Modified / Added**
+
+| File | Change |
+|------|--------|
+| `api/tradier_integration/client.py` | New `get_history_pricing` and `get_timesales` methods |
+| `api/tradier_integration/router.py` | New `/tradier/market/history` and `/tradier/market/timesales` routes |
+| `ui/package.json` | Added `lightweight-charts@^5.2.0` |
+| `ui/src/app/services/tradier.service.ts` | `HistoryBar` / `IntradayBar` / `TradeEvent` types; `getMarketHistory`, `getMarketTimesales`, `getTradeEvents` |
+| `ui/src/app/pages/positions/position-chart-dialog/` (new) | `MatDialog` chart component — range selector, contract/underlying toggle, entry/exit markers, 12hr local-time axis |
+| `ui/src/app/pages/positions/positions.component.{ts,html,scss}` | Row-click → chart dialog (entry-only) |
+| `ui/src/app/pages/performance/performance.component.{ts,html,scss}` | Row-click → chart dialog (entry+exit), `MatPaginator` on closed-positions table, options-aware per-share math, `getTradeEvents` fetch for precise fill timestamps |
+| `ui/src/app/pages/trades/trades.component.html` | Minor (touched as part of the same UI pass) |
+| `ui/src/app/app.config.ts` | Provider wiring for the new dialog component |
+
+**Open follow-ups (not yet verified)**
+- User to test the market-hours fallback in their browser tomorrow morning. If markers now land at ~9:30 AM ET / ~4:00 PM ET on same-day round trips, fix is confirmed.
+- 24-hour TSLA bars suggest the user is on **production**, not sandbox. If `getTradeEvents` keeps returning `[]`, check the Network tab for `/tradier/account/history?type=trade&symbol=...` — live should return real fill timestamps and bypass the date-only fallback entirely.
+- Open Positions page may have the same options-math bug (`avg_entry_price` possibly not divided by 100 for option contracts). Worth a quick check.
+
+---
+
 

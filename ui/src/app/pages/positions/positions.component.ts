@@ -8,9 +8,12 @@ import { MatIconModule } from '@angular/material/icon';
 import { MatChipsModule } from '@angular/material/chips';
 import { MatProgressSpinnerModule } from '@angular/material/progress-spinner';
 import { MatBadgeModule } from '@angular/material/badge';
+import { MatDialog, MatDialogModule } from '@angular/material/dialog';
+import { MatTooltipModule } from '@angular/material/tooltip';
 import { interval, Subscription } from 'rxjs';
 import { switchMap, startWith } from 'rxjs/operators';
 import { environment } from '../../../environments/environment';
+import { PositionChartDialogComponent } from './position-chart-dialog/position-chart-dialog.component';
 
 export interface DbPosition {
   symbol: string;
@@ -36,6 +39,8 @@ export interface DbPosition {
     MatChipsModule,
     MatProgressSpinnerModule,
     MatBadgeModule,
+    MatDialogModule,
+    MatTooltipModule,
     CurrencyPipe,
   ],
   templateUrl: './positions.component.html',
@@ -49,7 +54,20 @@ export class PositionsComponent implements OnInit, OnDestroy {
   private apiUrl = `${environment.apiUrl}/trading/positions`;
   poll_interval: number = 10000;
 
-  constructor(private http: HttpClient) {}
+  constructor(private http: HttpClient, private dialog: MatDialog) {}
+
+  openChart(p: DbPosition): void {
+    this.dialog.open(PositionChartDialogComponent, {
+      data: {
+        symbol: p.symbol,
+        avg_entry_price: p.avg_entry_price,
+        date_acquired: p.date_acquired,
+        qty: p.qty,
+      },
+      panelClass: 'position-chart-panel',
+      autoFocus: false,
+    });
+  }
 
   ngOnInit(): void {
     this.sub = interval(this.poll_interval).pipe(

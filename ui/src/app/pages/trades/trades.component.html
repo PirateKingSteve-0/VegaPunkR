@@ -61,7 +61,7 @@
 
         <ng-container matColumnDef="created_at">
           <th mat-header-cell *matHeaderCellDef>Time</th>
-          <td mat-cell *matCellDef="let e">{{ e.created_at | date:'MM/dd/yy HH:mm:ss' }}</td>
+          <td mat-cell *matCellDef="let e">{{ e.created_at | date:'MM/dd/yy h:mm:ss a' }}</td>
         </ng-container>
 
         <ng-container matColumnDef="event_type">

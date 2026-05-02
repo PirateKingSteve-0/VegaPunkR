@@ -51,6 +51,15 @@
         color: #f44336;
         font-weight: 500;
       }
+
+      .position-row {
+        cursor: pointer;
+        transition: background-color 120ms ease;
+
+        &:hover {
+          background-color: rgba(25, 118, 210, 0.06);
+        }
+      }
     }
   }
 }

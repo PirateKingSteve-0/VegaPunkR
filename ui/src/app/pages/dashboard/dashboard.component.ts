@@ -46,6 +46,7 @@ export class DashboardComponent implements OnInit {
     { icon: 'dashboard', label: 'Overview', route: '/dashboard/overview' },
     { icon: 'psychology', label: 'Strategies', route: '/dashboard/strategies' },
     { icon: 'account_balance', label: 'Positions', route: '/dashboard/positions' },
+    { icon: 'bookmarks', label: 'Watchlists', route: '/dashboard/watchlists' },
     { icon: 'event_note', label: 'Events', route: '/dashboard/events' },
     { icon: 'analytics', label: 'Performance', route: '/dashboard/performance' },
     { icon: 'warning', label: 'Risk', route: '/dashboard/risk' },
