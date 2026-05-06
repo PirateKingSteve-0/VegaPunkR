@@ -27,6 +27,15 @@ logger = logging.getLogger(__name__)
 _GREEKS_REFRESH_INTERVAL = timedelta(minutes=5)
 _MARKET_CLOSED_LOG_INTERVAL = timedelta(minutes=1)
 _RECONCILE_INTERVAL = timedelta(seconds=60)
+# Minimum interval between strategy evaluations on the same strategy. Stream
+# ticks can arrive 10+ per second on liquid names; without this, every tick
+# triggers a fresh executor pass before the previous fill has settled, which
+# is what produced the 2026-05-04 runaway loop. Tuned for 0DTE scalping.
+_EVAL_INTERVAL = timedelta(seconds=1)
+# Wall-clock forced reconcile cadence. The existing reconcile relies on the
+# 60s queue-idle timeout; a busy WS queue (or runaway loop) can prevent that
+# timeout from ever firing, leaving local DB and broker out of sync for hours.
+_FORCED_RECONCILE_INTERVAL = timedelta(seconds=60)
 
 
 @dataclass
@@ -226,6 +235,8 @@ class StreamDrivenWorker:
                 contract_retry_at: Optional[datetime] = None  # throttle failed contract-selection retries
                 last_market_closed_log: Optional[datetime] = None
                 last_closed_reconcile_at: Optional[datetime] = None
+                last_eval_at: Optional[datetime] = None
+                last_forced_reconcile_at: Optional[datetime] = None
 
                 try:
                     while self._running and strategy.is_active:
@@ -266,6 +277,28 @@ class StreamDrivenWorker:
                             and event.get("symbol") == underlying
                             and state.underlying_price > 0
                         ):
+                            now = datetime.utcnow()
+
+                            # Forced wall-clock reconcile — independent of queue
+                            # idleness, so a busy stream can't starve sync.
+                            if (
+                                last_forced_reconcile_at is None
+                                or now - last_forced_reconcile_at >= _FORCED_RECONCILE_INTERVAL
+                            ):
+                                await self._reconcile_position(strategy_id, state, db)
+                                last_forced_reconcile_at = now
+
+                            # Per-tick eval debounce — drop ticks that arrive
+                            # faster than the executor can meaningfully act on.
+                            # State accumulator already absorbed the tick above;
+                            # we only skip the executor invocation.
+                            if (
+                                last_eval_at is not None
+                                and now - last_eval_at < _EVAL_INTERVAL
+                            ):
+                                continue
+                            last_eval_at = now
+
                             # Refresh strategy params from DB every 30s so UI edits
                             # (e.g. TP/SL changes) take effect without a server restart
                             if (datetime.utcnow() - strategy_refreshed_at).total_seconds() >= 30:
@@ -433,14 +466,66 @@ class StreamDrivenWorker:
         If the DB shows a position but Tradier no longer holds it,
         the position was closed externally (manual close in broker UI).
         We zero out the DB record and emit a POSITION_MANUALLY_CLOSED event.
+
+        Also handles the inverse: if DB shows flat (qty=0) but Tradier holds
+        contracts for this strategy's underlying, adopt the broker truth so
+        the executor can manage the position rather than silently leaving it
+        unmanaged (this was the 2026-05-04 incident).
         """
+        # Pick up any row for this strategy regardless of qty so we can detect
+        # the inverse-drift case (broker has contracts, DB shows flat).
         position = db.query(Position).filter(
             Position.strategy_id == strategy_id,
-            Position.qty > 0,
-        ).first()
+        ).order_by(Position.id.desc()).first()
 
         if not position:
-            return  # nothing open in DB, nothing to reconcile
+            return  # no row at all to anchor against
+
+        # If DB is flat, look at the broker — if the broker holds something
+        # for this underlying, adopt it so the executor stops missing exits.
+        if position.qty <= 0:
+            try:
+                from tradier_integration.client import get_tradier_client
+                client = get_tradier_client()
+                tradier_positions = await asyncio.to_thread(client.get_positions)
+                underlying = state.underlying_symbol
+                held = [
+                    p for p in tradier_positions
+                    if str(p.get("symbol", "")).startswith(underlying)
+                    and str(p.get("symbol", "")) != underlying
+                    and float(p.get("quantity", 0)) > 0
+                ]
+                if held:
+                    tradier_pos = held[0]
+                    occ = tradier_pos["symbol"]
+                    qty = int(float(tradier_pos.get("quantity", 1)))
+                    cost_basis = float(tradier_pos.get("cost_basis", 0))
+                    entry_price = cost_basis / (qty * 100) if qty > 0 else 0.0
+                    position.qty = qty
+                    position.option_symbol = occ
+                    if entry_price > 0:
+                        position.avg_entry_price = entry_price
+                    position.opened_at = datetime.utcnow()
+                    db.commit()
+                    state.option_symbol = occ
+                    logger.warning(
+                        f"Strategy {strategy_id}: broker held {occ} qty={qty} "
+                        f"while DB was flat — adopting broker truth"
+                    )
+                    log_event(
+                        db=db,
+                        user_id=position.user_id,
+                        event_type="POSITION_ADOPTED_FROM_BROKER",
+                        title=f"Adopted untracked position: {occ}",
+                        detail=f"Broker held {qty} contracts not tracked locally — adopted.",
+                        symbol=position.symbol,
+                        strategy_id=strategy_id,
+                        severity="warning",
+                        event_data={"option_symbol": occ, "qty": qty},
+                    )
+            except Exception as e:
+                logger.warning(f"Inverse-drift reconcile failed for strategy {strategy_id}: {e}")
+            return
 
         contract = state.option_symbol or position.option_symbol
         if not contract:

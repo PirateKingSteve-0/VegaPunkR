@@ -38,7 +38,7 @@ import { StrategyTemplate } from '../../models/strategy.model';
       gap: 12px;
       margin: 0;
       padding: 20px 24px;
-      border-bottom: 1px solid #e0e0e0;
+      border-bottom: 1px solid var(--border);
     }
 
     mat-dialog-content {
@@ -48,7 +48,7 @@ import { StrategyTemplate } from '../../models/strategy.model';
     }
 
     .subtitle {
-      color: #666;
+      color: var(--text-muted);
       margin-bottom: 24px;
       font-size: 14px;
     }
@@ -131,7 +131,7 @@ import { StrategyTemplate } from '../../models/strategy.model';
     }
 
     .icon-beginner {
-      background: linear-gradient(135deg, #4caf50 0%, #45a049 100%);
+      background: var(--color-profit);
       color: white;
     }
 
@@ -141,7 +141,7 @@ import { StrategyTemplate } from '../../models/strategy.model';
     }
 
     .icon-advanced {
-      background: linear-gradient(135deg, #f44336 0%, #d32f2f 100%);
+      background: var(--color-loss);
       color: white;
     }
 
@@ -153,13 +153,13 @@ import { StrategyTemplate } from '../../models/strategy.model';
 
     mat-card-subtitle {
       font-size: 13px;
-      color: #666;
+      color: var(--text-muted);
       margin-top: 4px;
     }
 
     .description {
       font-size: 14px;
-      color: #555;
+      color: var(--text-muted);
       line-height: 1.5;
       margin-bottom: 16px;
       min-height: 60px;
@@ -177,14 +177,14 @@ import { StrategyTemplate } from '../../models/strategy.model';
       align-items: center;
       gap: 8px;
       font-size: 13px;
-      color: #666;
+      color: var(--text-muted);
     }
 
     .detail-icon {
       font-size: 18px;
       width: 18px;
       height: 18px;
-      color: #999;
+      color: var(--text-faint);
     }
 
     .tags {
@@ -205,18 +205,18 @@ import { StrategyTemplate } from '../../models/strategy.model';
     }
 
     .difficulty-beginner {
-      background-color: #e8f5e9;
-      color: #2e7d32;
+      background-color: var(--color-profit-bg);
+      color: var(--color-profit);
     }
 
     .difficulty-intermediate {
-      background-color: #e3f2fd;
-      color: #1565c0;
+      background-color: rgba(25, 118, 210, 0.14);
+      color: var(--primary);
     }
 
     .difficulty-advanced {
-      background-color: #ffebee;
-      color: #c62828;
+      background-color: var(--color-loss-bg);
+      color: var(--color-loss);
     }
 
     mat-card-actions {
@@ -225,7 +225,7 @@ import { StrategyTemplate } from '../../models/strategy.model';
       justify-content: flex-end;
       margin-top: auto;
       padding: 16px;
-      border-top: 1px solid #f0f0f0;
+      border-top: 1px solid var(--border);
     }
 
     mat-card-actions button {

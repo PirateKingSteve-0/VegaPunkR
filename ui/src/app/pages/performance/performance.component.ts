@@ -1,4 +1,4 @@
-import { Component, OnInit, OnDestroy, inject, signal, computed, ViewChild } from '@angular/core';
+import { Component, OnInit, OnDestroy, inject, signal, computed, effect, ViewChild } from '@angular/core';
 import { CommonModule } from '@angular/common';
 import { FormsModule } from '@angular/forms';
 import { MatCardModule } from '@angular/material/card';
@@ -12,8 +12,8 @@ import { MatProgressSpinnerModule } from '@angular/material/progress-spinner';
 import { MatDialog, MatDialogModule } from '@angular/material/dialog';
 import { MatTooltipModule } from '@angular/material/tooltip';
 import { PositionChartDialogComponent } from '../positions/position-chart-dialog/position-chart-dialog.component';
-import { Subscription, forkJoin } from 'rxjs';
-import { distinctUntilChanged, skip } from 'rxjs/operators';
+import { Subscription, forkJoin, of } from 'rxjs';
+import { catchError, distinctUntilChanged, skip } from 'rxjs/operators';
 import { BaseChartDirective } from 'ng2-charts';
 import { ChartConfiguration, ChartData } from 'chart.js';
 
@@ -26,6 +26,7 @@ import {
   TradierBalances,
 } from '../../services/tradier.service';
 import { SystemService } from '../../services/system.service';
+import { ThemeService } from '../../services/theme.service';
 
 interface MetricCard {
   label: string;
@@ -33,6 +34,14 @@ interface MetricCard {
   sub?: string;
   icon: string;
   tone: 'neutral' | 'positive' | 'negative';
+}
+
+interface CalendarCell {
+  date: Date;
+  inMonth: boolean;
+  isToday: boolean;
+  pl: number | null;
+  trades: number;
 }
 
 @Component({
@@ -60,6 +69,7 @@ export class PerformanceComponent implements OnInit, OnDestroy {
   private tradier = inject(TradierService);
   private systemService = inject(SystemService);
   private dialog = inject(MatDialog);
+  private themeService = inject(ThemeService);
   private settingsSub?: Subscription;
 
   @ViewChild(MatSort) sort?: MatSort;
@@ -83,6 +93,70 @@ export class PerformanceComponent implements OnInit, OnDestroy {
   history = signal<HistoricalBalances | null>(null);
   closedPositions = signal<ClosedPosition[]>([]);
 
+  // Anchored to the first of the displayed month
+  calendarMonth = signal<Date>(this.startOfMonth(new Date()));
+  readonly weekdayLabels = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+
+  dailyPL = computed<Map<string, { pl: number; trades: number }>>(() => {
+    const map = new Map<string, { pl: number; trades: number }>();
+    for (const p of this.closedPositions()) {
+      const key = (p.close_date || '').slice(0, 10);
+      if (!key) continue;
+      const cur = map.get(key) ?? { pl: 0, trades: 0 };
+      cur.pl += p.gain_loss || 0;
+      cur.trades += 1;
+      map.set(key, cur);
+    }
+    return map;
+  });
+
+  calendarCells = computed<CalendarCell[]>(() => {
+    const anchor = this.calendarMonth();
+    const year = anchor.getFullYear();
+    const month = anchor.getMonth();
+    const firstWeekday = new Date(year, month, 1).getDay();
+    const start = new Date(year, month, 1 - firstWeekday);
+    const today = new Date();
+    const todayKey = this.toDateKey(today);
+    const pl = this.dailyPL();
+    const cells: CalendarCell[] = [];
+    for (let i = 0; i < 42; i++) {
+      const d = new Date(start.getFullYear(), start.getMonth(), start.getDate() + i);
+      const key = this.toDateKey(d);
+      const entry = pl.get(key);
+      cells.push({
+        date: d,
+        inMonth: d.getMonth() === month,
+        isToday: key === todayKey,
+        pl: entry ? entry.pl : null,
+        trades: entry ? entry.trades : 0,
+      });
+    }
+    return cells;
+  });
+
+  calendarSummary = computed(() => {
+    const anchor = this.calendarMonth();
+    const year = anchor.getFullYear();
+    const month = anchor.getMonth();
+    let total = 0;
+    let wins = 0;
+    let losses = 0;
+    for (const [key, v] of this.dailyPL()) {
+      const [y, m] = key.split('-').map(Number);
+      if (y === year && m - 1 === month) {
+        total += v.pl;
+        if (v.pl > 0) wins++;
+        else if (v.pl < 0) losses++;
+      }
+    }
+    return { total, wins, losses };
+  });
+
+  calendarMonthLabel = computed(() =>
+    this.calendarMonth().toLocaleDateString('en-US', { month: 'long', year: 'numeric' }),
+  );
+
   closedDataSource = new MatTableDataSource<ClosedPosition>([]);
   displayedColumns = [
     'symbol',
@@ -93,6 +167,9 @@ export class PerformanceComponent implements OnInit, OnDestroy {
     'cost',
     'proceeds',
     'gain_loss',
+    'commission',
+    'fees',
+    'net_pnl',
     'gain_loss_percent',
   ];
 
@@ -106,6 +183,10 @@ export class PerformanceComponent implements OnInit, OnDestroy {
     const deltaPct = h?.deltaPercent ?? 0;
     const openPL = b?.open_pl ?? 0;
     const realizedPL = inPeriodClosed.reduce((s, p) => s + (p.gain_loss || 0), 0);
+    const periodCommission = inPeriodClosed.reduce((s, p) => s + (p.commission || 0), 0);
+    const periodFees = inPeriodClosed.reduce((s, p) => s + (p.fees || 0), 0);
+    const periodCosts = periodCommission + periodFees;
+    const netPL = realizedPL - periodCosts;
     const wins = inPeriodClosed.filter(p => p.gain_loss > 0).length;
     const losses = inPeriodClosed.filter(p => p.gain_loss < 0).length;
     const totalTrades = inPeriodClosed.length;
@@ -141,6 +222,20 @@ export class PerformanceComponent implements OnInit, OnDestroy {
         sub: `${totalTrades} trade${totalTrades === 1 ? '' : 's'}`,
         icon: 'attach_money',
         tone: tone(realizedPL),
+      },
+      {
+        label: `Net P&L (${this.periodLabel()})`,
+        value: `${netPL >= 0 ? '+' : ''}${this.fmtCurrency(netPL)}`,
+        sub: `After ${this.fmtCurrency(periodCosts)} costs`,
+        icon: 'request_quote',
+        tone: tone(netPL),
+      },
+      {
+        label: 'Costs (Commission + Fees)',
+        value: this.fmtCurrency(periodCosts),
+        sub: `${this.fmtCurrency(periodCommission)} comm + ${this.fmtCurrency(periodFees)} fees`,
+        icon: 'receipt_long',
+        tone: 'neutral',
       },
       {
         label: 'Win Rate',
@@ -180,6 +275,14 @@ export class PerformanceComponent implements OnInit, OnDestroy {
       line: { tension: 0.25, borderWidth: 2 },
     },
   };
+
+  constructor() {
+    // Rebuild equity chart when theme/colorblind mode changes so colors update live
+    effect(() => {
+      this.themeService.chartColors();
+      if (this.history()) this.rebuildChart();
+    });
+  }
 
   ngOnInit(): void {
     this.loadAll();
@@ -280,12 +383,26 @@ export class PerformanceComponent implements OnInit, OnDestroy {
       balances: this.tradier.getBalances(),
       history: this.tradier.getHistoricalBalances(this.period()),
       gainloss: this.tradier.getGainLoss(1, 200),
+      tradeHistory: this.tradier.getAccountHistory('trade', undefined, undefined, 500).pipe(
+        catchError(() => of([] as TradeEvent[])),
+      ),
+      optionHistory: this.tradier.getAccountHistory('option', undefined, undefined, 500).pipe(
+        catchError(() => of([] as TradeEvent[])),
+      ),
+      feeHistory: this.tradier.getAccountHistory('fee', undefined, undefined, 500).pipe(
+        catchError(() => of([] as TradeEvent[])),
+      ),
     }).subscribe({
-      next: ({ balances, history, gainloss }) => {
+      next: ({ balances, history, gainloss, tradeHistory, optionHistory, feeHistory }) => {
         this.balances.set(balances);
         this.history.set(history);
-        this.closedPositions.set(gainloss || []);
-        this.closedDataSource.data = gainloss || [];
+        const enriched = this.attachCostsToClosedPositions(
+          gainloss || [],
+          [...(tradeHistory || []), ...(optionHistory || [])],
+          feeHistory || [],
+        );
+        this.closedPositions.set(enriched);
+        this.closedDataSource.data = enriched;
         if (this.sort) this.closedDataSource.sort = this.sort;
         if (this.paginator) this.closedDataSource.paginator = this.paginator;
         this.rebuildChart();
@@ -298,6 +415,51 @@ export class PerformanceComponent implements OnInit, OnDestroy {
         );
         this.loading.set(false);
       },
+    });
+  }
+
+  private attachCostsToClosedPositions(
+    closed: ClosedPosition[],
+    tradeEvents: TradeEvent[],
+    feeEvents: TradeEvent[],
+  ): ClosedPosition[] {
+    // Bucket commission by symbol -> [{date, commission}], so each closed
+    // position gets the commissions paid on the open + close legs.
+    const commByEvent = tradeEvents
+      .map(e => ({
+        symbol: (e.trade?.symbol || e['symbol'] || '').toString(),
+        date: (e.date || '').slice(0, 10),
+        commission: Number(e.trade?.commission ?? e['commission'] ?? 0) || 0,
+      }))
+      .filter(x => x.symbol && x.date);
+
+    // Fee events generally lack a symbol — we attribute them to whichever
+    // closed position was closed on the same day. If multiple, split evenly.
+    const feesByDay = new Map<string, number>();
+    for (const e of feeEvents) {
+      const day = (e.date || '').slice(0, 10);
+      if (!day) continue;
+      const amt = Math.abs(Number(e['amount'] ?? 0)) || 0;
+      feesByDay.set(day, (feesByDay.get(day) || 0) + amt);
+    }
+    const closesPerDay = new Map<string, number>();
+    for (const p of closed) {
+      const day = (p.close_date || '').slice(0, 10);
+      if (!day) continue;
+      closesPerDay.set(day, (closesPerDay.get(day) || 0) + 1);
+    }
+
+    return closed.map(p => {
+      const openDay = (p.open_date || '').slice(0, 10);
+      const closeDay = (p.close_date || '').slice(0, 10);
+      const commission = commByEvent
+        .filter(c => c.symbol === p.symbol && (c.date === openDay || c.date === closeDay))
+        .reduce((s, c) => s + c.commission, 0);
+      const dayFees = feesByDay.get(closeDay) || 0;
+      const share = closesPerDay.get(closeDay) || 1;
+      const fees = dayFees / share;
+      const net = (p.gain_loss || 0) - commission - fees;
+      return { ...p, commission, fees, net_pnl: net };
     });
   }
 
@@ -324,7 +486,9 @@ export class PerformanceComponent implements OnInit, OnDestroy {
     const last = values.length > 0 ? values[values.length - 1] : 0;
     const first = values.length > 0 ? values[0] : 0;
     const trendUp = last >= first;
-    const stroke = trendUp ? '#4caf50' : '#f44336';
+    const palette = this.themeService.chartColors();
+    const stroke = trendUp ? palette.profit : palette.loss;
+    const fill = trendUp ? palette.profitFill : palette.lossFill;
     this.chartData.set({
       labels,
       datasets: [
@@ -332,7 +496,7 @@ export class PerformanceComponent implements OnInit, OnDestroy {
           data: values,
           label: 'Equity',
           borderColor: stroke,
-          backgroundColor: trendUp ? 'rgba(76, 175, 80, 0.12)' : 'rgba(244, 67, 54, 0.12)',
+          backgroundColor: fill,
           fill: 'origin',
           pointBackgroundColor: stroke,
         },
@@ -394,6 +558,38 @@ export class PerformanceComponent implements OnInit, OnDestroy {
     const date = new Date(d);
     if (isNaN(date.getTime())) return d;
     return date.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+  }
+
+  prevMonth(): void {
+    const a = this.calendarMonth();
+    this.calendarMonth.set(new Date(a.getFullYear(), a.getMonth() - 1, 1));
+  }
+
+  nextMonth(): void {
+    const a = this.calendarMonth();
+    this.calendarMonth.set(new Date(a.getFullYear(), a.getMonth() + 1, 1));
+  }
+
+  thisMonth(): void {
+    this.calendarMonth.set(this.startOfMonth(new Date()));
+  }
+
+  fmtCalendarPL(value: number): string {
+    const abs = Math.abs(value);
+    const sign = value >= 0 ? '+' : '-';
+    if (abs >= 1000) return `${sign}$${(abs / 1000).toFixed(abs >= 10_000 ? 0 : 1)}K`;
+    return `${sign}$${abs.toFixed(0)}`;
+  }
+
+  private startOfMonth(d: Date): Date {
+    return new Date(d.getFullYear(), d.getMonth(), 1);
+  }
+
+  private toDateKey(d: Date): string {
+    const y = d.getFullYear();
+    const m = String(d.getMonth() + 1).padStart(2, '0');
+    const day = String(d.getDate()).padStart(2, '0');
+    return `${y}-${m}-${day}`;
   }
 
   fmtDate(d: string): string {

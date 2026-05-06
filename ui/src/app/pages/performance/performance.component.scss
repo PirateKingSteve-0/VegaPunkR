@@ -11,7 +11,7 @@
 
     h1 {
       margin: 0;
-      color: rgba(0, 0, 0, 0.87);
+      color: var(--text);
     }
 
     .header-actions {
@@ -32,8 +32,8 @@
     align-items: center;
     gap: 8px;
     padding: 12px 16px;
-    background: #fdecea;
-    color: #b71c1c;
+    background: var(--color-error-bg);
+    color: var(--color-error-fg);
     border-radius: 4px;
     margin-bottom: 16px;
   }
@@ -46,11 +46,11 @@
 
     .metric-card {
       &[data-tone='positive'] .metric-value {
-        color: #2e7d32;
+        color: var(--color-profit);
       }
 
       &[data-tone='negative'] .metric-value {
-        color: #c62828;
+        color: var(--color-loss);
       }
 
       .metric-content {
@@ -62,7 +62,7 @@
           font-size: 36px;
           width: 36px;
           height: 36px;
-          color: rgba(0, 0, 0, 0.4);
+          color: var(--text-faint);
         }
 
         .metric-info {
@@ -71,7 +71,7 @@
 
           .metric-label {
             font-size: 13px;
-            color: rgba(0, 0, 0, 0.6);
+            color: var(--text-muted);
             margin-bottom: 6px;
             text-transform: uppercase;
             letter-spacing: 0.4px;
@@ -80,7 +80,7 @@
           .metric-value {
             font-size: 22px;
             font-weight: 500;
-            color: rgba(0, 0, 0, 0.87);
+            color: var(--text);
             margin-bottom: 4px;
             white-space: nowrap;
             overflow: hidden;
@@ -89,7 +89,7 @@
 
           .metric-sub {
             font-size: 12px;
-            color: rgba(0, 0, 0, 0.55);
+            color: var(--text-muted);
           }
         }
       }
@@ -108,7 +108,7 @@
   .empty-state {
     text-align: center;
     padding: 64px 24px;
-    color: rgba(0, 0, 0, 0.6);
+    color: var(--text-muted);
 
     mat-icon {
       font-size: 56px;
@@ -123,21 +123,135 @@
     }
 
     small {
-      color: rgba(0, 0, 0, 0.5);
+      color: var(--text-faint);
+    }
+  }
+
+  .calendar-card {
+    margin-bottom: 24px;
+
+    .calendar-toolbar {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 12px;
+      margin-bottom: 12px;
+
+      .calendar-nav {
+        display: flex;
+        align-items: center;
+        gap: 4px;
+
+        .calendar-month-label {
+          font-size: 16px;
+          font-weight: 500;
+          min-width: 160px;
+          text-align: center;
+        }
+
+        .today-btn {
+          margin-left: 8px;
+        }
+      }
+
+      .calendar-summary {
+        display: flex;
+        align-items: baseline;
+        gap: 8px;
+
+        .summary-item {
+          font-size: 18px;
+          font-weight: 500;
+
+          &.profit { color: var(--color-profit); }
+          &.loss { color: var(--color-loss); }
+        }
+
+        .summary-sub {
+          font-size: 12px;
+          color: var(--text-muted);
+        }
+      }
+    }
+
+    .calendar-grid {
+      display: grid;
+      grid-template-columns: repeat(7, 1fr);
+      gap: 4px;
+
+      .calendar-weekday {
+        text-align: center;
+        font-size: 11px;
+        font-weight: 500;
+        text-transform: uppercase;
+        letter-spacing: 0.4px;
+        color: var(--text-muted);
+        padding: 6px 0;
+      }
+
+      .calendar-cell {
+        position: relative;
+        min-height: 72px;
+        padding: 6px 8px;
+        border-radius: 6px;
+        background: var(--surface-hover);
+        border: 1px solid transparent;
+        display: flex;
+        flex-direction: column;
+
+        &.out-of-month {
+          opacity: 0.35;
+        }
+
+        &.is-today {
+          border-color: var(--primary);
+        }
+
+        &.profit {
+          background: var(--color-profit-bg);
+        }
+
+        &.loss {
+          background: var(--color-loss-bg);
+        }
+
+        .cell-day {
+          font-size: 12px;
+          color: var(--text-muted);
+        }
+
+        .cell-pl {
+          margin-top: auto;
+          font-size: 14px;
+          font-weight: 600;
+          text-align: right;
+        }
+
+        &.profit .cell-pl { color: var(--color-profit-strong); }
+        &.loss .cell-pl { color: var(--color-loss-strong); }
+      }
     }
   }
 
   .closed-positions-card {
+    overflow: hidden;
+
+    mat-card-content {
+      overflow-x: auto;
+    }
+
     .closed-table {
       width: 100%;
+      min-width: 1000px;
 
       .profit {
-        color: #2e7d32;
+        color: var(--color-profit);
         font-weight: 500;
       }
 
       .loss {
-        color: #c62828;
+        color: var(--color-loss);
         font-weight: 500;
       }
 
@@ -146,7 +260,7 @@
         transition: background-color 120ms ease;
 
         &:hover {
-          background-color: rgba(25, 118, 210, 0.06);
+          background-color: var(--surface-hover);
         }
       }
     }

@@ -13,10 +13,13 @@ from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request, sta
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
+from sqlalchemy.orm import Session
+
 from auth import get_current_user, decode_access_token
-from database import SessionLocals
+from database import SessionLocals, get_db
 from config import Environment
 from models import User
+from services.tradier_reconcile import reconcile_user_history
 from tradier_integration.client import get_tradier_client
 
 router = APIRouter(prefix="/tradier", tags=["Tradier Brokerage"])
@@ -365,5 +368,30 @@ def get_gainloss(
     """
     try:
         return _client().get_gainloss(account_id, page=page, limit=limit)
+    except Exception as e:
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(e))
+
+
+@router.post("/account/reconcile-fees")
+def reconcile_fees(
+    start: Optional[str] = Query(None, description="yyyy-mm-dd"),
+    end: Optional[str] = Query(None, description="yyyy-mm-dd"),
+    account_id: Optional[str] = Query(None),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Reconcile Tradier account history into local Trade rows: writes commission
+    onto matching trade events and accumulates fee events onto the closest
+    same-day trade. Returns counts and totals written.
+    """
+    try:
+        return reconcile_user_history(
+            db=db,
+            user=current_user,
+            start=start,
+            end=end,
+            account_id=account_id,
+        )
     except Exception as e:
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(e))

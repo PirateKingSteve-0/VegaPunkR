@@ -28,7 +28,7 @@
     .empty-state {
       text-align: center;
       padding: 64px 24px;
-      color: rgba(0, 0, 0, 0.6);
+      color: var(--text-muted);
 
       mat-icon {
         font-size: 64px;
@@ -51,8 +51,8 @@
 
       // Row tinting by severity
       tr.warning { background: rgba(255, 152, 0, 0.05); }
-      tr.error   { background: rgba(244, 67, 54, 0.05); }
-      tr.success { background: rgba(76, 175, 80, 0.04); }
+      tr.error   { background: var(--color-loss-bg-soft); }
+      tr.success { background: var(--color-profit-bg-soft); }
 
       // Event type badges
       .type-badge {
@@ -64,9 +64,9 @@
         letter-spacing: 0.04em;
         white-space: nowrap;
 
-        &.order-placed    { background: rgba(25, 118, 210, 0.12); color: #1565c0; }
-        &.order-failed    { background: rgba(211, 47, 47, 0.12);  color: #b71c1c; }
-        &.position-opened { background: rgba(56, 142, 60, 0.12);  color: #1b5e20; }
+        &.order-placed    { background: rgba(25, 118, 210, 0.12); color: var(--primary); }
+        &.order-failed    { background: var(--color-loss-bg-strong); color: var(--color-loss-strong); }
+        &.position-opened { background: var(--color-profit-bg-strong); color: var(--color-profit-strong); }
         &.position-closed { background: rgba(123, 31, 162, 0.12); color: #4a148c; }
         &.strategy-started { background: rgba(0, 121, 107, 0.12); color: #004d40; }
         &.strategy-stopped { background: rgba(97, 97, 97, 0.12);  color: #424242; }
@@ -83,10 +83,10 @@
         margin-right: 6px;
         vertical-align: middle;
 
-        &.info    { background: #1976d2; }
-        &.success { background: #388e3c; }
+        &.info    { background: var(--primary); }
+        &.success { background: var(--color-profit); }
         &.warning { background: #f57c00; }
-        &.error   { background: #d32f2f; }
+        &.error   { background: var(--color-loss); }
       }
 
       // Event title + detail stacked
@@ -98,7 +98,7 @@
       .event-detail {
         display: block;
         font-size: 12px;
-        color: rgba(0, 0, 0, 0.5);
+        color: var(--text-faint);
         margin-top: 1px;
       }
     }

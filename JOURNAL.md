@@ -5222,4 +5222,333 @@ Live accounts return precise `TradeEvent` fill timestamps (snap to the actual mi
 
 ---
 
+## Session Date: May 3, 2026
 
+### TL;DR
+Two TODO items shipped: (1) a daily P&L calendar on the performance page, and (2) full dark-mode + colorblind-mode support across the app, driven by CSS custom properties.
+
+### 1. Daily P&L Calendar (TODO #4)
+
+**What it is**: A new card on `/dashboard/performance` between the equity curve and the closed-positions table. 6×7 month grid with green/red day cells showing realized P&L. Header has prev/next month buttons, a "Today" jump, and a month total + W/L count.
+
+**Data source**: aggregates the existing `closedPositions` (Tradier `gainloss`) signal by `close_date` (sliced to `YYYY-MM-DD`). No new endpoint needed.
+
+**Implementation** (`ui/src/app/pages/performance/performance.component.{ts,html,scss}`):
+- New `CalendarCell` interface; signals `calendarMonth`, computeds `dailyPL`, `calendarCells` (42 cells), `calendarSummary`, `calendarMonthLabel`.
+- `prevMonth()` / `nextMonth()` / `thisMonth()` navigators.
+- Out-of-month days dimmed; today highlighted with a 1px primary-color border; tooltip shows full currency + trade count.
+- Day cells get `var(--color-profit-bg)` / `var(--color-loss-bg)` tints (theme-aware after the dark-mode work below).
+
+### 2. Dark Mode + Colorblind Mode (TODO #5)
+
+**Why**: User is colorblind. Wanted (a) a dark mode and (b) a CB-safe palette that works in both light and dark.
+
+**Architecture**: CSS custom properties on `<body>`, gated by `[data-theme]` and `[data-colorblind]` attributes. Material's M2 theme also swapped via `mat.all-component-colors` under `body[data-theme='dark']`.
+
+**Files added/changed**:
+
+| File | Change |
+|------|--------|
+| `ui/src/app/services/theme.service.ts` (new) | `theme` and `colorblind` signals; persists to `localStorage`; auto-detects `prefers-color-scheme` on first load; `effect` writes `data-theme`/`data-colorblind` to `<body>`; exposes `chartColors()` computed for JS chart consumers |
+| `ui/src/styles.scss` | Defines M2 light + dark themes; declares CSS vars (`--color-profit`, `--color-loss`, `--color-profit-bg`, `--color-error-bg`, `--surface`, `--surface-alt`, `--text`, `--text-muted`, `--text-faint`, `--border`, `--surface-hover`, `--primary`); 4 token blocks (light, dark, light+CB, dark+CB) |
+| `ui/src/app/app.component.ts` | Eagerly injects `ThemeService` so its effect runs at startup before any view renders |
+| `ui/src/app/pages/dashboard/dashboard.component.{ts,html}` | Two new toggles in the toolbar user menu — Light/Dark and Colorblind on/off |
+
+**Colorblind palette**: blue `#1976d2` (positive) / orange `#ef6c00` (negative) in light mode; lighter shades in dark mode. Distinguishable across deuteranopia, protanopia, and tritanopia.
+
+**Refactor sweep — replaced hardcoded colors with CSS vars across all UI surfaces**:
+
+| Pattern | Replaced with |
+|---------|---------------|
+| `#2e7d32`, `#4caf50`, `rgba(46,125,50,*)` etc | `var(--color-profit)` family |
+| `#c62828`, `#f44336`, `rgba(198,40,40,*)` etc | `var(--color-loss)` family |
+| `#fdecea` / `#ffebee` (error tints) | `var(--color-error-bg)` |
+| `rgba(0,0,0,0.87)` | `var(--text)` |
+| `rgba(0,0,0,0.5–0.65)` | `var(--text-muted)` |
+| `rgba(0,0,0,0.4–0.5)` | `var(--text-faint)` |
+| `rgba(0,0,0,0.12)` | `var(--border)` |
+| `rgba(0,0,0,0.02–0.06)` backgrounds | `var(--surface-hover)` |
+| `#333/#555/#666/#888/#999/#aaa/#bbb/#111` | text tokens |
+| `#fafafa` / `#f5f5f5` / `#e0e0e0` / `#f0f0f0` | `var(--surface-alt)` / `var(--border)` |
+
+**Files touched in the sweep**: positions, watchlists, performance, trades, dashboard, stream-drawer, strategy-list, risk, login, overview, position-chart-dialog (SCSS); template-gallery-modal (inline `styles:` array on @Component).
+
+**Chart consumers — pulled colors from ThemeService instead of literals**:
+- `performance.component.ts` — equity curve trend stroke/fill now from `chartColors()`. An `effect()` rebuilds the chart when theme/CB mode changes so the curve recolors live.
+- `position-chart-dialog.component.ts` — lightweight-charts background/text/grid/exit-marker all read from the palette so candle charts theme correctly. (Note: chart is only re-themed at init; user closes/reopens the dialog after switching theme.)
+- `stream-drawer.component.ts` — `connected`/`error` status colors come from the palette.
+
+### Quirks / decisions worth remembering
+- **Persistence is localStorage-only** for now. Backend `User.notification_preferences` JSON column was identified as a future home but not wired up — keep this in mind if we want theme to follow the user across devices.
+- **Default theme** = `prefers-color-scheme` on first visit, then locked to user's choice. There is no "system" mode that re-syncs; once toggled, it sticks.
+- **Why `data-` attributes on `<body>` and not `<html>`**: Angular Material's overlay containers (menus, dialogs, tooltips) are appended to `<body>`, so attribute-scoped CSS vars need to live on `<body>` to apply to overlays.
+- **Why we override `mat.all-component-colors` (not `all-component-themes`) for dark**: re-applying full themes blows up CSS size and can fight global typography. Color-only override is enough for M2.
+- **CB palette intentionally collides with `--primary` in light mode** (both blue). Acceptable because positive P&L surfaces never sit next to nav-link primaries in the same component.
+- **Dashboard env-test (#2196F3) and env-prod (#9C27B0)** were left as hardcoded — they're status labels, not profit/loss indicators, and have no CB dimension.
+
+### Files Modified / Added
+
+| File | Change |
+|------|--------|
+| `ui/src/app/services/theme.service.ts` | **new** — theme state + chart palette |
+| `ui/src/app/app.component.ts` | inject ThemeService at root |
+| `ui/src/styles.scss` | M2 dark theme + 4 CSS-var blocks (light/dark × normal/CB) |
+| `ui/src/app/pages/dashboard/dashboard.component.{ts,html,scss}` | toolbar toggles + tokenized env/trading colors |
+| `ui/src/app/pages/performance/performance.component.{ts,html,scss}` | calendar card + tokenized colors + theme-reactive equity chart |
+| `ui/src/app/pages/positions/positions.component.scss` | tokenized profit/loss + text |
+| `ui/src/app/pages/positions/position-chart-dialog/position-chart-dialog.component.ts` | lightweight-charts pulls from `chartColors()` |
+| `ui/src/app/pages/watchlists/watchlists.component.scss` | tokenized profit/loss + text |
+| `ui/src/app/pages/trades/trades.component.scss` | tokenized severity badges + dots |
+| `ui/src/app/pages/strategies/stream-drawer.component.{ts,scss}` | tokenized event-trade color + status colors from palette + dark-friendly drawer bg |
+| `ui/src/app/pages/strategies/strategy-list.component.scss` | tokenized live badge + delete action |
+| `ui/src/app/pages/strategies/strategy-form.component.scss` | text tokens |
+| `ui/src/app/pages/strategies/template-gallery-modal.component.ts` | inline-styles tokenized; difficulty chips use profit/loss vars |
+| `ui/src/app/pages/risk/risk.component.scss` | text/bg tokens |
+| `ui/src/app/pages/overview/overview.component.scss` | text tokens (numbers were rendering black on dark) |
+| `ui/src/app/pages/login/login.component.scss` | error message tokens |
+| `TODO.md` | items #4 and #5 moved to DONE |
+
+### Verification
+- `ng build --configuration development` passes. Only warning is the pre-existing NG8107 in `stream-drawer.component.html:13` (unrelated optional-chain).
+- **Not yet visually verified by us** — user reported overview/performance text was illegible in dark mode after the first pass; second pass swept the remaining `rgba(0,0,0,*)` and gray hex values. User to confirm in their browser.
+
+### Open follow-ups
+- Backend persistence for theme/CB preference (User.notification_preferences JSON).
+- `position-chart-dialog` chart palette is captured at init — switching theme while a chart dialog is open won't recolor it. Low priority since dialogs are usually short-lived.
+- A few non-tokenized colors remain by design: status colors in trades.component.scss (warning #f57c00, position-closed purple #4a148c, strategy-* badges) — these are categorical, not profit/loss, but if dark mode contrast suffers we can revisit.
+
+---
+
+
+
+## Session Date: May 3, 2026 — Fee & Commission Tracking (TODO #1)
+
+### Goal
+Surface commissions and regulatory fees on the performance page and per closed position. Tradier's `/account/history` endpoint exposes per-trade `commission` and standalone `type=fee` events; the order/preview responses do not, so this had to be built as a reconciliation against history rather than read at fill time.
+
+### What we built
+
+**1. Schema (`api/models.py` + Alembic migration `a7f2b9c4e1d3`)**
+- `Trade.fees` (Float, default 0.0) — populated from `type=fee` history events.
+- `PerformanceMetrics.total_fees` (Float, default 0.0) — period aggregate.
+- Migration applied to dev DB.
+
+**2. History → Trade reconciliation (`api/services/tradier_reconcile.py` — new)**
+- Pulls `/v1/accounts/{id}/history` (paginated, type-agnostic) for the user.
+- For each `type=trade`/`type=option` event: matches the local `Trade` by `user_id + symbol + side + qty` within a ±1 day window of the event timestamp; writes `commission`.
+- For each `type=fee` event: attaches the absolute `amount` to the closest same-day `Trade` (since Tradier delivers reg fees without a symbol). No-match events are logged and skipped.
+- Returns counts/totals (`matched_trades`, `commission_written`, `matched_fees`, `fees_written`, etc.).
+
+**3. Reconciliation endpoint (`api/tradier_integration/router.py`)**
+- `POST /tradier/account/reconcile-fees?start=&end=&account_id=` — auth-gated wrapper around the service. Not scheduled yet.
+
+**4. Performance metrics include fees (`api/routers/performance.py`)**
+- `total_fees = sum(t.fees for t in trades)` alongside the existing `total_commission` sum, written into `PerformanceMetrics`.
+- `schemas.PerformanceMetricsResponse` exposes `total_commission` and `total_fees`.
+
+**5. UI: closed-positions table & metric cards (`ui/.../performance.component.{ts,html,scss}`)**
+- `TradierService.getAccountHistory(type, start, end, ...)` — new method hitting `/account/history`.
+- `ClosedPosition` interface gains optional `commission`, `fees`, `net_pnl`.
+- Page load now fans out an extra three calls (`type=trade`, `type=option`, `type=fee`) and `attachCostsToClosedPositions()` enriches each row:
+  - Commission = sum of trade-event commissions for that symbol on the open or close day.
+  - Fees = same-day fee-event total split evenly across that day's closed positions (since fees lack a symbol).
+  - `net_pnl = gain_loss − commission − fees`.
+- Closed-positions table grew three columns: `Commission`, `Fees`, `Net P&L`.
+- Two new metric cards: **Net P&L (period)** and **Costs (Commission + Fees)**.
+
+**6. Table layout fix (`performance.component.scss`)**
+- With 12 columns the table outgrew the card and dragged the paginator/header with it. Wrapped scroll in `mat-card-content { overflow-x: auto }`, gave the table `min-width: 1000px`, and clipped the card with `overflow: hidden`.
+
+### Files touched
+| Path | Change |
+|------|--------|
+| `api/models.py` | `Trade.fees`, `PerformanceMetrics.total_fees` |
+| `api/alembic/versions/a7f2b9c4e1d3_add_fees_to_trades_and_metrics.py` | **new** migration |
+| `api/schemas.py` | `TradeCreate.fees`, `TradeResponse.fees`, `PerformanceMetricsResponse.total_commission/total_fees` |
+| `api/services/tradier_reconcile.py` | **new** reconciliation service |
+| `api/tradier_integration/router.py` | `POST /tradier/account/reconcile-fees` |
+| `api/routers/performance.py` | sum `total_fees`; include in stored metrics |
+| `ui/src/app/services/tradier.service.ts` | `getAccountHistory()`; `ClosedPosition` extra fields |
+| `ui/src/app/pages/performance/performance.component.ts` | history fan-out + `attachCostsToClosedPositions()`; new Net P&L / Costs cards |
+| `ui/src/app/pages/performance/performance.component.html` | Commission / Fees / Net P&L columns |
+| `ui/src/app/pages/performance/performance.component.scss` | horizontal scroll on closed-positions table |
+| `TODO.md` | (item #1 still in TODO until reconciliation is scheduled + verified live) |
+
+### Verification
+- Alembic migration applied cleanly (`upgrade 1c3159917f07 -> a7f2b9c4e1d3`).
+- Backend imports smoke-tested: `from services.tradier_reconcile import reconcile_user_history` + router import returns expected route count.
+- `npx tsc --noEmit -p tsconfig.app.json` passes (no errors).
+- **Not yet exercised end-to-end against a live Tradier account.** Sandbox returns no detailed history, so reconcile is a no-op there.
+
+### Open follow-ups
+- No scheduler — `/tradier/account/reconcile-fees` is endpoint-triggered. Wire a nightly job (or call it on the performance page load) before considering TODO #1 fully done.
+- Per-trade fee attribution is approximate (same-day, even split). If Tradier ever provides a transaction id linking fee events to the underlying fill, we can tighten this.
+- Closed-positions table costs are currently computed client-side from raw history events; once the reconciliation job runs server-side, we could drop the client computation and read commission/fees off the `Trade` rows via a new endpoint (e.g. `GET /trades?status=closed&include_costs=true`).
+- Live verification: needs a live Tradier account with real fills + fees to confirm the matching heuristics.
+
+---
+
+
+
+## Session Date: May 5, 2026 — Account-Level Trading Window (TODO #2)
+
+### Goal
+Layer a per-user trading window on top of the existing per-strategy time gates. Strategy templates already ship `entry_after_open_minutes` (opening-noise blackout) and `exit_before_close_minutes` (forced flat for 0DTE), but those are author-defined and can't be overridden by the account holder. The user wanted the ability to say "regardless of what any strategy says, never enter before 10:00 ET and force me flat by 15:30 ET."
+
+### Design decision: most-restrictive-bound-wins (option B)
+Rather than letting the account window *replace* strategy params (option A), the account gate is layered as an additional constraint:
+- **Effective entry start** = max(market_open + `entry_after_open_minutes`, account `start`).
+- **Effective forced exit** = min(market_close − `exit_before_close_minutes`, account `end`).
+- Account window can also block entries past `end` outright.
+
+This means the user can *narrow* their window but never *widen* past what a strategy author intended — important since the 0DTE templates ship aggressive close-timing for a reason.
+
+### What we built
+
+**1. Schema (`api/models.py` + Alembic migration `c9e5a73b2f81`)**
+- `User.trading_window_enabled` (Boolean, default False)
+- `User.trading_window_start` (String "HH:MM" ET, default "09:45")
+- `User.trading_window_end` (String "HH:MM" ET, default "15:45")
+- Migration applied cleanly: `upgrade b8d4f1e2c5a6 -> c9e5a73b2f81`.
+
+**2. API (`api/schemas.py` + `api/routers/auth.py`)**
+- `UserBase` / `UserUpdate` / `UserResponse` gained the three fields. `Field(..., pattern=r"^([01]\d|2[0-3]):[0-5]\d$")` validates HH:MM at the boundary.
+- New `PATCH /api/v1/auth/me` endpoint. Validates start < end (both pre-merge from the request body and post-merge against existing user state, so a partial PATCH that only changes one bound still gets checked).
+- `register` propagates the new defaults so newly created users inherit them.
+
+**3. Engine (`api/engine/signal_generator.py`)**
+- New `_parse_hhmm(value)` helper — defensive parser that returns `None` for empty/malformed input rather than throwing, since this runs on every market tick.
+- `check_entry_signal(..., user=None)` — replaced the old "0. Enforce opening noise blackout window" block with a unified time gate that combines the strategy's `entry_after_open_minutes` and the user's `trading_window_start` via max(), then also blocks if `current_et >= account_end_et`.
+- `check_exit_signal(..., user=None)` — replaced the old "5. Exit before market close" block with a unified forced-exit gate that picks the *earlier* of (market_close − `exit_before_close_minutes`) and account `trading_window_end`. Reason string differs depending on which bound fired so the trade log makes sense.
+- `user` param is `Optional` and defaulted to `None` so any in-flight code path that hasn't been migrated still gets the strategy-only behavior.
+
+**4. Wiring (`api/engine/strategy_executor.py`)**
+- `_check_entry_signals` and `_check_exit_signals` already had `user` in scope (passed in from the orchestrator); just plumbed it through both `signal_generator.check_*` calls.
+
+**5. UI dialog (`ui/src/app/components/trading-window-dialog/`)**
+- Standalone Material dialog with a `mat-slide-toggle` (enable/disable) and two `<input type="time">` fields (start, end). When the toggle is off the time inputs visually disable (opacity dim) but stay rendered so the user can see what's saved.
+- Loads current settings via `AuthService.refreshMe()` on open, validates `start < end` client-side before save, and bubbles backend validation errors into a styled error row.
+- Uses CSS tokens (`--text`, `--text-muted`, `--primary`, `--color-error-bg`, `--color-error-fg`) per `CLAUDE.md` so it works in dark mode and colorblind mode.
+
+**6. Auth service additions (`ui/src/app/services/auth.service.ts`)**
+- `refreshMe()`: GET `/auth/me`, updates `currentUser$` and localStorage with the merged response.
+- `updateTradingWindow(update)`: PATCH `/auth/me`, same merge-and-broadcast pattern.
+- **Auth header bug**: this app has no global HTTP interceptor — every service builds its own `Authorization: Bearer <token>` header. First pass shipped without it and got a 401. Added a private `authHeaders()` helper and pass `{ headers: this.authHeaders() }` to both calls.
+
+**7. Dashboard menu entry (`ui/src/app/pages/dashboard/dashboard.component.{ts,html}`)**
+- New "Trading Window" item between the colorblind toggle and Logout, opens the dialog. Imported `MatDialog` / `MatDialogModule` and the new component.
+
+### Files touched
+| Path | Change |
+|------|--------|
+| `api/models.py` | three new `User` columns |
+| `api/alembic/versions/c9e5a73b2f81_add_trading_window_to_users.py` | **new** migration |
+| `api/schemas.py` | HH:MM-validated fields on `UserBase` and `UserUpdate` |
+| `api/routers/auth.py` | new `PATCH /auth/me`; `register` propagates new defaults |
+| `api/engine/signal_generator.py` | `_parse_hhmm` helper; `check_entry_signal` / `check_exit_signal` accept `user` and merge gates |
+| `api/engine/strategy_executor.py` | pass `user` into both signal calls |
+| `ui/src/app/models/user.model.ts` | added trading window fields and `TradingWindowUpdate` type |
+| `ui/src/app/services/auth.service.ts` | `refreshMe()`, `updateTradingWindow()`, `authHeaders()` |
+| `ui/src/app/components/trading-window-dialog/*` | **new** dialog (ts/html/scss) |
+| `ui/src/app/pages/dashboard/dashboard.component.{ts,html}` | menu entry + dialog wiring |
+| `TODO.md` | item #2 → DONE |
+
+### Verification
+- Migration applied cleanly to dev DB.
+- Schema smoke test: `UserCreate` defaults populate; `UserUpdate(trading_window_start='25:99')` rejects; valid update round-trips through `model_dump(exclude_unset=True)`.
+- `engine.signal_generator` imports clean; `_parse_hhmm` tested with valid/invalid/empty inputs.
+- `npx ng build --configuration=development` succeeds.
+- Dialog opened in browser, hit a 401 on first attempt → fixed by attaching auth header to `refreshMe`/`updateTradingWindow` (this app has no global HTTP interceptor; every service rolls its own).
+
+### Quirks / decisions worth remembering
+- **No global HTTP interceptor.** When adding new HTTP calls anywhere in this UI, build the `Authorization: Bearer <token>` header explicitly via the service's own helper. Pattern is repeated across `system.service.ts`, `account.service.ts`, `tradier.service.ts`, etc.
+- **HH:MM strings, not `time` objects.** Storing as `String` keeps Pydantic validation simple (regex pattern), avoids timezone ambiguity (window is always interpreted in ET inside `signal_generator`), and round-trips cleanly to `<input type="time">` which produces `"HH:MM"` strings natively.
+- **Defaults are 09:45 / 15:45** — matches the user's "15-30 minutes after open, ~15 before close" framing on TODO #2 and is sane even if a user enables the window without changing the values. The window is *off* by default so behavior is unchanged for existing accounts.
+- **Why validate start<end twice in PATCH /me.** Once on the incoming body (when both are sent), once after merging into the existing user (to catch the case where only one bound is being updated and the result would be inverted). Either alone misses a case.
+
+### Open follow-ups
+- No timezone-other-than-ET support. The user model already has a `timezone` column but the window is hard-coded to interpret times in `US/Eastern` because that's where the market lives. If we ever support non-US markets this needs to interpret per-user TZ.
+- Dialog is opened from the user menu but there's no broader "Settings" page yet — `risk_tolerance`, `max_trade_percentage`, `account_size_usd` are still only mutable via direct API call. When that page lands, fold the trading window in.
+- "Most-restrictive-wins" is invisible to the user in the dialog. If a strategy has `entry_after_open_minutes: 30` and the user sets `trading_window_start: 09:35`, the effective start is 10:00 — they won't see this until they wonder why no trades fire. Could add a tooltip showing the effective window per active strategy.
+
+---
+
+## Session Date: May 5, 2026 (Part 2) — T+1 / GFV Cash Reservation Ledger (TODO #1)
+
+### Goal
+Stop the engine from placing buys it can't actually fund. The account is cash-only, so a Good Faith Violation (using unsettled proceeds to buy something then selling that something before the funding cash settles) is the real risk — three GFVs in 12 months locks the account to settled-cash-only for 90 days. The buy gate at `order_manager.py:181` already pulled `cash.cash_available` from Tradier, but two gaps remained:
+1. **No in-process tracking of pending buys.** Concurrent signals fired in the same process could each see the same `cash_available` and double-spend the dollars before Tradier registered the first order.
+2. **Wrong field for the deduction.** The gate compared `preview.order_cost` (bare principal per the example math in `docs/tradier/trading/preview_order.md`) against settled cash, under-reserving by exactly the commission amount in live mode.
+
+### Design decision: strict "never use unsettled funds" (option A over B)
+- **A (chosen):** subtract in-process pending-buy reservations from `cash_available`; reject if order won't fit. GFV becomes impossible by construction — if you never buy with unsettled funds, you can never sell what you bought-with-unsettled before it settles.
+- **B (rejected):** allow buying with unsettled, tag positions with a `funding_settle_date`, refuse early sells. More capital efficient but layers a whole new state-tracking surface (partial fills, splits across two settle dates, restart durability) that we don't need yet. The engine already opts "fail-safe over fail-open" (see `order_manager.py:30-31`), so A is consistent with the existing posture.
+
+Trade-off: A caps the user at roughly one round-trip per dollar per day. For the 0DTE-scalping pattern this codebase is tuned for, that's a real constraint, but it's the cost of never tripping a GFV.
+
+### Sandbox vs live fee asymmetry
+Tradier sandbox returns `commission=0` and `fees=0` on previews, while live returns real numbers (~$0.35 base commission + ~$0.05–0.20 regulatory fees per options contract per their published schedule). Without compensation, a sandbox-validated buy at the edge of `cash_available` would slip through and fail in live for the missing fees. Solution: a per-contract fee buffer added to the reservation amount only when `user.selected_environment != 'prod'`. Constant lives at module level so it's easy to refine once we have real `Trade.commission`+`Trade.fees` rows.
+
+### What we built
+
+**1. Module-level constants (`api/engine/order_manager.py`)**
+- `RESERVATION_TTL_SECONDS = 60.0` — auto-expire safety belt for missed releases.
+- `SANDBOX_FEE_BUFFER_PER_OPTION_CONTRACT = 0.65` — conservative per-contract estimate (commission + reg fees) used in non-prod envs only.
+- Dropped the stale `# Note: this validates settled buying power only; tracking unsettled funds for Good Faith Violation avoidance is TODO #3.` comment that was the original marker for this work.
+
+**2. Class-level reservation ledger (`OrderManager`)**
+- `_pending_buy_reservations: Dict[str, Dict]` — process-scoped, in-memory, keyed by reservation UUID. Each entry stores `{user_id, amount, expires_at}`.
+- Process-scoped is intentional: on engine restart the broker is the source of truth, so we don't need durability. The TTL covers the case where a release path is missed in code.
+
+**3. Helper methods**
+- `_purge_expired_reservations()` — drops expired entries, logs a warning per drop so a missed release surfaces as visible noise instead of silently locking cash.
+- `_active_reservations_total(user_id)` — sums currently-held reservation amounts for a user (purges first).
+- `_acquire_buy_reservation(user_id, amount)` → reservation_id (UUID).
+- `_release_buy_reservation(reservation_id)` — safe to call with `None` or unknown id.
+- `_estimate_fee_buffer(user, qty, option_symbol)` — returns 0 in prod, `qty * SANDBOX_FEE_BUFFER_PER_OPTION_CONTRACT` for option buys in non-prod, 0 for equities (commission-free at Tradier).
+
+**4. Updated `_preview_or_abort` (4-tuple return)**
+- Signature now returns `(ok, preview, msg, reservation_id)`. `reservation_id` is non-`None` only when a buy gate succeeds and acquires a reservation.
+- Switched the cash-debit field from `preview.order_cost` to `preview.cost` (with `order_cost` fallback for safety). Per the doc example: `cost = order_cost + commission + fees`. Reserving `cost` matches the actual deduction; the old code under-reserved by the commission amount in live.
+- Effective available = `settled_cash − active_reservations`.
+- Required = `preview.cost + fee_buffer`.
+- Reject path logs detailed `event_data` (`preview_cost`, `fee_buffer`, `required`, `settled_cash`, `active_reservations`, `effective_available`) so the activity feed is actionable.
+- Acquire reservation only on success path, immediately before returning.
+
+**5. Updated `execute_signal` flow**
+- Unpacks the new 4-tuple from `_preview_or_abort`.
+- Wraps the entire post-preview block (place_order → terminal-status wait → trade record → position update → success return) in an inner `try`/`finally`. The finally calls `_release_buy_reservation(reservation_id)` so every exit path (success, early return, exception) drops the reservation.
+- The outer `except Exception as e:` (which logs `ORDER_FAILED`) sits outside the inner try, so it sees exceptions after the finally has already released — no leaks possible on the exception path.
+
+**6. Updated `close_position` caller**
+- Closes are sells; `_preview_or_abort` doesn't acquire reservations on the sell path, so this caller just unpacks and discards the 4th tuple slot (`preview_ok, preview, preview_msg, _`). Minimal change to keep the breaking signature change contained to the buy flow.
+
+### Files touched
+| Path | Change |
+|------|--------|
+| `api/engine/order_manager.py` | reservation ledger, helpers, updated buy gate to use `preview.cost` + reservations + fee buffer, try/finally release in `execute_signal`, 4-tuple unpack in `close_position` |
+| `TODO.md` | item #1 → "Code complete — pending live verification" |
+| `JOURNAL.md` | this entry |
+
+### Verification
+- `python3 -c "import ast; ast.parse(...)"` parses cleanly.
+- All call sites of `_preview_or_abort` migrated to the 4-tuple signature (only two: `execute_signal` and `close_position`).
+- No tests added — the existing `api/tests/` directory has no order-manager coverage to update, and writing the first one is out of scope for this task.
+
+### Quirks / decisions worth remembering
+- **`preview.cost` vs `preview.order_cost`.** The Tradier doc field naming is misleading. `order_cost` looks like it should be the cash debit but the example math (`cost: 34.7151, commission: 3.49, order_cost: 31.2251`) shows `order_cost = cost − commission`, i.e. bare principal. `cost` is what actually leaves your account. Anywhere we reserve, deduct, or compare against cash, use `cost` and treat `order_cost` as a fallback only.
+- **Why the fee buffer keys off `selected_environment` instead of inferring sandbox from `commission==0 and fees==0`.** A real account on a zero-commission tier would inadvertently get padded under inference. Explicit env beats heuristics.
+- **Reservation TTL is 60s, not the order's natural lifetime.** Most orders reach a terminal broker state within seconds (`_await_terminal_order` polls with `timeout_s=30.0`). 60s gives generous headroom; if a reservation expires, that itself is a signal that a release path was missed and we want the warning log.
+- **`_release_buy_reservation` is `pop(..., None)`-safe.** Calling it on `None` or an already-released id is a no-op. This means closes (where `reservation_id is None`) and any future double-release wouldn't blow up.
+- **No DB migration.** Reservations are pure in-memory state. Restart loses them, but Tradier's `cash_available` will reflect any actually-placed orders post-restart so the next preview correctly reflects reality.
+
+### Open follow-ups
+- **Live verification not done yet.** The plan was discussed and the code shipped, but we haven't actually exercised it against real Tradier traffic. Things to confirm:
+  - Concurrent signals on the same user truly serialize through the reservation ledger (a focused test or a one-off probe with two parallel `execute_signal` calls would do it).
+  - Tradier's `preview_order` response shape in live mode matches what we extracted from the docs example. Specifically: that `cost` includes commission+fees and that `cash.cash_available` is what we think it is.
+  - The fee buffer is in the right ballpark — refine `SANDBOX_FEE_BUFFER_PER_OPTION_CONTRACT` from real `Trade.commission`+`Trade.fees` rows once we have any.
+- **In-memory ledger doesn't survive multi-process deployments.** Today the engine runs as one process per host so this is fine, but if we ever scale horizontally the reservation has to move to Redis (or similar) so all workers share one view of pending buys.
+- **No event log on reservation expiry.** The `logger.warning` in `_purge_expired_reservations` will surface in app logs but not in the SystemEvent activity feed. If we end up debugging reservation leaks, promoting that to a `RESERVATION_EXPIRED` event might be worth it.
+- **Sandbox-vs-live fee asymmetry isn't fixed for backtests or the performance dashboard.** The cash gate's buffer keeps the engine safe but the broader problem (sandbox PnL is artificially clean, performance metrics in dev are wrong by the fee delta) belongs with TODO #3 (backtest), which needs an explicit fee model anyway.
+
+---

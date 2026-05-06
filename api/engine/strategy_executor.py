@@ -16,8 +16,8 @@ Paper vs Live trading is handled automatically:
     * Live mode → Schwab Live API
 """
 import logging
-from typing import Dict, List, Optional
-from datetime import datetime
+from typing import Dict, List, Optional, Tuple
+from datetime import datetime, timedelta
 from sqlalchemy.orm import Session
 
 from models import User, Strategy, Position
@@ -27,6 +27,10 @@ from engine.order_manager import OrderManager, OrderResult
 from utils.market_hours import is_market_open
 
 logger = logging.getLogger(__name__)
+
+# Minimum time after a position closes before the same (strategy, symbol) is
+# allowed to re-enter. Stops the buy/sell flip-flop seen in 2026-05-04 incident.
+REENTRY_COOLDOWN_SECONDS = 30.0
 
 
 class ExecutionState:
@@ -53,6 +57,10 @@ class StrategyExecutor:
     6. Handle errors and safeguards
     """
 
+    # Class-level so the cooldown survives executor re-instantiation within
+    # the same process. Keyed by (strategy_id, symbol).
+    _last_closed_at: Dict[Tuple[int, str], datetime] = {}
+
     def __init__(self, db: Session):
         self.db = db
         self.risk_manager = RiskManager(db)
@@ -61,6 +69,21 @@ class StrategyExecutor:
 
         # Track execution state for each strategy
         self.execution_states: Dict[int, ExecutionState] = {}
+
+    @classmethod
+    def _check_reentry_cooldown(cls, strategy_id: int, symbol: str) -> Tuple[bool, float]:
+        """Return (allowed, seconds_until_allowed) for a fresh entry."""
+        last = cls._last_closed_at.get((strategy_id, symbol))
+        if last is None:
+            return True, 0.0
+        elapsed = (datetime.utcnow() - last).total_seconds()
+        if elapsed >= REENTRY_COOLDOWN_SECONDS:
+            return True, 0.0
+        return False, REENTRY_COOLDOWN_SECONDS - elapsed
+
+    @classmethod
+    def _stamp_position_closed(cls, strategy_id: int, symbol: str) -> None:
+        cls._last_closed_at[(strategy_id, symbol)] = datetime.utcnow()
 
     async def execute_exit_tick(
         self,
@@ -214,6 +237,17 @@ class StrategyExecutor:
         results: Dict
     ):
         """Check for entry signals and execute if conditions are met"""
+        # Re-entry cooldown — block fresh entries on (strategy, symbol) for a
+        # short window after the most recent close. Prevents the buy/sell
+        # flip-flop loop where a fresh signal fires the moment qty hits 0.
+        allowed, wait_s = self._check_reentry_cooldown(strategy.id, symbol)
+        if not allowed:
+            logger.debug(
+                f"Re-entry cooldown active for {symbol} "
+                f"(strategy {strategy.id}): {wait_s:.1f}s remaining"
+            )
+            return
+
         # Check if we have room for more positions
         open_positions_count = self.db.query(Position).filter(
             Position.user_id == user.id,
@@ -232,7 +266,8 @@ class StrategyExecutor:
             symbol=symbol,
             current_price=current_price,
             current_volume=current_volume,
-            additional_data=market_data
+            additional_data=market_data,
+            user=user
         )
 
         if not entry_signal:
@@ -356,9 +391,14 @@ class StrategyExecutor:
                     else:
                         continue  # Truly no price available, skip this tick
 
-            # Get current high/low for trailing stops (simplified - use current price)
-            current_high = market_data.get('high', exit_price)
-            current_low = market_data.get('low', exit_price)
+            # Update the option's high-water-mark since open. Trailing stops
+            # MUST compare against the option price's peak/trough, not the
+            # underlying's daily high/low — otherwise the stop fires the
+            # instant activation is reached (e.g. $3.67 vs $651.30).
+            if position.peak_price is None or exit_price > position.peak_price:
+                position.peak_price = exit_price
+            if position.trough_price is None or exit_price < position.trough_price:
+                position.trough_price = exit_price
 
             # Check for exit signal
             exit_signal = self.signal_generator.check_exit_signal(
@@ -368,8 +408,9 @@ class StrategyExecutor:
                 current_price=exit_price,
                 entry_timestamp=position.opened_at,
                 position_side=position_side,
-                current_high=current_high,
-                current_low=current_low
+                current_high=position.peak_price,
+                current_low=position.trough_price,
+                user=user
             )
 
             if not exit_signal:
@@ -405,6 +446,9 @@ class StrategyExecutor:
             )
 
             if order_result.success:
+                # Stamp the close so the re-entry cooldown gate kicks in on the
+                # next entry signal for this (strategy, symbol).
+                self._stamp_position_closed(strategy.id, symbol)
                 results['positions_closed'].append({
                     'symbol': symbol,
                     'qty': order_result.filled_qty,

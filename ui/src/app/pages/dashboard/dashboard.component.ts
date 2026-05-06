@@ -9,8 +9,12 @@ import { MatButtonModule } from '@angular/material/button';
 import { MatMenuModule } from '@angular/material/menu';
 import { MatDividerModule } from '@angular/material/divider';
 import { MatChipsModule } from '@angular/material/chips';
+import { MatSlideToggleModule } from '@angular/material/slide-toggle';
+import { MatDialog, MatDialogModule } from '@angular/material/dialog';
 import { AuthService } from '../../services/auth.service';
 import { SystemService, EnvironmentSettings } from '../../services/system.service';
+import { ThemeService } from '../../services/theme.service';
+import { TradingWindowDialogComponent } from '../../components/trading-window-dialog/trading-window-dialog.component';
 
 @Component({
   selector: 'app-dashboard',
@@ -25,7 +29,9 @@ import { SystemService, EnvironmentSettings } from '../../services/system.servic
     MatButtonModule,
     MatMenuModule,
     MatDividerModule,
-    MatChipsModule
+    MatChipsModule,
+    MatSlideToggleModule,
+    MatDialogModule
   ],
   templateUrl: './dashboard.component.html',
   styleUrls: ['./dashboard.component.scss']
@@ -34,6 +40,8 @@ export class DashboardComponent implements OnInit {
   private authService = inject(AuthService);
   private systemService = inject(SystemService);
   private router = inject(Router);
+  private dialog = inject(MatDialog);
+  protected themeService = inject(ThemeService);
 
   currentUser$ = this.authService.currentUser$;
   isSidenavOpen = signal(true);
@@ -200,6 +208,13 @@ export class DashboardComponent implements OnInit {
     const mode = this.environmentSettings()?.trading_mode;
     if (!mode) return 'Loading...';
     return mode.charAt(0).toUpperCase() + mode.slice(1);
+  }
+
+  openTradingWindowDialog(): void {
+    this.dialog.open(TradingWindowDialogComponent, {
+      width: '420px',
+      autoFocus: false,
+    });
   }
 
   logout(): void {

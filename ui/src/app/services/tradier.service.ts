@@ -38,6 +38,10 @@ export interface ClosedPosition {
   quantity: number;
   symbol: string;
   term: number;
+  // Populated client-side by reconciling /account/history events
+  commission?: number;
+  fees?: number;
+  net_pnl?: number;
 }
 
 export interface TradeEvent {
@@ -188,6 +192,23 @@ export class TradierService {
   getGainLoss(page = 1, limit = 100): Observable<ClosedPosition[]> {
     const params = new HttpParams().set('page', page).set('limit', limit);
     return this.http.get<ClosedPosition[]>(`${this.apiUrl}/account/gainloss`, {
+      headers: this.headers(),
+      params,
+    });
+  }
+
+  getAccountHistory(
+    type?: 'trade' | 'option' | 'fee' | 'dividend' | 'ach' | 'interest',
+    start?: string,
+    end?: string,
+    limit = 500,
+    page = 1,
+  ): Observable<TradeEvent[]> {
+    let params = new HttpParams().set('limit', limit).set('page', page);
+    if (type) params = params.set('type', type);
+    if (start) params = params.set('start', start);
+    if (end) params = params.set('end', end);
+    return this.http.get<TradeEvent[]>(`${this.apiUrl}/account/history`, {
       headers: this.headers(),
       params,
     });

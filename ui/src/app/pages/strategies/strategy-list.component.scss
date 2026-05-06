@@ -26,7 +26,7 @@
     h1 {
       font-size: 28px;
       font-weight: 600;
-      color: #333;
+      color: var(--text);
       margin: 0;
     }
 
@@ -59,18 +59,18 @@
       font-size: 64px;
       width: 64px;
       height: 64px;
-      color: #999;
+      color: var(--text-faint);
       margin-bottom: 16px;
     }
 
     h2 {
       font-size: 24px;
       margin: 0 0 8px 0;
-      color: #666;
+      color: var(--text-muted);
     }
 
     p {
-      color: #999;
+      color: var(--text-faint);
       margin: 0 0 24px 0;
     }
 
@@ -94,7 +94,7 @@
 
     th {
       font-weight: 600;
-      color: #666;
+      color: var(--text-muted);
       padding: 16px;
     }
 
@@ -108,12 +108,12 @@
       gap: 8px;
 
       strong {
-        color: #333;
+        color: var(--text);
         font-size: 14px;
       }
 
       .live-badge {
-        background-color: #f44336;
+        background-color: var(--color-loss);
         color: white;
         font-weight: 600;
         font-size: 10px;
@@ -132,12 +132,12 @@
       transition: background-color 0.2s ease;
 
       &:hover {
-        background-color: rgba(0, 0, 0, 0.02);
+        background-color: var(--surface-hover);
       }
     }
 
     .delete-action {
-      color: #d32f2f;
+      color: var(--color-loss);
     }
   }
 }

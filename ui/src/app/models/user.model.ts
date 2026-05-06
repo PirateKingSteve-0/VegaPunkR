@@ -3,6 +3,15 @@ export interface User {
   email: string;
   username: string;
   role?: string;
+  trading_window_enabled?: boolean;
+  trading_window_start?: string;
+  trading_window_end?: string;
+}
+
+export interface TradingWindowUpdate {
+  trading_window_enabled: boolean;
+  trading_window_start: string;
+  trading_window_end: string;
 }
 
 export interface LoginRequest {

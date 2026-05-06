@@ -1,8 +1,8 @@
 import { Injectable, inject } from '@angular/core';
-import { HttpClient } from '@angular/common/http';
+import { HttpClient, HttpHeaders } from '@angular/common/http';
 import { BehaviorSubject, Observable, tap } from 'rxjs';
 import { Router } from '@angular/router';
-import { LoginRequest, LoginResponse, User } from '../models/user.model';
+import { LoginRequest, LoginResponse, TradingWindowUpdate, User } from '../models/user.model';
 
 @Injectable({
   providedIn: 'root'
@@ -69,5 +69,30 @@ export class AuthService {
 
   getToken(): string | null {
     return this.getTokenFromStorage();
+  }
+
+  private authHeaders(): HttpHeaders {
+    const token = this.getTokenFromStorage();
+    return new HttpHeaders({ Authorization: token ? `Bearer ${token}` : '' });
+  }
+
+  refreshMe(): Observable<User> {
+    return this.http.get<User>(`${this.apiUrl}/auth/me`, { headers: this.authHeaders() }).pipe(
+      tap(user => {
+        const merged = { ...this.currentUserValue, ...user } as User;
+        localStorage.setItem('currentUser', JSON.stringify(merged));
+        this.currentUserSubject.next(merged);
+      })
+    );
+  }
+
+  updateTradingWindow(update: TradingWindowUpdate): Observable<User> {
+    return this.http.patch<User>(`${this.apiUrl}/auth/me`, update, { headers: this.authHeaders() }).pipe(
+      tap(user => {
+        const merged = { ...this.currentUserValue, ...user } as User;
+        localStorage.setItem('currentUser', JSON.stringify(merged));
+        this.currentUserSubject.next(merged);
+      })
+    );
   }
 }

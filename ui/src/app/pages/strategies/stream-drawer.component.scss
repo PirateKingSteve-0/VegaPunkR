@@ -2,7 +2,7 @@
   display: flex;
   flex-direction: column;
   height: 100%;
-  background: #fafafa;
+  background: var(--surface-alt);
 
   .drawer-header {
     padding: 16px;
@@ -17,7 +17,7 @@
         margin: 0;
         font-size: 16px;
         font-weight: 600;
-        color: #333;
+        color: var(--text);
       }
 
       .status-dot {
@@ -37,12 +37,12 @@
       .strategy-name {
         font-size: 13px;
         font-weight: 500;
-        color: #555;
+        color: var(--text-muted);
       }
 
       .symbols {
         font-size: 11px;
-        color: #888;
+        color: var(--text-faint);
         font-family: 'Roboto Mono', monospace;
         padding-top: 10px;
       }
@@ -72,7 +72,7 @@
       align-items: center;
       justify-content: center;
       height: 200px;
-      color: #bbb;
+      color: var(--text-faint);
 
       mat-icon {
         font-size: 40px;
@@ -98,7 +98,7 @@
       line-height: 1.6;
 
       &:hover {
-        background: rgba(0, 0, 0, 0.03);
+        background: var(--surface-hover);
       }
 
       &.event-quote {
@@ -110,10 +110,10 @@
       }
 
       &.event-trade {
-        border-left-color: #4caf50;
+        border-left-color: var(--color-profit);
 
         .event-badge {
-          color: #4caf50;
+          color: var(--color-profit);
         }
       }
 
@@ -128,7 +128,7 @@
 
       .event-symbol {
         font-weight: 600;
-        color: #333;
+        color: var(--text);
         width: 100px;
         flex-shrink: 0;
         overflow: hidden;
@@ -140,20 +140,20 @@
         flex: 1;
         display: flex;
         gap: 14px;
-        color: #555;
+        color: var(--text-muted);
 
         strong {
-          color: #111;
+          color: var(--text);
           font-weight: 600;
         }
 
         .muted {
-          color: #aaa;
+          color: var(--text-faint);
         }
       }
 
       .event-time {
-        color: #bbb;
+        color: var(--text-faint);
         font-size: 10px;
         flex-shrink: 0;
       }

@@ -22,6 +22,13 @@ class User(Base):
     selected_environment = Column(String, default='dev')  # 'dev', 'test', or 'prod'
     selected_trading_mode = Column(String, default='paper')  # 'paper' or 'live'
 
+    # Account-level trading window (ET, "HH:MM"). When enabled, layers on top of
+    # per-strategy entry_after_open_minutes / exit_before_close_minutes — the more
+    # restrictive bound wins, so users can never widen past their chosen window.
+    trading_window_enabled = Column(Boolean, default=False)
+    trading_window_start = Column(String, default='09:45')
+    trading_window_end = Column(String, default='15:45')
+
     # Additional fields
     timezone = Column(String, default='UTC')
     notification_preferences = Column(JSON, default=dict)  # Email, SMS, push settings
@@ -81,6 +88,13 @@ class Position(Base):
     current_price = Column(Float)
     unrealized_pnl = Column(Float)
 
+    # Per-position high-water-mark of the *option* price since open. Trailing
+    # stops compare against these, not the underlying's daily high/low — using
+    # underlying high here once produced trips like "$3.67 <= $651.30" because
+    # the option price was being measured against 90% of SPY's underlying.
+    peak_price = Column(Float)
+    trough_price = Column(Float)
+
     # Strategy link
     strategy_id = Column(Integer, ForeignKey('strategies.id'))
 
@@ -110,6 +124,7 @@ class Trade(Base):
 
     # Financial details
     commission = Column(Float, default=0.0)
+    fees = Column(Float, default=0.0)  # Regulatory fees (SEC/TAF/ORF) — populated from /account/history type=fee
     pnl = Column(Float)  # Profit/loss for closed positions
 
     # Timestamps
@@ -148,6 +163,7 @@ class PerformanceMetrics(Base):
     gross_profit = Column(Float, default=0.0)
     gross_loss = Column(Float, default=0.0)
     total_commission = Column(Float, default=0.0)
+    total_fees = Column(Float, default=0.0)
 
     # Performance ratios
     win_rate = Column(Float)  # winning_trades / total_trades

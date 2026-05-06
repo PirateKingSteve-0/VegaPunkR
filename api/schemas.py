@@ -27,6 +27,9 @@ class LoginRequest(BaseModel):
 
 # ===== User Schemas =====
 
+_HHMM_PATTERN = r"^([01]\d|2[0-3]):[0-5]\d$"
+
+
 class UserBase(BaseModel):
     """Base user schema with common fields."""
     email: EmailStr
@@ -36,6 +39,9 @@ class UserBase(BaseModel):
     account_size_usd: float = 0.0
     max_trade_percentage: float = 0.02
     timezone: str = "UTC"
+    trading_window_enabled: bool = False
+    trading_window_start: str = Field("09:45", pattern=_HHMM_PATTERN)
+    trading_window_end: str = Field("15:45", pattern=_HHMM_PATTERN)
 
 
 class UserCreate(UserBase):
@@ -50,6 +56,9 @@ class UserUpdate(BaseModel):
     account_size_usd: Optional[float] = None
     max_trade_percentage: Optional[float] = None
     timezone: Optional[str] = None
+    trading_window_enabled: Optional[bool] = None
+    trading_window_start: Optional[str] = Field(None, pattern=_HHMM_PATTERN)
+    trading_window_end: Optional[str] = Field(None, pattern=_HHMM_PATTERN)
 
 
 class UserResponse(UserBase):
@@ -161,6 +170,7 @@ class TradeCreate(TradeBase):
     """Schema for creating a trade."""
     filled_qty: Optional[int] = None
     commission: float = 0.0
+    fees: float = 0.0
     strategy_id: Optional[int] = None
     position_id: Optional[int] = None
     notes: Optional[Dict[str, Any]] = None
@@ -174,6 +184,7 @@ class TradeResponse(TradeBase):
     exit_price: Optional[float] = None
     exit_timestamp: Optional[datetime] = None
     commission: float
+    fees: float = 0.0
     pnl: Optional[float] = None
     timestamp: datetime
     strategy_id: Optional[int] = None
@@ -198,6 +209,8 @@ class PerformanceMetricsResponse(BaseModel):
     winning_trades: int
     losing_trades: int
     total_pnl: float
+    total_commission: float = 0.0
+    total_fees: float = 0.0
     win_rate: Optional[float] = None
     sharpe_ratio: Optional[float] = None
     max_drawdown: Optional[float] = None

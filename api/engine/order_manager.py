@@ -8,8 +8,9 @@ to the correct trading API based on user.selected_trading_mode:
 """
 import asyncio
 import logging
+import uuid
 from typing import Dict, Optional, Tuple
-from datetime import datetime
+from datetime import datetime, timedelta
 from sqlalchemy.orm import Session
 
 from models import User, Strategy, Trade, Position
@@ -18,6 +19,33 @@ from engine.signal_generator import Signal
 from engine.event_logger import log_event
 
 logger = logging.getLogger(__name__)
+
+# Minimum interval between orders for the same (user, symbol). Belt-and-suspenders
+# against runaway loops; tuned for 0DTE scalping where a few seconds is plenty.
+MIN_ORDER_INTERVAL_SECONDS = 5.0
+
+# Pre-flight order preview — call Tradier's preview endpoint before each
+# place_order to validate buying power, contract validity, and surface
+# commission/fees for the audit trail. Disable to fall back to direct placement.
+ENABLE_ORDER_PREVIEW = True
+
+# Cash-only GFV/T+1 protection: every accepted buy reserves cash in an
+# in-process ledger, layered on top of Tradier's settled `cash.cash_available`.
+# Effective available = settled_cash - sum(active reservations for this user).
+# Reservations are released when the order reaches a terminal broker state
+# (filled / rejected / canceled / expired). The TTL is a safety belt — if a
+# release path is missed (crash, unhandled exception), the reservation lapses
+# instead of locking cash forever.
+RESERVATION_TTL_SECONDS = 60.0
+
+# Per-options-contract estimate of broker commission + regulatory fees. Used
+# as a safety buffer in non-prod environments where Tradier's preview returns
+# commission=0 and fees=0 — without it, a sandbox-validated buy can slip past
+# the gate at the edge of available cash and then fail in live for the missing
+# fees. Sized conservatively above Tradier's published schedule (~$0.35 base
+# commission + ~$0.10 regulatory). Refine from real Trade.commission/fees rows
+# once live trading has produced a sample.
+SANDBOX_FEE_BUFFER_PER_OPTION_CONTRACT = 0.65
 
 
 class OrderResult:
@@ -49,9 +77,241 @@ class OrderManager:
     - Trade recording
     """
 
+    # Class-level so the rate limit holds across executor instances within a process.
+    # Keyed by (user_id, symbol). Values are last submission timestamps (UTC).
+    _last_order_at: Dict[Tuple[int, str], datetime] = {}
+
+    # Class-level pending-buy ledger — in-memory, process-scoped. Survives
+    # nothing across restarts (broker is the source of truth post-restart).
+    # Maps reservation_id -> {user_id, amount, expires_at}.
+    _pending_buy_reservations: Dict[str, Dict] = {}
+
     def __init__(self, db: Session):
         self.db = db
         self.trading_client = TradingClientManager()
+
+    @classmethod
+    def _check_order_rate_limit(cls, user_id: int, symbol: str) -> Tuple[bool, float]:
+        """Return (allowed, seconds_until_allowed). Symbol-scoped, not user-global."""
+        last = cls._last_order_at.get((user_id, symbol))
+        if last is None:
+            return True, 0.0
+        elapsed = (datetime.utcnow() - last).total_seconds()
+        if elapsed >= MIN_ORDER_INTERVAL_SECONDS:
+            return True, 0.0
+        return False, MIN_ORDER_INTERVAL_SECONDS - elapsed
+
+    @classmethod
+    def _stamp_order_submitted(cls, user_id: int, symbol: str) -> None:
+        cls._last_order_at[(user_id, symbol)] = datetime.utcnow()
+
+    @classmethod
+    def _purge_expired_reservations(cls) -> None:
+        """Drop reservations past their TTL. A non-empty expiry set means a
+        release path was missed somewhere — we log so it's visible without
+        disrupting the order flow."""
+        now = datetime.utcnow()
+        expired = [
+            rid for rid, r in cls._pending_buy_reservations.items()
+            if r["expires_at"] <= now
+        ]
+        for rid in expired:
+            r = cls._pending_buy_reservations.pop(rid, None)
+            if r:
+                logger.warning(
+                    f"Buy reservation {rid} (user={r['user_id']}, "
+                    f"amount=${r['amount']:.2f}) expired without explicit release. "
+                    "A release path was likely missed."
+                )
+
+    @classmethod
+    def _active_reservations_total(cls, user_id: int) -> float:
+        """Sum of currently-held reservation amounts for a user."""
+        cls._purge_expired_reservations()
+        return sum(
+            r["amount"] for r in cls._pending_buy_reservations.values()
+            if r["user_id"] == user_id
+        )
+
+    @classmethod
+    def _acquire_buy_reservation(cls, user_id: int, amount: float) -> str:
+        """Add a reservation and return its id."""
+        reservation_id = str(uuid.uuid4())
+        cls._pending_buy_reservations[reservation_id] = {
+            "user_id": user_id,
+            "amount": amount,
+            "expires_at": datetime.utcnow() + timedelta(seconds=RESERVATION_TTL_SECONDS),
+        }
+        return reservation_id
+
+    @classmethod
+    def _release_buy_reservation(cls, reservation_id: Optional[str]) -> None:
+        """Drop a reservation. Safe to call with None or with an unknown id."""
+        if reservation_id:
+            cls._pending_buy_reservations.pop(reservation_id, None)
+
+    @staticmethod
+    def _estimate_fee_buffer(user: User, qty: int, option_symbol: Optional[str]) -> float:
+        """Per-order fee buffer added to the reservation in non-prod envs.
+
+        Tradier sandbox returns commission/fees as 0 on previews, which makes
+        a sandbox-validated buy quietly under-funded vs the same buy in live.
+        We pad with a per-contract estimate so the cash gate behaves the same
+        in dev/test as it will in prod. In prod we trust Tradier's `cost`
+        field (which already includes commission + fees) and pad nothing.
+        """
+        if (user.selected_environment or "").lower() == "prod":
+            return 0.0
+        if option_symbol:
+            return qty * SANDBOX_FEE_BUFFER_PER_OPTION_CONTRACT
+        return 0.0  # equities are commission-free at Tradier
+
+    async def _preview_or_abort(
+        self,
+        user: User,
+        strategy: Strategy,
+        symbol: str,
+        qty: int,
+        side: str,
+        option_symbol: Optional[str],
+        order_type: str = "market",
+    ) -> Tuple[bool, Optional[Dict], str, Optional[str]]:
+        """Call broker preview before placing an order.
+
+        Returns (ok, preview_dict, message, reservation_id):
+          - ok=True  → preview validated, safe to place. preview_dict carries
+                       commission/fees/cost/order_cost for the audit trail.
+                       For buys, reservation_id holds cash in the in-process
+                       ledger and MUST be released by the caller (try/finally).
+                       reservation_id is None for sells and when previews are
+                       disabled or unavailable.
+          - ok=False → abort the order. message explains why. No reservation.
+
+        Cash-account-only: validates `cost` (total cash debit) against settled
+        cash minus any in-process pending-buy reservations on entry orders.
+        Sells generate cash so the cash gate is skipped.
+
+        Aborts on any preview transport error/timeout — fail-safe over fail-open.
+        """
+        if not ENABLE_ORDER_PREVIEW:
+            return True, None, "preview disabled", None
+
+        try:
+            preview = await self.trading_client.preview_order(
+                user=user,
+                symbol=symbol,
+                qty=qty,
+                side=side,
+                order_type=order_type,
+                option_symbol=option_symbol,
+            )
+        except Exception as e:
+            msg = f"Preview failed for {symbol}: {e}"
+            logger.error(msg)
+            log_event(
+                db=self.db,
+                user_id=user.id,
+                event_type="ORDER_PREVIEW_FAILED",
+                title=f"Preview failed: {symbol}",
+                detail=msg,
+                symbol=symbol,
+                strategy_id=strategy.id,
+                severity="error",
+                event_data={"side": side, "qty": qty},
+            )
+            return False, None, msg, None
+
+        if preview is None:
+            # preview_order returned None for a non-paper trading mode (Schwab
+            # live preview not yet implemented). Treat as "no preview available"
+            # and proceed — Schwab path will be wired in a follow-up.
+            return True, None, "preview not available for trading mode", None
+
+        # Cash gate — only on buys. Sells generate cash.
+        if side == "buy":
+            try:
+                client = self.trading_client.get_client(user)
+                balances = await asyncio.to_thread(client.get_balances)
+                # Real cash accounts expose cash.cash_available (settled cash).
+                # Margin/PDT/sandbox accounts return cash=None — fall back to
+                # total_cash so buying-power validation still runs in dev.
+                # Production cash accounts will pass through the preferred path.
+                cash_block = balances.get("cash") or {}
+                settled_cash_raw = cash_block.get("cash_available")
+                if settled_cash_raw is None:
+                    settled_cash = float(balances.get("total_cash") or 0.0)
+                    logger.warning(
+                        f"No cash.cash_available on this account "
+                        f"(account_type={balances.get('account_type')!r}); "
+                        f"falling back to total_cash=${settled_cash:.2f} for buy gate."
+                    )
+                else:
+                    settled_cash = float(settled_cash_raw)
+            except Exception as e:
+                msg = f"Could not fetch settled cash for buy preview: {e}"
+                logger.error(msg)
+                log_event(
+                    db=self.db,
+                    user_id=user.id,
+                    event_type="ORDER_PREVIEW_FAILED",
+                    title=f"Preview cash check failed: {symbol}",
+                    detail=msg,
+                    symbol=symbol,
+                    strategy_id=strategy.id,
+                    severity="error",
+                )
+                return False, preview, msg, None
+
+            # Tradier preview semantics (per docs/tradier/trading/preview_order.md
+            # example math): `cost` is the total cash debit, equal to
+            # `order_cost + commission + fees`. Reserve `cost` so we match the
+            # actual deduction. Sandbox returns commission=0/fees=0 → cost ==
+            # order_cost there, so we add an explicit fee buffer below to keep
+            # dev parity with prod.
+            preview_cost = float(preview.get("cost") or preview.get("order_cost") or 0.0)
+            fee_buffer = self._estimate_fee_buffer(user, qty, option_symbol)
+            required = preview_cost + fee_buffer
+
+            # Subtract in-process pending buys so concurrent signals can't
+            # double-spend the same dollars between balance fetch and order
+            # placement (Tradier won't reflect our pending order in
+            # cash_available until they've registered it server-side).
+            active_reservations = self._active_reservations_total(user.id)
+            effective_available = settled_cash - active_reservations
+
+            if required > effective_available:
+                msg = (
+                    f"Insufficient settled cash: required=${required:.2f} "
+                    f"(cost=${preview_cost:.2f} + fee_buffer=${fee_buffer:.2f}) "
+                    f"> effective_available=${effective_available:.2f} "
+                    f"(settled=${settled_cash:.2f} - reserved=${active_reservations:.2f})"
+                )
+                logger.warning(msg)
+                log_event(
+                    db=self.db,
+                    user_id=user.id,
+                    event_type="ORDER_PREVIEW_REJECTED",
+                    title=f"Insufficient cash: {symbol}",
+                    detail=msg,
+                    symbol=symbol,
+                    strategy_id=strategy.id,
+                    severity="warning",
+                    event_data={
+                        "preview_cost": preview_cost,
+                        "fee_buffer": fee_buffer,
+                        "required": required,
+                        "settled_cash": settled_cash,
+                        "active_reservations": active_reservations,
+                        "effective_available": effective_available,
+                        "qty": qty,
+                    },
+                )
+                return False, preview, msg, None
+
+            reservation_id = self._acquire_buy_reservation(user.id, required)
+            return True, preview, "preview ok", reservation_id
+
+        return True, preview, "preview ok", None
 
     async def execute_signal(
         self,
@@ -118,86 +378,205 @@ class OrderManager:
                     return OrderResult(success=False, message=msg)
                 self.db.rollback()  # release the lock before the broker call
 
-            # Place order via TradingClientManager (handles paper/live routing)
-            order_response = await self.trading_client.place_order(
+            # Per-(user, symbol) order rate limit. Stops a runaway loop from
+            # hammering the broker even if the strategy logic flips state every
+            # tick. Independent of the broker rate limit.
+            allowed, wait_s = self._check_order_rate_limit(user.id, symbol)
+            if not allowed:
+                msg = (
+                    f"Order rate-limited for {symbol}: last submission was within "
+                    f"{MIN_ORDER_INTERVAL_SECONDS:.1f}s ({wait_s:.1f}s remaining)"
+                )
+                logger.warning(msg)
+                log_event(
+                    db=self.db,
+                    user_id=user.id,
+                    event_type="ORDER_RATE_LIMITED",
+                    title=f"Order throttled: {symbol}",
+                    detail=msg,
+                    symbol=symbol,
+                    strategy_id=strategy.id,
+                    severity="warning",
+                    event_data={"wait_seconds": round(wait_s, 2)},
+                )
+                return OrderResult(success=False, message=msg)
+
+            self._stamp_order_submitted(user.id, symbol)
+
+            # Pre-flight broker preview — validates buying power, contract,
+            # surfaces commission/fees. Aborts on any failure (fail-safe).
+            # On a buy, this also acquires an in-process cash reservation so
+            # concurrent signals can't double-spend; we MUST release it on
+            # every exit below (try/finally).
+            preview_ok, preview, preview_msg, reservation_id = await self._preview_or_abort(
                 user=user,
+                strategy=strategy,
                 symbol=symbol,
                 qty=qty,
                 side=side,
-                order_type=order_type,
                 option_symbol=option_symbol,
+                order_type=order_type,
             )
+            if not preview_ok:
+                return OrderResult(success=False, message=f"Order aborted: {preview_msg}")
 
-            if not order_response:
-                return OrderResult(
-                    success=False,
-                    message=f"Failed to place order for {symbol}"
-                )
-
-            # Extract order details
-            order_id = self._extract_order_id(order_response)
-            filled_price = self._extract_filled_price(order_response, estimated_price or signal.price)
-            filled_qty = self._extract_filled_qty(order_response, qty)
-
-            # Record trade in database
-            trade = self._create_trade_record(
-                user=user,
-                strategy=strategy,
-                signal=signal,
-                qty=filled_qty,
-                price=filled_price,
-                order_id=order_id
-            )
-
-            log_event(
-                db=self.db,
-                user_id=user.id,
-                event_type="ORDER_PLACED",
-                title=f"{side.upper()} {filled_qty}x {symbol}",
-                symbol=symbol,
-                strategy_id=strategy.id,
-                severity="info",
-                event_data={
-                    "order_id": order_id,
-                    "price": filled_price,
-                    "qty": filled_qty,
-                    "signal_type": signal.signal_type,
-                },
-            )
-
-            # Update or create position
-            if signal.signal_type == 'entry':
-                self._update_position_entry(
+            try:
+                # Place order via TradingClientManager (handles paper/live routing)
+                order_response = await self.trading_client.place_order(
                     user=user,
-                    strategy=strategy,
                     symbol=symbol,
-                    qty=filled_qty,
-                    price=filled_price,
-                    trade=trade,
+                    qty=qty,
+                    side=side,
+                    order_type=order_type,
                     option_symbol=option_symbol,
                 )
-            elif signal.signal_type == 'exit':
-                self._update_position_exit(
+
+                if not order_response:
+                    return OrderResult(
+                        success=False,
+                        message=f"Failed to place order for {symbol}"
+                    )
+
+                order_id = self._extract_order_id(order_response)
+
+                # Wait for terminal broker status before mutating local position state.
+                # Submission "ok"/"pending"/"open" only means the broker accepted the
+                # request — we must confirm the fill before writing Trade/Position rows.
+                # This makes entries symmetric with close_position()'s behavior and
+                # eliminates the divergence where local thinks flat while broker holds
+                # contracts (see incident 2026-05-04: 6 TSLA contracts unaccounted for).
+                terminal_order = await self._await_terminal_order(order_id, user)
+                if terminal_order is None:
+                    msg = (
+                        f"Order {order_id} status not confirmed within timeout — "
+                        "leaving local state untouched (next reconcile tick will sync)"
+                    )
+                    logger.warning(msg)
+                    log_event(
+                        db=self.db,
+                        user_id=user.id,
+                        event_type="ORDER_UNCONFIRMED",
+                        title=f"Order unconfirmed: {symbol}",
+                        detail=msg,
+                        symbol=symbol,
+                        strategy_id=strategy.id,
+                        severity="warning",
+                        event_data={"order_id": order_id, "side": side, "qty": qty},
+                    )
+                    return OrderResult(success=False, message=msg, order_id=order_id)
+
+                terminal_status = (terminal_order.get("status") or "").lower()
+                if terminal_status != "filled":
+                    msg = (
+                        f"Order {order_id} did not fill (status={terminal_status}). "
+                        "Local position left untouched."
+                    )
+                    logger.error(msg)
+                    # Record an audit Trade so the failed attempt shows in history.
+                    failed_trade = Trade(
+                        user_id=user.id,
+                        strategy_id=strategy.id,
+                        symbol=symbol,
+                        side=side,
+                        order_type=order_type,
+                        qty=qty,
+                        filled_qty=0,
+                        price=estimated_price or signal.price or 0.0,
+                        status='failed',
+                        timestamp=datetime.utcnow(),
+                        notes={
+                            'signal_type': signal.signal_type,
+                            'signal_reason': signal.reason,
+                            'order_id': order_id,
+                            'terminal_status': terminal_status,
+                        },
+                    )
+                    self.db.add(failed_trade)
+                    self.db.commit()
+                    log_event(
+                        db=self.db,
+                        user_id=user.id,
+                        event_type="ORDER_FAILED",
+                        title=f"Order {terminal_status}: {side.upper()} {qty}x {symbol}",
+                        detail=msg,
+                        symbol=symbol,
+                        strategy_id=strategy.id,
+                        severity="error",
+                        event_data={"order_id": order_id, "status": terminal_status},
+                    )
+                    return OrderResult(success=False, message=msg, order_id=order_id)
+
+                # Confirmed filled — use the broker's actual fill data.
+                filled_price = self._extract_filled_price(terminal_order, estimated_price or signal.price)
+                filled_qty = self._extract_filled_qty(terminal_order, qty)
+
+                # Record trade in database
+                trade = self._create_trade_record(
                     user=user,
                     strategy=strategy,
-                    symbol=symbol,
+                    signal=signal,
                     qty=filled_qty,
                     price=filled_price,
-                    trade=trade
+                    order_id=order_id,
+                    preview=preview,
                 )
 
-            logger.info(
-                f"Order executed successfully: {order_id} - {side} {filled_qty} {symbol} @ ${filled_price:.2f}"
-            )
+                log_event(
+                    db=self.db,
+                    user_id=user.id,
+                    event_type="ORDER_PLACED",
+                    title=f"{side.upper()} {filled_qty}x {symbol}",
+                    symbol=symbol,
+                    strategy_id=strategy.id,
+                    severity="info",
+                    event_data={
+                        "order_id": order_id,
+                        "price": filled_price,
+                        "qty": filled_qty,
+                        "signal_type": signal.signal_type,
+                    },
+                )
 
-            return OrderResult(
-                success=True,
-                message=f"Order executed: {side} {filled_qty} {symbol} @ ${filled_price:.2f}",
-                order_id=order_id,
-                trade=trade,
-                filled_price=filled_price,
-                filled_qty=filled_qty
-            )
+                # Update or create position
+                if signal.signal_type == 'entry':
+                    self._update_position_entry(
+                        user=user,
+                        strategy=strategy,
+                        symbol=symbol,
+                        qty=filled_qty,
+                        price=filled_price,
+                        trade=trade,
+                        option_symbol=option_symbol,
+                    )
+                elif signal.signal_type == 'exit':
+                    self._update_position_exit(
+                        user=user,
+                        strategy=strategy,
+                        symbol=symbol,
+                        qty=filled_qty,
+                        price=filled_price,
+                        trade=trade
+                    )
+
+                logger.info(
+                    f"Order executed successfully: {order_id} - {side} {filled_qty} {symbol} @ ${filled_price:.2f}"
+                )
+
+                return OrderResult(
+                    success=True,
+                    message=f"Order executed: {side} {filled_qty} {symbol} @ ${filled_price:.2f}",
+                    order_id=order_id,
+                    trade=trade,
+                    filled_price=filled_price,
+                    filled_qty=filled_qty
+                )
+            finally:
+                # Release the cash reservation regardless of how the inner block
+                # exited (success, early return, raised exception). Tradier's
+                # cash_available reflects the order at this point — the reservation
+                # was only needed to bridge the gap between balance fetch and
+                # broker-side registration.
+                self._release_buy_reservation(reservation_id)
 
         except Exception as e:
             logger.error(f"Error executing signal: {str(e)}", exc_info=True)
@@ -365,9 +744,26 @@ class OrderManager:
         signal: Signal,
         qty: int,
         price: float,
-        order_id: Optional[str]
+        order_id: Optional[str],
+        preview: Optional[Dict] = None,
     ) -> Trade:
         """Create a trade record in the database"""
+        notes = {
+            'signal_type': signal.signal_type,
+            'signal_reason': signal.reason,
+            'signal_confidence': signal.confidence,
+            'indicators': signal.indicators,
+            'order_id': order_id,
+        }
+        if preview:
+            notes['preview'] = {
+                'order_cost': preview.get('order_cost'),
+                'commission': preview.get('commission'),
+                'fees': preview.get('fees'),
+                'margin_change': preview.get('margin_change'),
+                'day_trades': preview.get('day_trades'),
+            }
+
         trade = Trade(
             user_id=user.id,
             strategy_id=strategy.id,
@@ -379,13 +775,7 @@ class OrderManager:
             price=price,
             status='executed',
             timestamp=datetime.utcnow(),
-            notes={
-                'signal_type': signal.signal_type,
-                'signal_reason': signal.reason,
-                'signal_confidence': signal.confidence,
-                'indicators': signal.indicators,
-                'order_id': order_id
-            }
+            notes=notes,
         )
 
         self.db.add(trade)
@@ -458,6 +848,8 @@ class OrderManager:
             position.unrealized_pnl = 0.0
             position.opened_at = datetime.utcnow()
             position.option_symbol = option_symbol
+            position.peak_price = price
+            position.trough_price = price
             is_new = True  # treat as a fresh open for event logging
 
             logger.info(f"Reopened position: {symbol} qty={qty}, price=${price:.2f}")
@@ -472,7 +864,9 @@ class OrderManager:
                 avg_entry_price=price,
                 current_price=price,
                 unrealized_pnl=0.0,
-                opened_at=datetime.utcnow()
+                opened_at=datetime.utcnow(),
+                peak_price=price,
+                trough_price=price,
             )
             self.db.add(position)
 
@@ -601,6 +995,46 @@ class OrderManager:
 
         logger.info(f"Closing position: {side} {position.qty} {position.symbol} - {reason}")
 
+        # Per-(user, symbol) rate limit also applies to closes — same belt-and-
+        # suspenders against runaway loops. Closes are usually triggered after
+        # entries so they should normally pass the throttle.
+        allowed, wait_s = self._check_order_rate_limit(user.id, position.symbol)
+        if not allowed:
+            msg = (
+                f"Close rate-limited for {position.symbol}: last order was within "
+                f"{MIN_ORDER_INTERVAL_SECONDS:.1f}s ({wait_s:.1f}s remaining)"
+            )
+            logger.warning(msg)
+            log_event(
+                db=self.db,
+                user_id=user.id,
+                event_type="ORDER_RATE_LIMITED",
+                title=f"Close throttled: {position.symbol}",
+                detail=msg,
+                symbol=position.symbol,
+                strategy_id=strategy.id,
+                severity="warning",
+                event_data={"wait_seconds": round(wait_s, 2)},
+            )
+            return OrderResult(success=False, message=msg)
+
+        self._stamp_order_submitted(user.id, position.symbol)
+
+        # Pre-flight preview for closes too — validates the contract is held,
+        # surfaces commission/fees for accurate P&L. Sells skip the cash gate
+        # and never acquire a reservation, so the 4th return slot is discarded.
+        preview_ok, preview, preview_msg, _ = await self._preview_or_abort(
+            user=user,
+            strategy=strategy,
+            symbol=position.symbol,
+            qty=position.qty,
+            side=side,
+            option_symbol=option_symbol,
+            order_type='market',
+        )
+        if not preview_ok:
+            return OrderResult(success=False, message=f"Close aborted: {preview_msg}")
+
         try:
             # Place market order to close (routes via TradingClientManager)
             order_response = await self.trading_client.place_order(
@@ -694,6 +1128,19 @@ class OrderManager:
             pnl = (filled_price - position.avg_entry_price) * filled_qty
 
             # Create trade record
+            close_notes = {
+                'signal_type': 'exit',
+                'signal_reason': reason,
+                'order_id': order_id,
+            }
+            if preview:
+                close_notes['preview'] = {
+                    'order_cost': preview.get('order_cost'),
+                    'commission': preview.get('commission'),
+                    'fees': preview.get('fees'),
+                    'margin_change': preview.get('margin_change'),
+                    'day_trades': preview.get('day_trades'),
+                }
             trade = Trade(
                 user_id=user.id,
                 strategy_id=strategy.id,
@@ -709,11 +1156,7 @@ class OrderManager:
                 pnl=pnl,
                 status='executed',
                 timestamp=datetime.utcnow(),
-                notes={
-                    'signal_type': 'exit',
-                    'signal_reason': reason,
-                    'order_id': order_id
-                }
+                notes=close_notes,
             )
 
             self.db.add(trade)

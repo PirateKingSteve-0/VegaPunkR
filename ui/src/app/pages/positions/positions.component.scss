@@ -11,7 +11,7 @@
 
     .subtitle {
       font-size: 13px;
-      color: rgba(0, 0, 0, 0.45);
+      color: var(--text-faint);
     }
   }
 
@@ -19,7 +19,7 @@
     .empty-state {
       text-align: center;
       padding: 64px 24px;
-      color: rgba(0, 0, 0, 0.6);
+      color: var(--text-muted);
 
       mat-icon {
         font-size: 64px;
@@ -43,12 +43,12 @@
       width: 100%;
 
       .profit {
-        color: #4caf50;
+        color: var(--color-profit);
         font-weight: 500;
       }
 
       .loss {
-        color: #f44336;
+        color: var(--color-loss);
         font-weight: 500;
       }
 
@@ -57,7 +57,7 @@
         transition: background-color 120ms ease;
 
         &:hover {
-          background-color: rgba(25, 118, 210, 0.06);
+          background-color: var(--surface-hover);
         }
       }
     }

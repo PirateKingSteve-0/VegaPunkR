@@ -28,6 +28,7 @@ import {
   createSeriesMarkers,
 } from 'lightweight-charts';
 import { TradierService, HistoryBar, IntradayBar } from '../../../services/tradier.service';
+import { ThemeService } from '../../../services/theme.service';
 
 export interface PositionChartData {
   symbol: string;
@@ -85,6 +86,7 @@ export class PositionChartDialogComponent implements OnInit, AfterViewInit, OnDe
   @ViewChild('chartContainer', { static: false }) chartContainer!: ElementRef<HTMLDivElement>;
 
   private tradier = inject(TradierService);
+  private themeService = inject(ThemeService);
   private chart?: IChartApi;
   private series?: ISeriesApi<'Candlestick'>;
   private resizeObserver?: ResizeObserver;
@@ -197,23 +199,24 @@ export class PositionChartDialogComponent implements OnInit, AfterViewInit, OnDe
 
   private initChart(): void {
     const el = this.chartContainer.nativeElement;
+    const palette = this.themeService.chartColors();
     this.chart = createChart(el, {
       autoSize: true,
       layout: {
-        background: { type: ColorType.Solid, color: '#ffffff' },
-        textColor: '#222',
+        background: { type: ColorType.Solid, color: palette.surface },
+        textColor: palette.text,
       },
       grid: {
-        vertLines: { color: 'rgba(0,0,0,0.06)' },
-        horzLines: { color: 'rgba(0,0,0,0.06)' },
+        vertLines: { color: palette.grid },
+        horzLines: { color: palette.grid },
       },
       timeScale: {
-        borderColor: 'rgba(0,0,0,0.1)',
+        borderColor: palette.grid,
         timeVisible: false,
         secondsVisible: false,
         tickMarkFormatter: (time: any) => this.formatAxisTick(time),
       },
-      rightPriceScale: { borderColor: 'rgba(0,0,0,0.1)' },
+      rightPriceScale: { borderColor: palette.grid },
       crosshair: { mode: 1 },
       localization: {
         timeFormatter: (time: any) => this.formatCrosshairTime(time),
@@ -314,7 +317,7 @@ export class PositionChartDialogComponent implements OnInit, AfterViewInit, OnDe
       markers.push({
         time: exitTime,
         position: 'aboveBar',
-        color: '#c62828',
+        color: this.themeService.chartColors().loss,
         shape: 'arrowDown',
         text: `Exit @ $${this.position.exit_price.toFixed(2)}`,
       });
@@ -362,7 +365,7 @@ export class PositionChartDialogComponent implements OnInit, AfterViewInit, OnDe
         markers.push({
           time: exitTime,
           position: 'aboveBar',
-          color: '#c62828',
+          color: this.themeService.chartColors().loss,
           shape: 'arrowDown',
           text: `Exit @ $${this.position.exit_price.toFixed(2)}`,
         });
@@ -488,7 +491,7 @@ export class PositionChartDialogComponent implements OnInit, AfterViewInit, OnDe
     this.priceLines.push(
       this.series.createPriceLine({
         price: this.position.exit_price,
-        color: '#c62828',
+        color: this.themeService.chartColors().loss,
         lineWidth: 1,
         lineStyle: 2,
         axisLabelVisible: true,

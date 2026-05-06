@@ -1,0 +1,68 @@
+<h2 mat-dialog-title>
+  <mat-icon class="title-icon">schedule</mat-icon>
+  Account Trading Window
+</h2>
+
+<mat-dialog-content>
+  @if (loading()) {
+    <div class="loading-row">
+      <mat-spinner diameter="32"></mat-spinner>
+    </div>
+  } @else {
+    <p class="hint">
+      When enabled, no entries fire before <strong>start</strong> or after <strong>end</strong>,
+      and any open position is force-exited at <strong>end</strong>. The strategy's own opening-noise
+      and exit-before-close rules still apply — the more restrictive bound wins.
+    </p>
+
+    <div class="row">
+      <mat-slide-toggle [checked]="enabled()" (change)="enabled.set($event.checked)">
+        Enforce account window
+      </mat-slide-toggle>
+    </div>
+
+    <div class="row time-row" [class.disabled]="!enabled()">
+      <mat-form-field appearance="outline">
+        <mat-label>Start (ET)</mat-label>
+        <input
+          matInput
+          type="time"
+          [value]="start()"
+          (change)="start.set($any($event.target).value)"
+          [disabled]="!enabled()"
+        />
+      </mat-form-field>
+
+      <mat-form-field appearance="outline">
+        <mat-label>End (ET)</mat-label>
+        <input
+          matInput
+          type="time"
+          [value]="end()"
+          (change)="end.set($any($event.target).value)"
+          [disabled]="!enabled()"
+        />
+      </mat-form-field>
+    </div>
+
+    @if (error()) {
+      <div class="error-row">{{ error() }}</div>
+    }
+  }
+</mat-dialog-content>
+
+<mat-dialog-actions align="end">
+  <button mat-button (click)="cancel()" [disabled]="saving()">Cancel</button>
+  <button
+    mat-flat-button
+    color="primary"
+    (click)="save()"
+    [disabled]="loading() || saving()"
+  >
+    @if (saving()) {
+      <mat-spinner diameter="18"></mat-spinner>
+    } @else {
+      Save
+    }
+  </button>
+</mat-dialog-actions>

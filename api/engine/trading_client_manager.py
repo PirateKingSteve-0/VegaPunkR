@@ -198,6 +198,55 @@ class TradingClientManager:
             logger.error(f"❌ Failed to place order: {e}")
             raise
 
+    async def preview_order(self, user: User, symbol: str, qty: int, side: str, order_type: str = "market", **kwargs):
+        """
+        Preview an order via the broker without submitting it.
+
+        Returns the broker's preview dict (commission, fees, order_cost,
+        margin_change, day_trades, etc.) on success. Raises on rejection.
+
+        Currently Tradier (paper) only — Schwab live preview support is a
+        follow-up.
+        """
+        client = self.get_client(user)
+        trading_mode = user.selected_trading_mode or "paper"
+
+        if trading_mode != "paper":
+            # Schwab live preview not yet wired — return None so caller can
+            # decide whether to proceed without preview (currently: abort).
+            logger.info(f"Order preview skipped: not implemented for {trading_mode}")
+            return None
+
+        option_symbol = kwargs.get("option_symbol")
+        if not option_symbol:
+            raise ValueError(
+                f"option_symbol is required for option preview (underlying: {symbol})"
+            )
+
+        side_map = {"buy": "buy_to_open", "sell": "sell_to_close"}
+        tradier_side = side_map.get(side)
+        if not tradier_side:
+            raise ValueError(f"Unsupported option side for preview: {side}")
+
+        limit_price = kwargs.get("limit_price")
+
+        preview = await asyncio.to_thread(
+            client.preview_option_order,
+            symbol=symbol,
+            option_symbol=option_symbol,
+            side=tradier_side,
+            quantity=qty,
+            order_type=order_type,
+            duration="day",
+            price=limit_price,
+        )
+        logger.info(
+            f"Tradier option preview: {tradier_side} {qty}x {option_symbol} "
+            f"cost=${preview.get('order_cost')} commission=${preview.get('commission')} "
+            f"fees=${preview.get('fees')}"
+        )
+        return preview
+
     async def get_account(self, user: User):
         """
         Get account information from the appropriate trading API.

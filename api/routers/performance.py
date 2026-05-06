@@ -159,6 +159,7 @@ def calculate_performance_metrics(
             gross_profit=0.0,
             gross_loss=0.0,
             total_commission=0.0,
+            total_fees=0.0,
             win_rate=0.0,
             profit_factor=0.0,
             sharpe_ratio=None,
@@ -186,7 +187,8 @@ def calculate_performance_metrics(
     total_pnl = sum(t.pnl for t in trades)
     gross_profit = sum(t.pnl for t in winning_trades_list)
     gross_loss = sum(t.pnl for t in losing_trades_list)
-    total_commission = sum(t.commission for t in trades)
+    total_commission = sum(t.commission or 0.0 for t in trades)
+    total_fees = sum(t.fees or 0.0 for t in trades)
 
     # Calculate derived metrics
     win_rate = (winning_trades / total_trades) if total_trades > 0 else 0.0
@@ -250,6 +252,7 @@ def calculate_performance_metrics(
         gross_profit=round(gross_profit, 2),
         gross_loss=round(gross_loss, 2),
         total_commission=round(total_commission, 2),
+        total_fees=round(total_fees, 2),
         win_rate=round(win_rate, 4),
         profit_factor=round(profit_factor, 4),
         sharpe_ratio=round(sharpe_ratio, 4) if sharpe_ratio else None,

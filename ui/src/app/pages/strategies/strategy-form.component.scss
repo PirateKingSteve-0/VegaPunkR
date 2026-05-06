@@ -8,7 +8,7 @@
     h1 {
       font-size: 28px;
       font-weight: 600;
-      color: #333;
+      color: var(--text);
       margin: 0;
     }
   }
@@ -30,7 +30,7 @@
     h2 {
       font-size: 18px;
       font-weight: 600;
-      color: #555;
+      color: var(--text-muted);
       margin: 0 0 20px 0;
       padding-bottom: 8px;
       border-bottom: 2px solid #f0f0f0;

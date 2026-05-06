@@ -19,6 +19,20 @@
         </div>
         <mat-divider></mat-divider>
       }
+      <button mat-menu-item (click)="themeService.toggleTheme(); $event.stopPropagation()">
+        <mat-icon>{{ themeService.theme() === 'dark' ? 'light_mode' : 'dark_mode' }}</mat-icon>
+        <span>{{ themeService.theme() === 'dark' ? 'Light mode' : 'Dark mode' }}</span>
+      </button>
+      <button mat-menu-item (click)="themeService.toggleColorblind(); $event.stopPropagation()">
+        <mat-icon>{{ themeService.colorblind() ? 'visibility' : 'visibility_off' }}</mat-icon>
+        <span>{{ themeService.colorblind() ? 'Colorblind: On' : 'Colorblind: Off' }}</span>
+      </button>
+      <mat-divider></mat-divider>
+      <button mat-menu-item (click)="openTradingWindowDialog()">
+        <mat-icon>schedule</mat-icon>
+        <span>Trading Window</span>
+      </button>
+      <mat-divider></mat-divider>
       <button mat-menu-item (click)="logout()">
         <mat-icon>logout</mat-icon>
         <span>Logout</span>

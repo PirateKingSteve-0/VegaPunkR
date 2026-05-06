@@ -8,7 +8,7 @@ from sqlalchemy.orm import Session
 
 from database import get_db
 from models import User
-from schemas import Token, UserCreate, UserResponse
+from schemas import Token, UserCreate, UserResponse, UserUpdate
 from auth import (
     authenticate_user,
     create_access_token,
@@ -49,6 +49,9 @@ def register(user_data: UserCreate, db: Session = Depends(get_db)):
         account_size_usd=user_data.account_size_usd,
         max_trade_percentage=user_data.max_trade_percentage,
         timezone=user_data.timezone,
+        trading_window_enabled=user_data.trading_window_enabled,
+        trading_window_start=user_data.trading_window_start,
+        trading_window_end=user_data.trading_window_end,
         is_active=True
     )
 
@@ -98,6 +101,42 @@ def get_me(current_user: User = Depends(get_current_user)):
     Requires authentication token in header:
     Authorization: Bearer <token>
     """
+    return current_user
+
+
+@router.patch("/me", response_model=UserResponse)
+def update_me(
+    update: UserUpdate,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Update the current user's profile and trading preferences."""
+    if update.trading_window_enabled and (
+        update.trading_window_start is not None
+        and update.trading_window_end is not None
+        and update.trading_window_start >= update.trading_window_end
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="trading_window_start must be earlier than trading_window_end"
+        )
+
+    for field, value in update.model_dump(exclude_unset=True).items():
+        setattr(current_user, field, value)
+
+    if (
+        current_user.trading_window_enabled
+        and current_user.trading_window_start
+        and current_user.trading_window_end
+        and current_user.trading_window_start >= current_user.trading_window_end
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="trading_window_start must be earlier than trading_window_end"
+        )
+
+    db.commit()
+    db.refresh(current_user)
     return current_user
 
 

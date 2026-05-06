@@ -8,12 +8,26 @@ from datetime import datetime, timedelta, date
 import numpy as np
 from collections import deque
 
-from models import Strategy
+from models import Strategy, User
 from utils.market_hours import MarketHours
 
 logger = logging.getLogger(__name__)
 
 _market_hours = MarketHours()
+
+
+def _parse_hhmm(value: Optional[str]) -> Optional[Tuple[int, int]]:
+    """Parse "HH:MM" into (hour, minute), or return None if invalid/empty."""
+    if not value or ":" not in value:
+        return None
+    try:
+        h_str, m_str = value.split(":", 1)
+        h, m = int(h_str), int(m_str)
+        if 0 <= h <= 23 and 0 <= m <= 59:
+            return h, m
+    except (ValueError, TypeError):
+        pass
+    return None
 
 
 class Signal:
@@ -68,7 +82,8 @@ class SignalGenerator:
         symbol: str,
         current_price: float,
         current_volume: int,
-        additional_data: Optional[Dict] = None
+        additional_data: Optional[Dict] = None,
+        user: Optional[User] = None
     ) -> Optional[Signal]:
         """
         Check if current market conditions generate an entry signal
@@ -90,18 +105,49 @@ class SignalGenerator:
         params = strategy.params_json
         indicators = {}
 
-        # 0. Enforce opening noise blackout window
+        # 0. Entry-time gate. Combines two layers, taking the later of the two as
+        # the effective earliest-entry time so users can never widen past their
+        # account window:
+        #   - strategy: market_open + entry_after_open_minutes (opening-noise blackout)
+        #   - account:  user.trading_window_start (when trading_window_enabled)
+        # The account window also has a hard "no entries past end" upper bound.
+        current_et = _market_hours.get_current_et_time()
+        market_open_et = current_et.replace(hour=9, minute=30, second=0, microsecond=0)
+
         entry_after_open_minutes = params.get('entry_after_open_minutes', 0)
+        effective_start_et = market_open_et
         if entry_after_open_minutes:
-            current_et = _market_hours.get_current_et_time()
-            market_open_et = current_et.replace(hour=9, minute=30, second=0, microsecond=0)
-            minutes_since_open = (current_et - market_open_et).total_seconds() / 60
-            if minutes_since_open < entry_after_open_minutes:
-                logger.debug(
-                    f"{symbol}: Opening noise window — {minutes_since_open:.1f} min since open "
-                    f"(waiting for {entry_after_open_minutes} min)"
+            effective_start_et = market_open_et + timedelta(minutes=entry_after_open_minutes)
+
+        account_end_et = None
+        if user is not None and getattr(user, 'trading_window_enabled', False):
+            window_start = _parse_hhmm(getattr(user, 'trading_window_start', None))
+            window_end = _parse_hhmm(getattr(user, 'trading_window_end', None))
+            if window_start is not None:
+                account_start_et = current_et.replace(
+                    hour=window_start[0], minute=window_start[1], second=0, microsecond=0
                 )
-                return None
+                if account_start_et > effective_start_et:
+                    effective_start_et = account_start_et
+            if window_end is not None:
+                account_end_et = current_et.replace(
+                    hour=window_end[0], minute=window_end[1], second=0, microsecond=0
+                )
+
+        if current_et < effective_start_et:
+            logger.debug(
+                f"{symbol}: Trading window not yet open — current ET "
+                f"{current_et.strftime('%H:%M')} < earliest entry "
+                f"{effective_start_et.strftime('%H:%M')}"
+            )
+            return None
+        if account_end_et is not None and current_et >= account_end_et:
+            logger.debug(
+                f"{symbol}: Account trading window closed — current ET "
+                f"{current_et.strftime('%H:%M')} >= window end "
+                f"{account_end_et.strftime('%H:%M')}"
+            )
+            return None
 
         # 1. Check EMA condition
         ema_period = params.get('ema_period', 9)
@@ -258,7 +304,8 @@ class SignalGenerator:
         entry_timestamp: datetime,
         position_side: str,  # 'long' or 'short'
         current_high: Optional[float] = None,
-        current_low: Optional[float] = None
+        current_low: Optional[float] = None,
+        user: Optional[User] = None
     ) -> Optional[Signal]:
         """
         Check if exit conditions are met for an open position
@@ -367,26 +414,44 @@ class SignalGenerator:
                     indicators={**indicators, 'time_held_minutes': time_held}
                 )
 
-        # 5. Exit before market close (for 0DTE strategies)
+        # 5. Time-of-day exit. Effective forced-exit time is the earliest of:
+        #   - strategy: market_close - exit_before_close_minutes
+        #   - account:  user.trading_window_end (when trading_window_enabled)
+        # so the user's window can pull exits earlier but never push them later.
         exit_before_close_minutes = params.get('exit_before_close_minutes', None)
+        current_et = _market_hours.get_current_et_time()
+
+        exit_time_et: Optional[datetime] = None
+        exit_reason: Optional[str] = None
+
         if exit_before_close_minutes:
-            current_et = _market_hours.get_current_et_time()
             close_time = _market_hours.get_market_close_time_et()
             market_close_et = current_et.replace(
                 hour=close_time.hour, minute=close_time.minute, second=0, microsecond=0
             )
             exit_time_et = market_close_et - timedelta(minutes=exit_before_close_minutes)
+            exit_reason = f"Market close approaching: {exit_before_close_minutes} minutes before close"
 
-            if current_et >= exit_time_et:
-                return Signal(
-                    signal_type='exit',
-                    action='sell' if position_side == 'long' else 'buy',
-                    symbol=symbol,
-                    confidence=1.0,
-                    reason=f"Market close approaching: {exit_before_close_minutes} minutes before close",
-                    price=current_price,
-                    indicators=indicators
+        if user is not None and getattr(user, 'trading_window_enabled', False):
+            window_end = _parse_hhmm(getattr(user, 'trading_window_end', None))
+            if window_end is not None:
+                account_end_et = current_et.replace(
+                    hour=window_end[0], minute=window_end[1], second=0, microsecond=0
                 )
+                if exit_time_et is None or account_end_et < exit_time_et:
+                    exit_time_et = account_end_et
+                    exit_reason = f"Account trading window ended at {account_end_et.strftime('%H:%M')} ET"
+
+        if exit_time_et is not None and current_et >= exit_time_et:
+            return Signal(
+                signal_type='exit',
+                action='sell' if position_side == 'long' else 'buy',
+                symbol=symbol,
+                confidence=1.0,
+                reason=exit_reason or "Forced exit: trading window closed",
+                price=current_price,
+                indicators=indicators
+            )
 
         # No exit signal
         return None

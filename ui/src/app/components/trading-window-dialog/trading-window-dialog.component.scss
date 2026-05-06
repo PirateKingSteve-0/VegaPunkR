@@ -1,0 +1,60 @@
+:host {
+  display: block;
+  min-width: 360px;
+  color: var(--text);
+}
+
+h2 {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin: 0;
+  color: var(--text);
+
+  .title-icon {
+    color: var(--primary);
+  }
+}
+
+.hint {
+  color: var(--text-muted);
+  font-size: 0.85rem;
+  margin: 0 0 1rem;
+  line-height: 1.4;
+}
+
+.loading-row {
+  display: flex;
+  justify-content: center;
+  padding: 1.5rem 0;
+}
+
+.row {
+  margin: 0.75rem 0;
+}
+
+.time-row {
+  display: flex;
+  gap: 0.75rem;
+
+  mat-form-field {
+    flex: 1;
+  }
+
+  &.disabled {
+    opacity: 0.55;
+  }
+}
+
+.error-row {
+  margin-top: 0.5rem;
+  padding: 0.5rem 0.75rem;
+  background: var(--color-error-bg);
+  color: var(--color-error-fg);
+  border-radius: 4px;
+  font-size: 0.85rem;
+}
+
+mat-dialog-actions button mat-spinner {
+  display: inline-block;
+}

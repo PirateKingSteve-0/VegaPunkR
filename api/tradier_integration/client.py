@@ -11,13 +11,19 @@ Covers the account endpoints described in the Tradier Account Details guide:
   - Historical account balances (portfolio chart data)
 """
 import logging
-from typing import Any, Dict, List, Optional, Union
+import time
+from typing import Any, Callable, Dict, List, Optional, Union
 
 import requests
 
 from config import settings
 
 logger = logging.getLogger(__name__)
+
+_HTTP_TIMEOUT = (5.0, 30.0)  # (connect, read) seconds
+_RETRY_STATUSES = {502, 503, 504}
+_RETRY_MAX_ATTEMPTS = 3
+_RETRY_BACKOFF_BASE = 0.5  # seconds; doubles each attempt
 
 
 class TradierClient:
@@ -49,28 +55,87 @@ class TradierClient:
     # Internal helpers
     # ------------------------------------------------------------------
 
+    def _raise_for_status(self, response: requests.Response, method: str, path: str) -> None:
+        if response.ok:
+            return
+        logger.error(
+            "Tradier %s %s failed: status=%s body=%s",
+            method, path, response.status_code, response.text,
+        )
+        raise requests.HTTPError(
+            f"{response.status_code} {response.reason} for {method} {response.url}: {response.text}",
+            response=response,
+        )
+
+    def _request_with_retry(
+        self,
+        method: str,
+        path: str,
+        send: Callable[[], requests.Response],
+    ) -> requests.Response:
+        """Send an idempotent request, retrying on timeouts and 502/503/504."""
+        last_exc: Optional[BaseException] = None
+        for attempt in range(1, _RETRY_MAX_ATTEMPTS + 1):
+            try:
+                response = send()
+            except (requests.ConnectionError, requests.Timeout) as exc:
+                last_exc = exc
+                if attempt == _RETRY_MAX_ATTEMPTS:
+                    raise
+                delay = _RETRY_BACKOFF_BASE * (2 ** (attempt - 1))
+                logger.warning(
+                    "Tradier %s %s transport error on attempt %d/%d (%s); retrying in %.1fs",
+                    method, path, attempt, _RETRY_MAX_ATTEMPTS, exc, delay,
+                )
+                time.sleep(delay)
+                continue
+
+            if response.status_code in _RETRY_STATUSES and attempt < _RETRY_MAX_ATTEMPTS:
+                delay = _RETRY_BACKOFF_BASE * (2 ** (attempt - 1))
+                logger.warning(
+                    "Tradier %s %s returned %d on attempt %d/%d; retrying in %.1fs",
+                    method, path, response.status_code, attempt, _RETRY_MAX_ATTEMPTS, delay,
+                )
+                time.sleep(delay)
+                continue
+
+            return response
+
+        # Unreachable: loop either returns or re-raises, but keep mypy/linters happy.
+        raise last_exc if last_exc else RuntimeError("retry loop exited without response")
+
     def _get(self, path: str, params: Optional[Dict] = None) -> Any:
         url = f"{self._base_url}{path}"
-        response = self._session.get(url, params=params)
-        response.raise_for_status()
+        response = self._request_with_retry(
+            "GET", path,
+            lambda: self._session.get(url, params=params, timeout=_HTTP_TIMEOUT),
+        )
+        self._raise_for_status(response, "GET", path)
         return response.json()
 
     def _post(self, path: str, data: Optional[Dict] = None) -> Any:
         url = f"{self._base_url}{path}"
-        response = self._session.post(url, data=data)
-        response.raise_for_status()
+        # No retry on POST: order placement is not idempotent — retrying could double-submit.
+        response = self._session.post(url, data=data, timeout=_HTTP_TIMEOUT)
+        self._raise_for_status(response, "POST", path)
         return response.json()
 
     def _put(self, path: str, data: Optional[Dict] = None) -> Any:
         url = f"{self._base_url}{path}"
-        response = self._session.put(url, data=data)
-        response.raise_for_status()
+        response = self._request_with_retry(
+            "PUT", path,
+            lambda: self._session.put(url, data=data, timeout=_HTTP_TIMEOUT),
+        )
+        self._raise_for_status(response, "PUT", path)
         return response.json()
 
     def _delete(self, path: str) -> Any:
         url = f"{self._base_url}{path}"
-        response = self._session.delete(url)
-        response.raise_for_status()
+        response = self._request_with_retry(
+            "DELETE", path,
+            lambda: self._session.delete(url, timeout=_HTTP_TIMEOUT),
+        )
+        self._raise_for_status(response, "DELETE", path)
         return response.json()
 
     def _resolve_account_id(self) -> str:
@@ -277,6 +342,58 @@ class TradierClient:
         if status not in ("ok", "pending", "open", "partially_filled", "filled", ""):
             raise ValueError(f"Tradier order not accepted (status={status!r}): {order}")
 
+        return order
+
+    def preview_option_order(
+        self,
+        symbol: str,
+        option_symbol: str,
+        side: str,
+        quantity: int,
+        order_type: str = "market",
+        duration: str = "day",
+        price: Optional[float] = None,
+        account_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        POST /v1/accounts/{account_id}/orders with preview=true — validate an order
+        without submitting it.
+
+        Tradier runs full validation (buying power, contract validity, etc.) and
+        returns commission, fees, order_cost, margin_change, and day_trades.
+
+        Returns the preview dict on success. Raises ValueError on rejection
+        (e.g. insufficient buying power, invalid contract).
+
+        See docs/tradier/trading/preview_order.md for the response shape.
+        """
+        acct = account_id or self._resolve_account_id()
+        data: Dict[str, Any] = {
+            "class": "option",
+            "symbol": symbol,
+            "option_symbol": option_symbol,
+            "side": side,
+            "quantity": str(quantity),
+            "type": order_type,
+            "duration": duration,
+            "preview": "true",
+        }
+        if price is not None:
+            data["price"] = str(price)
+
+        response = self._post(f"/v1/accounts/{acct}/orders", data=data)
+
+        if "errors" in response:
+            errors = response["errors"]
+            msg = errors.get("error", errors)
+            if isinstance(msg, list):
+                msg = "; ".join(msg)
+            raise ValueError(f"Tradier preview rejected: {msg}")
+
+        order = response.get("order", response)
+        # Preview success = result:true + status:ok per docs
+        if order.get("result") is False:
+            raise ValueError(f"Tradier preview returned result=false: {order}")
         return order
 
     def get_market_clock(self) -> Dict[str, Any]:

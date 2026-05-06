@@ -26,7 +26,7 @@
 
 .dashboard-sidenav {
   width: 250px;
-  border-right: 1px solid rgba(0, 0, 0, 0.12);
+  border-right: 1px solid var(--border);
   display: flex;
   flex-direction: column;
 
@@ -40,7 +40,7 @@
       transition: all 0.2s ease;
 
       &:hover {
-        background-color: rgba(0, 0, 0, 0.04);
+        background-color: var(--surface-hover);
       }
 
       &.active-link {
@@ -78,7 +78,7 @@
       position: relative;
 
       &:hover {
-        background-color: rgba(0, 0, 0, 0.04);
+        background-color: var(--surface-hover);
       }
 
       // Color indicator bar on the left
@@ -96,7 +96,7 @@
       mat-icon:first-child {
         margin-right: 12px;
         margin-left: 8px;
-        color: rgba(0, 0, 0, 0.54);
+        color: var(--text-muted);
       }
 
       .env-label {
@@ -107,7 +107,7 @@
 
         .env-title {
           font-size: 12px;
-          color: rgba(0, 0, 0, 0.6);
+          color: var(--text-muted);
           font-weight: 500;
           text-transform: uppercase;
           letter-spacing: 0.5px;
@@ -123,16 +123,16 @@
 
       .dropdown-icon {
         margin-left: 8px;
-        color: rgba(0, 0, 0, 0.54);
+        color: var(--text-muted);
       }
 
-      // Dev environment styling (green)
+      // Dev environment styling (positive tone)
       &.env-dev {
         &::before {
-          background-color: #4CAF50;
+          background-color: var(--color-profit);
         }
         .env-label .env-value {
-          color: #4CAF50;
+          color: var(--color-profit);
         }
       }
 
@@ -171,7 +171,7 @@
       margin-top: 8px;
 
       &:hover {
-        background-color: rgba(0, 0, 0, 0.04);
+        background-color: var(--surface-hover);
       }
 
       // Color indicator bar
@@ -189,7 +189,7 @@
       mat-icon:first-child {
         margin-right: 12px;
         margin-left: 8px;
-        color: rgba(0, 0, 0, 0.54);
+        color: var(--text-muted);
       }
 
       .trading-label {
@@ -200,7 +200,7 @@
 
         .trading-title {
           font-size: 12px;
-          color: rgba(0, 0, 0, 0.6);
+          color: var(--text-muted);
           font-weight: 500;
           text-transform: uppercase;
           letter-spacing: 0.5px;
@@ -216,27 +216,27 @@
 
       .dropdown-icon {
         margin-left: 8px;
-        color: rgba(0, 0, 0, 0.54);
+        color: var(--text-muted);
       }
 
-      // Paper trading styling (safe green)
+      // Paper trading styling (safe / positive tone)
       &.trading-paper {
         &::before {
-          background-color: #4CAF50;
+          background-color: var(--color-profit);
         }
         .trading-label .trading-value {
-          color: #4CAF50;
+          color: var(--color-profit);
         }
       }
 
-      // Live trading styling (danger red with animation)
+      // Live trading styling (danger / negative tone with animation)
       &.trading-live {
         &::before {
-          background-color: #F44336;
+          background-color: var(--color-loss);
           animation: pulse 2s ease-in-out infinite;
         }
         .trading-label .trading-value {
-          color: #F44336;
+          color: var(--color-loss);
           animation: pulse-text 2s ease-in-out infinite;
         }
       }
@@ -246,19 +246,19 @@
     .warning-banner {
       margin-top: 8px;
       padding: 8px 12px;
-      background-color: rgba(244, 67, 54, 0.1);
-      border-left: 4px solid #F44336;
+      background-color: var(--color-loss-bg);
+      border-left: 4px solid var(--color-loss);
       border-radius: 4px;
       font-size: 12px;
       font-weight: 500;
-      color: #F44336;
+      color: var(--color-loss);
       animation: pulse-warning 2s ease-in-out infinite;
     }
   }
 }
 
 .dashboard-content {
-  background-color: #f5f5f5;
+  background-color: var(--surface-alt);
 }
 
 .content-wrapper {
@@ -276,12 +276,12 @@
   .user-name {
     font-weight: 600;
     font-size: 14px;
-    color: #333;
+    color: var(--text);
   }
 
   .user-email {
     font-size: 12px;
-    color: #666;
+    color: var(--text-muted);
     margin-top: 4px;
   }
 }

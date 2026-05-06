@@ -6,28 +6,128 @@
 // Include the common styles for Angular Material
 @include mat.core();
 
-// Define custom theme colors
+// ----- Palettes -----
 $vegapunk-primary: mat.m2-define-palette(mat.$m2-indigo-palette, 700);
 $vegapunk-accent: mat.m2-define-palette(mat.$m2-pink-palette, A200);
 $vegapunk-warn: mat.m2-define-palette(mat.$m2-red-palette);
 
-// Create the theme object
+$vegapunk-typography: mat.m2-define-typography-config(
+  $font-family: 'Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif',
+);
+
+// ----- Light theme (default) -----
 $vegapunk-theme: mat.m2-define-light-theme((
   color: (
     primary: $vegapunk-primary,
     accent: $vegapunk-accent,
     warn: $vegapunk-warn,
   ),
-  typography: mat.m2-define-typography-config(
-    $font-family: 'Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif',
-  ),
+  typography: $vegapunk-typography,
   density: 0,
 ));
 
-// Include theme styles for core and each component
 @include mat.all-component-themes($vegapunk-theme);
 
-// Global styles
+// ----- Dark theme override -----
+$vegapunk-dark-primary: mat.m2-define-palette(mat.$m2-indigo-palette, 200);
+$vegapunk-dark-accent: mat.m2-define-palette(mat.$m2-pink-palette, A100);
+$vegapunk-dark-warn: mat.m2-define-palette(mat.$m2-red-palette, 300);
+$vegapunk-dark-theme: mat.m2-define-dark-theme((
+  color: (
+    primary: $vegapunk-dark-primary,
+    accent: $vegapunk-dark-accent,
+    warn: $vegapunk-dark-warn,
+  ),
+  typography: $vegapunk-typography,
+  density: 0,
+));
+
+body[data-theme='dark'] {
+  @include mat.all-component-colors($vegapunk-dark-theme);
+}
+
+// ----- Theme tokens (CSS custom properties) -----
+// Default = light + standard red/green
+:root,
+body[data-theme='light'] {
+  --color-profit: #2e7d32;
+  --color-profit-strong: #1b5e20;
+  --color-loss: #c62828;
+  --color-loss-strong: #b71c1c;
+  --color-profit-bg: rgba(46, 125, 50, 0.14);
+  --color-loss-bg: rgba(198, 40, 40, 0.14);
+  --color-profit-bg-soft: rgba(76, 175, 80, 0.05);
+  --color-loss-bg-soft: rgba(244, 67, 54, 0.05);
+  --color-profit-bg-strong: rgba(56, 142, 60, 0.12);
+  --color-loss-bg-strong: rgba(211, 47, 47, 0.12);
+  --color-error-bg: #fdecea;
+  --color-error-fg: #b71c1c;
+
+  --surface: #ffffff;
+  --surface-alt: #fafafa;
+  --surface-hover: rgba(25, 118, 210, 0.06);
+  --text: rgba(0, 0, 0, 0.87);
+  --text-muted: rgba(0, 0, 0, 0.6);
+  --text-faint: rgba(0, 0, 0, 0.45);
+  --border: rgba(0, 0, 0, 0.12);
+  --primary: #1976d2;
+}
+
+body[data-theme='dark'] {
+  --color-profit: #66bb6a;
+  --color-profit-strong: #81c784;
+  --color-loss: #ef5350;
+  --color-loss-strong: #e57373;
+  --color-profit-bg: rgba(102, 187, 106, 0.18);
+  --color-loss-bg: rgba(239, 83, 80, 0.18);
+  --color-profit-bg-soft: rgba(102, 187, 106, 0.08);
+  --color-loss-bg-soft: rgba(239, 83, 80, 0.08);
+  --color-profit-bg-strong: rgba(102, 187, 106, 0.22);
+  --color-loss-bg-strong: rgba(239, 83, 80, 0.22);
+  --color-error-bg: rgba(239, 83, 80, 0.18);
+  --color-error-fg: #ef9a9a;
+
+  --surface: #1e1e1e;
+  --surface-alt: #121212;
+  --surface-hover: rgba(144, 202, 249, 0.10);
+  --text: rgba(255, 255, 255, 0.87);
+  --text-muted: rgba(255, 255, 255, 0.65);
+  --text-faint: rgba(255, 255, 255, 0.45);
+  --border: rgba(255, 255, 255, 0.14);
+  --primary: #90caf9;
+}
+
+// Colorblind override — applies on top of light or dark.
+// Uses blue (positive) / orange (negative), which preserve contrast across
+// deuteranopia, protanopia, and tritanopia.
+body[data-colorblind='true'][data-theme='light'],
+body[data-colorblind='true']:not([data-theme='dark']) {
+  --color-profit: #1976d2;
+  --color-profit-strong: #0d47a1;
+  --color-loss: #ef6c00;
+  --color-loss-strong: #e65100;
+  --color-profit-bg: rgba(25, 118, 210, 0.14);
+  --color-loss-bg: rgba(239, 108, 0, 0.14);
+  --color-profit-bg-soft: rgba(25, 118, 210, 0.06);
+  --color-loss-bg-soft: rgba(239, 108, 0, 0.06);
+  --color-profit-bg-strong: rgba(25, 118, 210, 0.18);
+  --color-loss-bg-strong: rgba(239, 108, 0, 0.18);
+}
+
+body[data-colorblind='true'][data-theme='dark'] {
+  --color-profit: #64b5f6;
+  --color-profit-strong: #90caf9;
+  --color-loss: #ffa726;
+  --color-loss-strong: #ffb74d;
+  --color-profit-bg: rgba(100, 181, 246, 0.18);
+  --color-loss-bg: rgba(255, 167, 38, 0.18);
+  --color-profit-bg-soft: rgba(100, 181, 246, 0.08);
+  --color-loss-bg-soft: rgba(255, 167, 38, 0.08);
+  --color-profit-bg-strong: rgba(100, 181, 246, 0.22);
+  --color-loss-bg-strong: rgba(255, 167, 38, 0.22);
+}
+
+// ----- Global -----
 * {
   margin: 0;
   padding: 0;
@@ -41,5 +141,7 @@ html, body {
 
 body {
   margin: 0;
-  background-color: #fafafa;
+  background-color: var(--surface-alt);
+  color: var(--text);
+  transition: background-color 150ms ease, color 150ms ease;
 }
