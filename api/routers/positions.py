@@ -9,7 +9,7 @@ from datetime import datetime
 from database import get_db
 from models import Position, User, Strategy
 from schemas import PositionCreate, PositionUpdate, PositionResponse
-from auth import get_current_user
+from auth import get_current_user, require_can_write_own
 
 router = APIRouter(prefix="/positions", tags=["Positions"])
 
@@ -67,7 +67,7 @@ def get_position(
 def create_position(
     position_data: PositionCreate,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
+    current_user: User = Depends(require_can_write_own)
 ):
     """
     Create a new position.
@@ -122,7 +122,7 @@ def update_position(
     position_id: int,
     position_data: PositionUpdate,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
+    current_user: User = Depends(require_can_write_own)
 ):
     """
     Update an existing position.
@@ -162,7 +162,7 @@ def update_position(
 def close_position(
     position_id: int,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
+    current_user: User = Depends(require_can_write_own)
 ):
     """
     Close (delete) a position.

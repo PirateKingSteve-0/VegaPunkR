@@ -2,7 +2,15 @@ import { Injectable, inject } from '@angular/core';
 import { HttpClient, HttpHeaders } from '@angular/common/http';
 import { BehaviorSubject, Observable, tap } from 'rxjs';
 import { Router } from '@angular/router';
-import { LoginRequest, LoginResponse, TradingWindowUpdate, User } from '../models/user.model';
+import {
+  LoginRequest,
+  LoginResponse,
+  NotificationPreferences,
+  NotificationPreferencesUpdate,
+  ProfileUpdate,
+  TradingWindowUpdate,
+  User,
+} from '../models/user.model';
 
 @Injectable({
   providedIn: 'root'
@@ -87,6 +95,43 @@ export class AuthService {
   }
 
   updateTradingWindow(update: TradingWindowUpdate): Observable<User> {
+    return this.http.patch<User>(`${this.apiUrl}/auth/me`, update, { headers: this.authHeaders() }).pipe(
+      tap(user => {
+        const merged = { ...this.currentUserValue, ...user } as User;
+        localStorage.setItem('currentUser', JSON.stringify(merged));
+        this.currentUserSubject.next(merged);
+      })
+    );
+  }
+
+  updateNotificationPreferences(prefs: NotificationPreferences): Observable<User> {
+    const body: NotificationPreferencesUpdate = { notification_preferences: prefs };
+    return this.http.patch<User>(`${this.apiUrl}/auth/me`, body, { headers: this.authHeaders() }).pipe(
+      tap(user => {
+        const merged = { ...this.currentUserValue, ...user } as User;
+        localStorage.setItem('currentUser', JSON.stringify(merged));
+        this.currentUserSubject.next(merged);
+      })
+    );
+  }
+
+  testDiscordWebhook(webhookUrl: string): Observable<{ ok: boolean; message: string }> {
+    return this.http.post<{ ok: boolean; message: string }>(
+      `${this.apiUrl}/auth/me/notifications/discord/test`,
+      { webhook_url: webhookUrl },
+      { headers: this.authHeaders() }
+    );
+  }
+
+  testEmailReport(): Observable<{ ok: boolean; message: string }> {
+    return this.http.post<{ ok: boolean; message: string }>(
+      `${this.apiUrl}/auth/me/notifications/email-reports/test`,
+      {},
+      { headers: this.authHeaders() }
+    );
+  }
+
+  updateProfile(update: ProfileUpdate): Observable<User> {
     return this.http.patch<User>(`${this.apiUrl}/auth/me`, update, { headers: this.authHeaders() }).pipe(
       tap(user => {
         const merged = { ...this.currentUserValue, ...user } as User;

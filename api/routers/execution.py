@@ -6,7 +6,7 @@ from sqlalchemy.orm import Session
 from typing import Dict
 
 from database import get_db
-from auth import get_current_user
+from auth import get_current_user, require_can_write_own, require_can_place_orders
 from models import User, Strategy
 from engine.stream_driven_worker import get_stream_driven_worker
 from engine.tradier_stream_manager import get_stream_manager
@@ -31,7 +31,7 @@ def _get_strategy_for_user(strategy_id: int, user: User, db: Session) -> Strateg
 async def start_strategy(
     strategy_id: int,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_can_write_own),
 ):
     """
     Start the stream-driven execution task for a strategy.
@@ -67,7 +67,7 @@ async def start_strategy(
 async def stop_strategy(
     strategy_id: int,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_can_write_own),
 ):
     """
     Stop the execution task for a strategy. Does not close open positions.
@@ -190,7 +190,7 @@ async def execute_strategy_tick_manual(
     strategy_id: int,
     market_data: Dict,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_can_place_orders),
 ):
     """
     Manually inject one market_data tick into a strategy (testing/debugging only).

@@ -7,6 +7,7 @@ import { Subscription } from 'rxjs';
 import { distinctUntilChanged, skip } from 'rxjs/operators';
 import { AccountService } from '../../services/account.service';
 import { SystemService } from '../../services/system.service';
+import { RiskService, AccountRiskStatus } from '../../services/risk.service';
 
 @Component({
   selector: 'app-overview',
@@ -23,7 +24,9 @@ import { SystemService } from '../../services/system.service';
 export class OverviewComponent implements OnInit, OnDestroy {
   private accountService = inject(AccountService);
   private systemService = inject(SystemService);
+  private riskService = inject(RiskService);
   private settingsSubscription?: Subscription;
+  private accountStatusInterval?: ReturnType<typeof setInterval>;
 
   // Reactive signals for stat values
   portfolioValue = signal('$0.00');
@@ -31,6 +34,9 @@ export class OverviewComponent implements OnInit, OnDestroy {
   openPositions = signal('0');
   totalPnL = signal('$0.00');
   pnlColor = signal<'primary' | 'accent' | 'warn'>('primary');
+
+  // Account-wide daily-loss session status (TODO #7)
+  accountRisk = signal<AccountRiskStatus | null>(null);
 
   // Stats configuration with signal getters
   stats = [
@@ -46,6 +52,11 @@ export class OverviewComponent implements OnInit, OnDestroy {
   ngOnInit() {
     // Load initial data
     this.loadAccountData();
+    this.loadAccountRisk();
+    // Refresh the session-status tile every 30s. The cap is computed from
+    // realized+unrealized PnL, and unrealized PnL changes whenever option
+    // marks update — a stale tile would understate how close to halt we are.
+    this.accountStatusInterval = setInterval(() => this.loadAccountRisk(), 30_000);
 
     // Subscribe to environment/trading mode changes and reload data
     // Skip the first emission to avoid double-loading on init
@@ -64,13 +75,35 @@ export class OverviewComponent implements OnInit, OnDestroy {
           trading_mode: settings.trading_mode
         });
         this.loadAccountData();
+        this.loadAccountRisk();
       }
     });
   }
 
   ngOnDestroy() {
-    // Clean up subscription
     this.settingsSubscription?.unsubscribe();
+    if (this.accountStatusInterval) {
+      clearInterval(this.accountStatusInterval);
+    }
+  }
+
+  loadAccountRisk() {
+    this.riskService.getAccountStatus().subscribe({
+      next: (status) => this.accountRisk.set(status),
+      error: (err: Error) => console.error('Failed to load account risk status:', err),
+    });
+  }
+
+  formatSignedCurrency(value: number): string {
+    const sign = value > 0 ? '+' : value < 0 ? '−' : '';
+    return `${sign}${this.formatCurrency(Math.abs(value))}`;
+  }
+
+  /** Clamp the progress-bar fill so a >100% breach still renders cleanly. */
+  riskBarPct(): number {
+    const r = this.accountRisk();
+    if (!r) return 0;
+    return Math.max(0, Math.min(100, r.pct_consumed));
   }
 
   loadAccountData() {
@@ -123,5 +156,6 @@ export class OverviewComponent implements OnInit, OnDestroy {
 
   refresh() {
     this.loadAccountData();
+    this.loadAccountRisk();
   }
 }

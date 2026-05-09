@@ -145,6 +145,20 @@ class RiskManager:
                 "Cannot execute paper strategy in live trading mode"
             )
 
+        # 2.5. Account-wide daily loss cap (entries-only halt across ALL of
+        # the user's strategies). Most-restrictive bound: this gate is
+        # checked before per-strategy limits so if the account is halted
+        # we don't bother probing strategy-level state. Exits (`side='sell'`)
+        # are never blocked here — closing existing positions must always
+        # be possible even when the cap is breached.
+        account_loss_check = self._check_user_daily_loss_limit(user, side)
+        if not account_loss_check.approved:
+            self._log_account_risk_event(
+                user, strategy, "user_daily_loss_limit",
+                account_loss_check.reason, "trade_rejected"
+            )
+            return account_loss_check
+
         # 3. Check daily loss limit
         daily_loss_check = self._check_daily_loss_limit(user, strategy)
         if not daily_loss_check.approved:
@@ -202,6 +216,89 @@ class RiskManager:
             f"Pre-trade validation PASSED: {symbol} {side} {qty} @ ${estimated_price}"
         )
         return RiskCheckResult(True, "All risk checks passed")
+
+    def _check_user_daily_loss_limit(self, user: User, side: str = "buy") -> RiskCheckResult:
+        """Account-wide daily loss cap. Sums realized PnL across all the
+        user's strategies for today (closing legs that filled today) plus
+        the unrealized PnL of every currently open position. Rejects new
+        entries once `today_pnl < -(account_size * daily_loss_limit_pct/100)`.
+
+        Entries-only: when `side != 'buy'` we always approve so users can
+        still close out existing positions through the engine when the cap
+        is breached. Force-closing converts paper drawdown into realized,
+        which is usually worse — see TODO #5 decision."""
+        if side != "buy":
+            return RiskCheckResult(True)
+
+        daily_loss_limit_pct = float(user.daily_loss_limit_pct or 0)
+        if daily_loss_limit_pct <= 0:
+            return RiskCheckResult(True)
+
+        today_start = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+
+        realized = self.db.query(func.sum(Trade.pnl)).filter(
+            Trade.user_id == user.id,
+            Trade.timestamp >= today_start,
+            Trade.status == 'executed',
+            Trade.pnl.isnot(None),
+        ).scalar() or 0.0
+
+        unrealized = self.db.query(func.sum(Position.unrealized_pnl)).filter(
+            Position.user_id == user.id,
+            Position.qty > 0,
+        ).scalar() or 0.0
+
+        today_pnl = float(realized) + float(unrealized)
+
+        account_size = float(user.account_size_usd or 10000)
+        daily_loss_limit = account_size * (daily_loss_limit_pct / 100.0)
+
+        if today_pnl < -daily_loss_limit:
+            return RiskCheckResult(
+                False,
+                f"Account daily loss cap reached: ${today_pnl:.2f} "
+                f"(limit: ${-daily_loss_limit:.2f}). "
+                f"New entries halted; existing positions can still be closed."
+            )
+
+        if today_pnl < -(daily_loss_limit * 0.8):
+            logger.warning(
+                f"User {user.id} approaching account daily loss cap: "
+                f"${today_pnl:.2f} / ${-daily_loss_limit:.2f}"
+            )
+
+        return RiskCheckResult(True)
+
+    def _log_account_risk_event(
+        self,
+        user: User,
+        strategy: Strategy,
+        event_type: str,
+        reason: str,
+        action_taken: str,
+    ) -> None:
+        """Account-cap-specific risk-event writer that uses `details` JSON
+        rather than the legacy `_log_risk_event` (which references a `message`
+        column that doesn't exist on the model). Wrapped in try/except so a
+        logging hiccup never blocks the actual trade-rejection return."""
+        try:
+            risk_event = RiskEvent(
+                user_id=user.id,
+                strategy_id=strategy.id if strategy is not None else None,
+                event_type=event_type,
+                severity="critical",
+                action_taken=action_taken,
+                details={"reason": reason},
+            )
+            self.db.add(risk_event)
+            self.db.commit()
+        except Exception as exc:  # pragma: no cover - logging must never crash trade flow
+            try:
+                self.db.rollback()
+            except Exception:
+                pass
+            logger.error(f"Failed to persist {event_type} risk event: {exc}")
+        logger.warning(f"User {user.id} entry rejected ({event_type}): {reason}")
 
     def _check_daily_loss_limit(self, user: User, strategy: Strategy) -> RiskCheckResult:
         """Check if daily loss limit has been exceeded"""
@@ -321,6 +418,67 @@ class RiskManager:
         logger.warning(
             f"Risk event: {event_type} ({severity}) - {message} - Action: {action_taken}"
         )
+
+    def get_account_risk_status(self, user: User) -> Dict:
+        """User-level (account-wide) risk snapshot for the dashboard
+        session-status tile. Sums realized PnL across all the user's
+        strategies for today plus unrealized PnL on open positions.
+
+        Status thresholds match `_check_user_daily_loss_limit`:
+        - HALTED at 100% of cap consumed (entries blocked)
+        - WARNING at 80% of cap consumed
+        - OK otherwise
+
+        `pct_consumed` is clamped to [0, 100+] so the UI progress bar
+        can render a meaningful overflow if the cap is breached past
+        100% (e.g. between checks)."""
+        today_start = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+
+        realized = self.db.query(func.sum(Trade.pnl)).filter(
+            Trade.user_id == user.id,
+            Trade.timestamp >= today_start,
+            Trade.status == 'executed',
+            Trade.pnl.isnot(None),
+        ).scalar() or 0.0
+
+        unrealized = self.db.query(func.sum(Position.unrealized_pnl)).filter(
+            Position.user_id == user.id,
+            Position.qty > 0,
+        ).scalar() or 0.0
+
+        realized = float(realized)
+        unrealized = float(unrealized)
+        today_pnl = realized + unrealized
+
+        account_size = float(user.account_size_usd or 10000)
+        daily_loss_limit_pct = float(user.daily_loss_limit_pct or 5.0)
+        daily_loss_limit = account_size * (daily_loss_limit_pct / 100.0)
+
+        # `loss_consumed` is positive when underwater. If we're net-positive
+        # the bar should read 0% — losses are what consume the cap, not gains.
+        loss_consumed = max(0.0, -today_pnl)
+        pct_consumed = (loss_consumed / daily_loss_limit * 100.0) if daily_loss_limit > 0 else 0.0
+        daily_loss_remaining = max(0.0, daily_loss_limit - loss_consumed)
+
+        if pct_consumed >= 100.0:
+            risk_status = "HALTED"
+        elif pct_consumed >= 80.0:
+            risk_status = "WARNING"
+        else:
+            risk_status = "OK"
+
+        return {
+            "today_pnl": today_pnl,
+            "realized_pnl": realized,
+            "unrealized_pnl": unrealized,
+            "account_size": account_size,
+            "daily_loss_limit_pct": daily_loss_limit_pct,
+            "daily_loss_limit": daily_loss_limit,
+            "daily_loss_remaining": daily_loss_remaining,
+            "pct_consumed": pct_consumed,
+            "risk_status": risk_status,
+            "entries_halted": risk_status == "HALTED",
+        }
 
     def check_live_trading_safeguards(self, user: User) -> Tuple[bool, str]:
         """

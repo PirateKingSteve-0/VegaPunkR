@@ -16,3 +16,6 @@ dist/
 
 # Docker/DB
 *.sql.dump
+
+# Claude
+CLAUDE.md

@@ -17,6 +17,7 @@ from models import User, Strategy, Trade, Position
 from engine.trading_client_manager import TradingClientManager
 from engine.signal_generator import Signal
 from engine.event_logger import log_event
+from notifications.discord import notify_position_opened, notify_position_closed
 
 logger = logging.getLogger(__name__)
 
@@ -175,6 +176,7 @@ class OrderManager:
         side: str,
         option_symbol: Optional[str],
         order_type: str = "market",
+        signal_price: Optional[float] = None,
     ) -> Tuple[bool, Optional[Dict], str, Optional[str]]:
         """Call broker preview before placing an order.
 
@@ -226,6 +228,52 @@ class OrderManager:
             # live preview not yet implemented). Treat as "no preview available"
             # and proceed — Schwab path will be wired in a follow-up.
             return True, None, "preview not available for trading mode", None
+
+        # Entry-price drift observation. Compares the per-contract price the
+        # signal triggered on against the per-contract price the broker preview
+        # quotes at fill time. Observation only — does NOT gate the order. The
+        # data feeds a future decision on whether to add a "cancel if drift
+        # exceeds X" rule (TODO #4); we log the distribution first instead of
+        # picking a threshold blind. Skipped for sells (handled by exit-side
+        # analysis in TODO #6) and for non-option orders.
+        if (
+            side == "buy"
+            and option_symbol
+            and signal_price is not None
+            and signal_price > 0
+            and qty > 0
+        ):
+            order_cost = float(preview.get("order_cost") or 0.0)
+            if order_cost > 0:
+                preview_per_contract = order_cost / (qty * 100.0)
+                drift_pct = (preview_per_contract - signal_price) / signal_price
+                drift_dollars = (preview_per_contract - signal_price) * qty * 100.0
+                drift_msg = (
+                    f"Entry preview drift {symbol} ({option_symbol}): "
+                    f"signal=${signal_price:.4f} preview=${preview_per_contract:.4f} "
+                    f"drift={drift_pct:+.2%} (${drift_dollars:+.2f} on {qty} contracts)"
+                )
+                logger.info(drift_msg)
+                log_event(
+                    db=self.db,
+                    user_id=user.id,
+                    event_type="ORDER_PREVIEW_DRIFT",
+                    title=f"Preview drift: {option_symbol} {drift_pct:+.2%}",
+                    detail=drift_msg,
+                    symbol=symbol,
+                    strategy_id=strategy.id,
+                    severity="info",
+                    event_data={
+                        "signal_price": signal_price,
+                        "preview_per_contract": preview_per_contract,
+                        "drift_pct": drift_pct,
+                        "drift_dollars": drift_dollars,
+                        "qty": qty,
+                        "side": side,
+                        "option_symbol": option_symbol,
+                        "order_cost": order_cost,
+                    },
+                )
 
         # Cash gate — only on buys. Sells generate cash.
         if side == "buy":
@@ -345,6 +393,31 @@ class OrderManager:
             f"[Mode: {user.selected_trading_mode}]"
         )
 
+        # Role-based gate: only `user` and `admin` may place new entries.
+        # `strategy_author` can build strategies but never trades; `viewer`
+        # and `auditor` are read-only. Exits (`side='sell'`) are NOT gated
+        # so any existing positions can still be closed even if the user
+        # was demoted to a non-trading role mid-session.
+        if side == 'buy' and (user.role or 'user') not in ('user', 'admin'):
+            msg = (
+                f"Entry blocked by role: user.role='{user.role}' is not "
+                f"permitted to place orders. Strategy '{strategy.name}' "
+                f"({strategy.id}) signal ignored."
+            )
+            logger.warning(msg)
+            log_event(
+                db=self.db,
+                user_id=user.id,
+                event_type="ENTRY_BLOCKED_BY_ROLE",
+                title=f"Entry blocked: role={user.role}",
+                detail=msg,
+                symbol=symbol,
+                strategy_id=strategy.id,
+                severity="warning",
+                event_data={"role": user.role, "side": side},
+            )
+            return OrderResult(success=False, message=msg)
+
         try:
             # Lock-out: once a position is open on (user, strategy, symbol),
             # block further entries so we lock in to sell-to-close instead of
@@ -416,6 +489,7 @@ class OrderManager:
                 side=side,
                 option_symbol=option_symbol,
                 order_type=order_type,
+                signal_price=signal.price,
             )
             if not preview_ok:
                 return OrderResult(success=False, message=f"Order aborted: {preview_msg}")
@@ -889,6 +963,17 @@ class OrderManager:
                 severity="success",
                 event_data={"qty": qty, "price": price},
             )
+            try:
+                notify_position_opened(
+                    user_prefs=user.notification_preferences,
+                    symbol=symbol,
+                    qty=qty,
+                    price=price,
+                    strategy_name=strategy.name,
+                    option_symbol=option_symbol,
+                )
+            except Exception as e:
+                logger.warning(f"Discord notify (open) failed: {e}")
 
         return position
 
@@ -960,6 +1045,18 @@ class OrderManager:
                 severity="success" if exit_pnl >= 0 else "warning",
                 event_data={"qty": qty, "exit_price": price, "pnl": exit_pnl},
             )
+            try:
+                notify_position_closed(
+                    user_prefs=user.notification_preferences,
+                    symbol=symbol,
+                    qty=qty,
+                    price=price,
+                    pnl=exit_pnl,
+                    strategy_name=strategy.name,
+                    option_symbol=position.option_symbol,
+                )
+            except Exception as e:
+                logger.warning(f"Discord notify (close) failed: {e}")
 
         return position
 
@@ -1187,6 +1284,18 @@ class OrderManager:
                 severity="success" if pnl >= 0 else "warning",
                 event_data={"qty": filled_qty, "exit_price": filled_price, "pnl": pnl, "order_id": order_id},
             )
+            try:
+                notify_position_closed(
+                    user_prefs=user.notification_preferences,
+                    symbol=position.symbol,
+                    qty=filled_qty,
+                    price=filled_price,
+                    pnl=pnl,
+                    strategy_name=strategy.name,
+                    option_symbol=option_symbol or position.option_symbol,
+                )
+            except Exception as e:
+                logger.warning(f"Discord notify (close) failed: {e}")
 
             return OrderResult(
                 success=True,

@@ -10,8 +10,25 @@ from database import get_db
 from models import RiskEvent, User, Strategy
 from schemas import RiskEventCreate, RiskEventResponse
 from auth import get_current_user
+from engine.risk_manager import RiskManager
 
 router = APIRouter(prefix="/risk-events", tags=["Risk Events"])
+
+
+@router.get("/account-status")
+def get_account_risk_status(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Account-wide risk snapshot for the dashboard session-status tile.
+
+    Returns realized+unrealized PnL today across ALL the user's strategies,
+    the dollar amount remaining before the daily-loss cap halts new
+    entries, % cap consumed, and a high-level status (OK / WARNING /
+    HALTED). `entries_halted=true` means the engine will reject new buys
+    for any of this user's strategies until midnight or until losses
+    recover above the cap; existing positions can still be closed."""
+    return RiskManager(db).get_account_risk_status(current_user)
 
 
 @router.get("", response_model=List[RiskEventResponse])

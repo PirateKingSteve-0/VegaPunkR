@@ -9,7 +9,7 @@ from datetime import datetime, timedelta
 from database import get_db
 from models import Trade, User, Strategy, Position
 from schemas import TradeCreate, TradeResponse
-from auth import get_current_user
+from auth import get_current_user, require_can_write_own
 
 router = APIRouter(prefix="/trades", tags=["Trades"])
 
@@ -90,7 +90,7 @@ def get_trade(
 def create_trade(
     trade_data: TradeCreate,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
+    current_user: User = Depends(require_can_write_own)
 ):
     """
     Record a new trade.
@@ -158,7 +158,7 @@ def close_trade(
     trade_id: int,
     exit_price: float,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
+    current_user: User = Depends(require_can_write_own)
 ):
     """
     Close a trade by recording the exit price and calculating P&L.
@@ -206,7 +206,7 @@ def close_trade(
 def delete_trade(
     trade_id: int,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
+    current_user: User = Depends(require_can_write_own)
 ):
     """
     Delete a trade record.

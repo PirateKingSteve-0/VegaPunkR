@@ -414,6 +414,37 @@ class TradierClient:
         resp.raise_for_status()
         return resp.json().get("clock", {})
 
+    def get_market_calendar(
+        self,
+        month: Optional[int] = None,
+        year: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        GET /v1/markets/calendar — full month of trading days.
+
+        Returns the `calendar.days.day` list. Each entry has `date`, `status`
+        ('open' | 'closed'), and on open days `open.start` / `open.end` (ET
+        time strings, e.g. "09:30" / "16:00"). Early-close days surface here
+        with a non-16:00 `open.end`. Always uses live endpoint — sandbox
+        calendar lags.
+        """
+        live_url = settings.TRADIER_LIVE_BASE_URL.rstrip("/")
+        live_token = settings.TRADIER_LIVE_API_KEY
+        params: Dict[str, Any] = {}
+        if month is not None:
+            params["month"] = month
+        if year is not None:
+            params["year"] = year
+        resp = requests.get(
+            f"{live_url}/v1/markets/calendar",
+            params=params,
+            headers={"Authorization": f"Bearer {live_token}", "Accept": "application/json"},
+        )
+        resp.raise_for_status()
+        cal = resp.json().get("calendar", {}) or {}
+        days = (cal.get("days") or {}).get("day") or []
+        return days if isinstance(days, list) else [days]
+
     def get_history_pricing(
         self,
         symbol: str,

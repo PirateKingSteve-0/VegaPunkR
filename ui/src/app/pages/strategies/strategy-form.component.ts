@@ -60,6 +60,12 @@ export class StrategyFormComponent implements OnInit {
       max_positions: [5, [Validators.required, Validators.min(1)]],
       stop_loss_percentage: [2, [Validators.min(0.1), Validators.max(20)]],
       take_profit_percentage: [4, [Validators.min(0.1), Validators.max(50)]],
+      max_hold_time_minutes: [0, [Validators.min(0)]],
+      entry_after_open_minutes: [0, [Validators.min(0)]],
+      exit_before_close_minutes: [0, [Validators.min(0)]],
+      trailing_stop: [false],
+      trailing_stop_activation: [0, [Validators.min(0)]],
+      trailing_stop_distance: [0, [Validators.min(0)]],
       is_active: [false],
       is_paper_trading: [true]
     });
@@ -80,6 +86,7 @@ export class StrategyFormComponent implements OnInit {
     this.strategyService.getStrategy(id).subscribe({
       next: (strategy) => {
         this.instruments = strategy.instruments || [];
+        const p: Record<string, any> = strategy.params_json || {};
         this.strategyForm.patchValue({
           name: strategy.name,
           strategy_type: strategy.strategy_type,
@@ -87,6 +94,12 @@ export class StrategyFormComponent implements OnInit {
           max_positions: strategy.max_positions,
           stop_loss_percentage: strategy.stop_loss_percentage,
           take_profit_percentage: strategy.take_profit_percentage,
+          max_hold_time_minutes: p['max_hold_time_minutes'] ?? 0,
+          entry_after_open_minutes: p['entry_after_open_minutes'] ?? 0,
+          exit_before_close_minutes: p['exit_before_close_minutes'] ?? 0,
+          trailing_stop: p['trailing_stop'] ?? false,
+          trailing_stop_activation: p['trailing_stop_activation'] ?? 0,
+          trailing_stop_distance: p['trailing_stop_distance'] ?? 0,
           is_active: strategy.is_active,
           is_paper_trading: strategy.is_paper_trading
         });
@@ -132,11 +145,18 @@ export class StrategyFormComponent implements OnInit {
 
     const formValue = this.strategyForm.value;
 
-    // Create params_json from form values
+    // Create params_json from form values. Backend merges this with the
+    // existing params_json server-side, so unspecified keys (delta_min,
+    // ema_period, etc.) are preserved.
     const params_json = {
       stop_loss_percentage: formValue.stop_loss_percentage,
       take_profit_percentage: formValue.take_profit_percentage,
-      // Add any other strategy-specific parameters here
+      max_hold_time_minutes: formValue.max_hold_time_minutes,
+      entry_after_open_minutes: formValue.entry_after_open_minutes,
+      exit_before_close_minutes: formValue.exit_before_close_minutes,
+      trailing_stop: formValue.trailing_stop,
+      trailing_stop_activation: formValue.trailing_stop_activation,
+      trailing_stop_distance: formValue.trailing_stop_distance,
     };
 
     const strategyData = this.isEditMode ? {

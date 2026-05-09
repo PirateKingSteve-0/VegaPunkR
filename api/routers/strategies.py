@@ -8,7 +8,7 @@ from sqlalchemy.orm import Session
 from database import get_db
 from models import Strategy, User
 from schemas import StrategyCreate, StrategyUpdate, StrategyResponse
-from auth import get_current_user
+from auth import get_current_user, require_can_write_own
 from strategy_templates import StrategyTemplates
 from engine.event_logger import log_event
 
@@ -58,7 +58,7 @@ def get_strategy_template(template_id: str):
 def clone_strategy_template(
     template_id: str,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
+    current_user: User = Depends(require_can_write_own)
 ):
     """
     Clone a strategy template to create a new user strategy.
@@ -122,7 +122,7 @@ def get_strategy(
 def create_strategy(
     strategy_data: StrategyCreate,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
+    current_user: User = Depends(require_can_write_own)
 ):
     """
     Create a new strategy.
@@ -153,7 +153,7 @@ def update_strategy(
     strategy_id: int,
     strategy_data: StrategyUpdate,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
+    current_user: User = Depends(require_can_write_own)
 ):
     """
     Update an existing strategy.
@@ -192,7 +192,7 @@ def update_strategy(
 def delete_strategy(
     strategy_id: int,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
+    current_user: User = Depends(require_can_write_own)
 ):
     """
     Delete a strategy.
@@ -218,7 +218,7 @@ def delete_strategy(
 async def toggle_strategy_status(
     strategy_id: int,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
+    current_user: User = Depends(require_can_write_own)
 ):
     """
     Toggle strategy active status (activate/deactivate).

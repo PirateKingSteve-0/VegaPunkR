@@ -14,7 +14,7 @@ from pydantic import BaseModel
 
 from database import get_db
 from models import User
-from auth import get_current_user
+from auth import get_current_user, require_can_write_own
 from config import Environment, TradingMode
 
 logger = logging.getLogger(__name__)
@@ -105,7 +105,7 @@ async def get_environment(
 @router.post("/environment")
 async def set_environment(
     request: EnvironmentUpdateRequest,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_can_write_own),
     db: Session = Depends(get_db)
 ):
     """
@@ -162,7 +162,7 @@ async def set_environment(
 @router.post("/trading-mode")
 async def set_trading_mode(
     request: TradingModeUpdateRequest,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_can_write_own),
     db: Session = Depends(get_db)
 ):
     """

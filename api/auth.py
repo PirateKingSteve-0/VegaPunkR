@@ -90,11 +90,18 @@ async def get_current_user(
     if payload is None:
         raise credentials_exception
 
-    email: str = payload.get("sub")
-    if email is None:
+    # JWT `sub` is the user id (string-typed for JWT compliance). Using id
+    # instead of email so a user changing their email mid-session doesn't
+    # invalidate the existing token.
+    sub = payload.get("sub")
+    if sub is None:
+        raise credentials_exception
+    try:
+        user_id = int(sub)
+    except (TypeError, ValueError):
         raise credentials_exception
 
-    user = db.query(User).filter(User.email == email).first()
+    user = db.query(User).filter(User.id == user_id).first()
     if user is None:
         raise credentials_exception
 
@@ -104,20 +111,81 @@ async def get_current_user(
     return user
 
 
+ROLE_USER = "user"
+ROLE_ADMIN = "admin"
+ROLE_VIEWER = "viewer"
+ROLE_AUDITOR = "auditor"
+ROLE_STRATEGY_AUTHOR = "strategy_author"
+
+VALID_ROLES = {ROLE_USER, ROLE_ADMIN, ROLE_VIEWER, ROLE_AUDITOR, ROLE_STRATEGY_AUTHOR}
+
+# Roles that may write to their OWN account: edit settings, create or
+# modify strategies, manage watchlists, etc. `viewer` and `auditor` are
+# strictly read-only on their own data.
+_WRITE_OWN_ROLES = {ROLE_USER, ROLE_ADMIN, ROLE_STRATEGY_AUTHOR}
+
+# Roles that may place or cancel orders. `strategy_author` can build
+# strategies but never trades — order placement is gated separately so
+# they can author without a trading liability surface.
+_PLACE_ORDER_ROLES = {ROLE_USER, ROLE_ADMIN}
+
+# Roles that may read across all users (no act-as).
+_READ_CROSS_USER_ROLES = {ROLE_ADMIN, ROLE_AUDITOR}
+
+
 async def get_current_active_admin(
     current_user: User = Depends(get_current_user)
 ) -> User:
-    """
-    Require the current user to be an admin.
-
-    Example:
-        @app.get("/admin/users")
-        def list_all_users(admin: User = Depends(get_current_active_admin)):
-            # Only admins can access this
-            return users
-    """
-    if current_user.role != "admin":
+    """Strictly admin — used for user-management endpoints (role changes,
+    creating users, etc.). For *read* across users, prefer
+    `get_current_active_admin_or_auditor` so auditors aren't locked out of
+    oversight."""
+    if current_user.role != ROLE_ADMIN:
         raise HTTPException(status_code=403, detail="Admin privileges required")
+    return current_user
+
+
+async def get_current_active_admin_or_auditor(
+    current_user: User = Depends(get_current_user)
+) -> User:
+    """Read-only-across-users dependency. Used by `/admin/users/...`
+    inspect endpoints — both admins (who manage users) and auditors (who
+    only observe) are allowed through. Writes still need
+    `get_current_active_admin`."""
+    if current_user.role not in _READ_CROSS_USER_ROLES:
+        raise HTTPException(
+            status_code=403,
+            detail="Admin or auditor privileges required",
+        )
+    return current_user
+
+
+async def require_can_write_own(
+    current_user: User = Depends(get_current_user),
+) -> User:
+    """Block writes for read-only roles (`viewer`, `auditor`). Apply on
+    POST/PATCH/DELETE handlers that mutate the *current user's* own
+    resources. Place-order endpoints additionally need
+    `require_can_place_orders`."""
+    if current_user.role not in _WRITE_OWN_ROLES:
+        raise HTTPException(
+            status_code=403,
+            detail=f"Your role ({current_user.role}) is read-only.",
+        )
+    return current_user
+
+
+async def require_can_place_orders(
+    current_user: User = Depends(get_current_user),
+) -> User:
+    """Block order placement for non-trading roles (`viewer`, `auditor`,
+    `strategy_author`). Distinct from `require_can_write_own` because
+    `strategy_author` can mutate strategies but must never trade."""
+    if current_user.role not in _PLACE_ORDER_ROLES:
+        raise HTTPException(
+            status_code=403,
+            detail=f"Your role ({current_user.role}) cannot place orders.",
+        )
     return current_user
 
 

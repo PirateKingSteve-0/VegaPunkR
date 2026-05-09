@@ -1,0 +1,176 @@
+<div class="admin-users-container">
+  <div class="header">
+    <h1>Users</h1>
+    <button mat-stroked-button (click)="refresh()" [disabled]="loading()">
+      <mat-icon>refresh</mat-icon>
+      Refresh
+    </button>
+  </div>
+
+  <ng-container *ngIf="!isAdmin()">
+    <div class="auditor-banner">
+      <mat-icon>visibility</mat-icon>
+      You are viewing as auditor — read-only.
+    </div>
+  </ng-container>
+
+  <ng-container *ngIf="error()">
+    <div class="error-banner">
+      <mat-icon>error</mat-icon>
+      {{ error() }}
+    </div>
+  </ng-container>
+
+  <div class="page-body">
+    <div class="users-table-wrapper">
+      <ng-container *ngIf="loading()">
+        <div class="loading-row">
+          <mat-spinner diameter="32"></mat-spinner>
+        </div>
+      </ng-container>
+
+      <table mat-table [dataSource]="users()" *ngIf="!loading()" class="users-table">
+        <ng-container matColumnDef="email">
+          <th mat-header-cell *matHeaderCellDef>User</th>
+          <td mat-cell *matCellDef="let u">
+            <div class="user-cell">
+              <div class="user-name">{{ u.name }}</div>
+              <div class="user-email">{{ u.email }}</div>
+            </div>
+          </td>
+        </ng-container>
+
+        <ng-container matColumnDef="role">
+          <th mat-header-cell *matHeaderCellDef>Role</th>
+          <td mat-cell *matCellDef="let u">
+            <ng-container *ngIf="isAdmin(); else roleBadge">
+              <mat-form-field appearance="outline" subscriptSizing="dynamic" class="role-field">
+                <mat-select [value]="u.role" (valueChange)="changeRole(u, $event)">
+                  <mat-option *ngFor="let r of allRoles" [value]="r">{{ r }}</mat-option>
+                </mat-select>
+              </mat-form-field>
+            </ng-container>
+            <ng-template #roleBadge>
+              <span class="role-pill">{{ u.role }}</span>
+            </ng-template>
+          </td>
+        </ng-container>
+
+        <ng-container matColumnDef="is_active">
+          <th mat-header-cell *matHeaderCellDef>Active</th>
+          <td mat-cell *matCellDef="let u">
+            <mat-icon [class.active]="u.is_active" [class.inactive]="!u.is_active">
+              {{ u.is_active ? 'check_circle' : 'cancel' }}
+            </mat-icon>
+          </td>
+        </ng-container>
+
+        <ng-container matColumnDef="active_strategies">
+          <th mat-header-cell *matHeaderCellDef>Strategies</th>
+          <td mat-cell *matCellDef="let u">{{ u.active_strategies }}</td>
+        </ng-container>
+
+        <ng-container matColumnDef="open_positions">
+          <th mat-header-cell *matHeaderCellDef>Positions</th>
+          <td mat-cell *matCellDef="let u">{{ u.open_positions }}</td>
+        </ng-container>
+
+        <ng-container matColumnDef="today_pnl">
+          <th mat-header-cell *matHeaderCellDef>Today PnL</th>
+          <td mat-cell *matCellDef="let u" [class]="pnlClass(u.today_pnl)">
+            {{ formatSignedCurrency(u.today_pnl) }}
+          </td>
+        </ng-container>
+
+        <ng-container matColumnDef="last_trade_at">
+          <th mat-header-cell *matHeaderCellDef>Last trade</th>
+          <td mat-cell *matCellDef="let u">
+            {{ u.last_trade_at ? (u.last_trade_at | date:'short') : '—' }}
+          </td>
+        </ng-container>
+
+        <ng-container matColumnDef="last_login">
+          <th mat-header-cell *matHeaderCellDef>Last login</th>
+          <td mat-cell *matCellDef="let u">
+            {{ u.last_login ? (u.last_login | date:'short') : '—' }}
+          </td>
+        </ng-container>
+
+        <ng-container matColumnDef="actions">
+          <th mat-header-cell *matHeaderCellDef></th>
+          <td mat-cell *matCellDef="let u">
+            <button mat-icon-button (click)="selectUser(u.id)" matTooltip="View details">
+              <mat-icon>open_in_new</mat-icon>
+            </button>
+          </td>
+        </ng-container>
+
+        <tr mat-header-row *matHeaderRowDef="displayedColumns"></tr>
+        <tr mat-row *matRowDef="let row; columns: displayedColumns;"
+            [class.selected]="selectedUserId() === row.id"
+            (click)="selectUser(row.id)"></tr>
+      </table>
+    </div>
+
+    <ng-container *ngIf="selectedUserId() !== null">
+      <aside class="detail-panel">
+        <div class="detail-header">
+          <h2>User detail</h2>
+          <button mat-icon-button (click)="closeDetail()">
+            <mat-icon>close</mat-icon>
+          </button>
+        </div>
+
+        <ng-container *ngIf="detailLoading()">
+          <div class="loading-row"><mat-spinner diameter="28"></mat-spinner></div>
+        </ng-container>
+
+        <ng-container *ngIf="selectedDetail() as d">
+          <div class="detail-section">
+            <div class="detail-name">{{ d.user.name }}</div>
+            <div class="detail-email">{{ d.user.email }}</div>
+            <span class="role-pill">{{ d.user.role }}</span>
+          </div>
+
+          <div class="detail-section">
+            <h3>Today's session</h3>
+            <div class="detail-row">
+              <span>Today PnL</span>
+              <strong [class]="pnlClass(d.session_status.today_pnl)">
+                {{ formatSignedCurrency(d.session_status.today_pnl) }}
+              </strong>
+            </div>
+            <div class="detail-row">
+              <span>Cap consumed</span>
+              <strong>{{ d.session_status.pct_consumed.toFixed(0) }}%</strong>
+            </div>
+            <div class="detail-row">
+              <span>Remaining before halt</span>
+              <strong>{{ formatCurrency(d.session_status.daily_loss_remaining) }}</strong>
+            </div>
+            <div class="detail-row">
+              <span>Status</span>
+              <strong>{{ d.session_status.risk_status }}</strong>
+            </div>
+          </div>
+
+          <div class="detail-section">
+            <h3>Account</h3>
+            <div class="detail-row"><span>Size</span><strong>{{ formatCurrency(d.account.account_size_usd) }}</strong></div>
+            <div class="detail-row"><span>Daily cap</span><strong>{{ d.account.daily_loss_limit_pct }}%</strong></div>
+            <div class="detail-row"><span>Environment</span><strong>{{ d.user.selected_environment ?? '—' }}</strong></div>
+            <div class="detail-row"><span>Trading mode</span><strong>{{ d.user.selected_trading_mode ?? '—' }}</strong></div>
+          </div>
+
+          <div class="detail-section">
+            <h3>Activity</h3>
+            <div class="detail-row"><span>Active strategies</span><strong>{{ d.counts.active_strategies }}</strong></div>
+            <div class="detail-row"><span>Open positions</span><strong>{{ d.counts.open_positions }}</strong></div>
+            <div class="detail-row"><span>Last trade</span><strong>{{ d.last_trade_at ? (d.last_trade_at | date:'short') : '—' }}</strong></div>
+            <div class="detail-row"><span>Last login</span><strong>{{ d.user.last_login ? (d.user.last_login | date:'short') : '—' }}</strong></div>
+          </div>
+        </ng-container>
+      </aside>
+    </ng-container>
+  </div>
+</div>

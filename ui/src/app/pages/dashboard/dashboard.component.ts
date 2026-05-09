@@ -15,6 +15,9 @@ import { AuthService } from '../../services/auth.service';
 import { SystemService, EnvironmentSettings } from '../../services/system.service';
 import { ThemeService } from '../../services/theme.service';
 import { TradingWindowDialogComponent } from '../../components/trading-window-dialog/trading-window-dialog.component';
+import { DiscordNotificationsDialogComponent } from '../../components/discord-notifications-dialog/discord-notifications-dialog.component';
+import { EmailReportsDialogComponent } from '../../components/email-reports-dialog/email-reports-dialog.component';
+import { ProfileDialogComponent } from '../../components/profile-dialog/profile-dialog.component';
 
 @Component({
   selector: 'app-dashboard',
@@ -50,15 +53,34 @@ export class DashboardComponent implements OnInit {
   environmentSettings = signal<EnvironmentSettings | null>(null);
   loading = signal(false);
 
-  menuItems = [
-    { icon: 'dashboard', label: 'Overview', route: '/dashboard/overview' },
-    { icon: 'psychology', label: 'Strategies', route: '/dashboard/strategies' },
-    { icon: 'account_balance', label: 'Positions', route: '/dashboard/positions' },
-    { icon: 'bookmarks', label: 'Watchlists', route: '/dashboard/watchlists' },
-    { icon: 'event_note', label: 'Events', route: '/dashboard/events' },
-    { icon: 'analytics', label: 'Performance', route: '/dashboard/performance' },
-    { icon: 'warning', label: 'Risk', route: '/dashboard/risk' },
+  // Admin/auditor-only nav rows are filtered into `menuItems` based on the
+  // currently authed user's role (see filteredMenuItems()).
+  private allMenuItems = [
+    { icon: 'dashboard', label: 'Overview', route: '/dashboard/overview', roles: null as string[] | null },
+    { icon: 'psychology', label: 'Strategies', route: '/dashboard/strategies', roles: null },
+    { icon: 'account_balance', label: 'Positions', route: '/dashboard/positions', roles: null },
+    { icon: 'bookmarks', label: 'Watchlists', route: '/dashboard/watchlists', roles: null },
+    { icon: 'event_note', label: 'Events', route: '/dashboard/events', roles: null },
+    { icon: 'analytics', label: 'Performance', route: '/dashboard/performance', roles: null },
+    { icon: 'warning', label: 'Risk', route: '/dashboard/risk', roles: null },
+    { icon: 'admin_panel_settings', label: 'Users', route: '/dashboard/admin/users', roles: ['admin', 'auditor'] },
   ];
+
+  get menuItems() {
+    const role = this.authService.currentUserValue?.role ?? 'user';
+    return this.allMenuItems.filter(it => it.roles === null || it.roles.includes(role));
+  }
+
+  roleLabel(role: string | undefined | null): string {
+    switch (role) {
+      case 'admin': return 'Admin';
+      case 'auditor': return 'Auditor';
+      case 'viewer': return 'Viewer';
+      case 'strategy_author': return 'Strategy author';
+      case 'user':
+      default: return 'User';
+    }
+  }
 
   ngOnInit() {
     this.loadEnvironmentSettings();
@@ -213,6 +235,27 @@ export class DashboardComponent implements OnInit {
   openTradingWindowDialog(): void {
     this.dialog.open(TradingWindowDialogComponent, {
       width: '420px',
+      autoFocus: false,
+    });
+  }
+
+  openDiscordNotificationsDialog(): void {
+    this.dialog.open(DiscordNotificationsDialogComponent, {
+      width: '480px',
+      autoFocus: false,
+    });
+  }
+
+  openEmailReportsDialog(): void {
+    this.dialog.open(EmailReportsDialogComponent, {
+      width: '500px',
+      autoFocus: false,
+    });
+  }
+
+  openProfileDialog(): void {
+    this.dialog.open(ProfileDialogComponent, {
+      width: '500px',
       autoFocus: false,
     });
   }

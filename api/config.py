@@ -79,6 +79,12 @@ class Settings(BaseSettings):
     DISCORD_WEBHOOK_URL: str = os.getenv("DISCORD_WEBHOOK_URL", "")
     DISCORD_WEBHOOK_URL_DEV: str = os.getenv("DISCORD_WEBHOOK_URL_DEV", "")
 
+    # Resend (email reports). Without RESEND_API_KEY the dispatcher logs the
+    # rendered report and skips the network call — useful in dev.
+    RESEND_API_KEY: str = os.getenv("RESEND_API_KEY", "")
+    EMAIL_FROM_ADDRESS: str = os.getenv("EMAIL_FROM_ADDRESS", "reports@vegapunkr.local")
+    EMAIL_FROM_NAME: str = os.getenv("EMAIL_FROM_NAME", "VegaPunkR Reports")
+
     class Config:
         env_file = ".env"
         case_sensitive = True

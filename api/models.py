@@ -9,7 +9,7 @@ class User(Base):
     id = Column(Integer, primary_key=True, index=True)
     email = Column(String, unique=True, index=True, nullable=False)
     name = Column(String, nullable=False)
-    role = Column(String, default='user')  # 'user' or 'admin'
+    role = Column(String, default='user')  # 'user' | 'admin' | 'viewer' | 'auditor' | 'strategy_author'
     is_active = Column(Boolean, default=True)
     hashed_password = Column(String, nullable=False)
 
@@ -17,6 +17,15 @@ class User(Base):
     risk_tolerance = Column(String, default='medium')  # 'low', 'medium', 'high'
     account_size_usd = Column(Float, default=0.0)  # Fetched/updated from broker API
     max_trade_percentage = Column(Float, default=0.02)  # e.g., 0.02 = 2% of portfolio
+
+    # Account-wide daily loss cap (% of account_size_usd). Halts new entries
+    # for *all* the user's strategies once realized+unrealized PnL today
+    # falls below -(account_size * pct/100). Mirrors the trading-window
+    # most-restrictive-bound semantics: account cap can never widen what a
+    # strategy already enforces. Open positions stay open and can be closed
+    # normally (entries-only halt — force-closing converts paper drawdown
+    # into realized).
+    daily_loss_limit_pct = Column(Float, default=5.0)
 
     # Environment and trading mode selection (for multi-database and API switching)
     selected_environment = Column(String, default='dev')  # 'dev', 'test', or 'prod'

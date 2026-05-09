@@ -36,3 +36,6 @@ requests>=2.31.0  # HTTP library for REST API calls
 
 # Background Jobs & Scheduling
 APScheduler>=3.10.0  # Background job scheduler for strategy execution
+
+# Notifications
+resend>=2.0.0  # Transactional email API for end-of-period reports

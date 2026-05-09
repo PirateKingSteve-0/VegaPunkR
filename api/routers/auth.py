@@ -8,14 +8,17 @@ from sqlalchemy.orm import Session
 
 from database import get_db
 from models import User
-from schemas import Token, UserCreate, UserResponse, UserUpdate
+from schemas import Token, UserCreate, UserResponse, UserUpdate, DiscordTestRequest
 from auth import (
     authenticate_user,
     create_access_token,
     get_password_hash,
-    get_current_user
+    get_current_user,
+    verify_password,
 )
 from config import settings
+from notifications.discord import send_test_message
+from notifications import reports as email_reports
 
 router = APIRouter(prefix="/auth", tags=["Authentication"])
 
@@ -83,10 +86,11 @@ def login(
             headers={"WWW-Authenticate": "Bearer"},
         )
 
-    # Create access token
+    # Create access token. Subject is the user id (as a string per JWT spec)
+    # so a future email change won't invalidate the in-flight session.
     access_token_expires = timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
     access_token = create_access_token(
-        data={"sub": user.email},
+        data={"sub": str(user.id)},
         expires_delta=access_token_expires
     )
 
@@ -110,7 +114,13 @@ def update_me(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    """Update the current user's profile and trading preferences."""
+    """Update the current user's profile and trading preferences.
+
+    Editable identity fields: name, email. Password change requires
+    `current_password` + `new_password`. Email updates propagate
+    automatically to anyone with email reports enabled because the
+    dispatcher reads `User.email` at send time.
+    """
     if update.trading_window_enabled and (
         update.trading_window_start is not None
         and update.trading_window_end is not None
@@ -121,7 +131,43 @@ def update_me(
             detail="trading_window_start must be earlier than trading_window_end"
         )
 
-    for field, value in update.model_dump(exclude_unset=True).items():
+    payload = update.model_dump(exclude_unset=True)
+
+    # daily_loss_limit_pct is bounded by Pydantic (0.5–20). No further
+    # cross-field validation needed — defensive lower bound is already
+    # enforced in `_check_user_daily_loss_limit` (treats <=0 as opt-out).
+
+    # Password change is its own concern — handled before generic field
+    # assignment so we don't ever assign `new_password` / `current_password`
+    # onto the User model.
+    new_password = payload.pop("new_password", None)
+    current_password = payload.pop("current_password", None)
+    if new_password or current_password:
+        if not (new_password and current_password):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Password change requires both current_password and new_password",
+            )
+        if not verify_password(current_password, current_user.hashed_password):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Current password is incorrect",
+            )
+        current_user.hashed_password = get_password_hash(new_password)
+
+    # Email change — uniqueness check before commit so we surface a clean
+    # 400 instead of a DB unique-violation 500.
+    if "email" in payload:
+        new_email = payload["email"]
+        if new_email != current_user.email:
+            existing = db.query(User).filter(User.email == new_email).first()
+            if existing and existing.id != current_user.id:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="That email is already in use",
+                )
+
+    for field, value in payload.items():
         setattr(current_user, field, value)
 
     if (
@@ -138,6 +184,33 @@ def update_me(
     db.commit()
     db.refresh(current_user)
     return current_user
+
+
+@router.post("/me/notifications/discord/test")
+def test_discord_webhook(
+    body: DiscordTestRequest,
+    current_user: User = Depends(get_current_user),
+):
+    """Send a test embed to the supplied Discord webhook so the user can verify
+    their setup before saving. Does not persist anything."""
+    ok, message = send_test_message(body.webhook_url)
+    if not ok:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=message)
+    return {"ok": True, "message": message}
+
+
+@router.post("/me/notifications/email-reports/test")
+def test_email_report(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Send a real-shaped daily report against today's trades to the user's
+    current email address. Lets the user verify formatting and that messages
+    actually land in inbox vs. spam before relying on scheduled reports."""
+    ok, message = email_reports.send_test_now(db, current_user)
+    if not ok:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=message)
+    return {"ok": True, "message": message}
 
 
 @router.post("/logout")

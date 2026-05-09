@@ -115,6 +115,59 @@
           </div>
         </div>
 
+        <!-- Time & Trailing Exits -->
+        <div class="form-section">
+          <h2>Time & Trailing Exits</h2>
+
+          <div class="form-row">
+            <mat-form-field appearance="outline">
+              <mat-label>Max Hold Time</mat-label>
+              <input matInput type="number" formControlName="max_hold_time_minutes" step="1" min="0">
+              <span matSuffix>min</span>
+              <mat-hint>Force exit after N minutes. 0 = disabled.</mat-hint>
+            </mat-form-field>
+
+            <mat-form-field appearance="outline">
+              <mat-label>Entry After Open</mat-label>
+              <input matInput type="number" formControlName="entry_after_open_minutes" step="1" min="0">
+              <span matSuffix>min</span>
+              <mat-hint>Wait N minutes after market open before entering. 0 = disabled.</mat-hint>
+            </mat-form-field>
+          </div>
+
+          <div class="form-row">
+            <mat-form-field appearance="outline">
+              <mat-label>Exit Before Close</mat-label>
+              <input matInput type="number" formControlName="exit_before_close_minutes" step="1" min="0">
+              <span matSuffix>min</span>
+              <mat-hint>Force exit N minutes before market close. 0 = disabled.</mat-hint>
+            </mat-form-field>
+          </div>
+
+          <div class="checkbox-row">
+            <mat-checkbox formControlName="trailing_stop">
+              Enable Trailing Stop
+            </mat-checkbox>
+            <mat-hint>Lock in gains by trailing the stop behind the high-water mark</mat-hint>
+          </div>
+
+          <div class="form-row">
+            <mat-form-field appearance="outline">
+              <mat-label>Trailing Activation</mat-label>
+              <input matInput type="number" formControlName="trailing_stop_activation" step="0.1" min="0">
+              <span matSuffix>%</span>
+              <mat-hint>Gain % required before trailing stop activates</mat-hint>
+            </mat-form-field>
+
+            <mat-form-field appearance="outline">
+              <mat-label>Trailing Distance</mat-label>
+              <input matInput type="number" formControlName="trailing_stop_distance" step="0.1" min="0">
+              <span matSuffix>%</span>
+              <mat-hint>Pullback % from peak that fires the trailing stop</mat-hint>
+            </mat-form-field>
+          </div>
+        </div>
+
         <!-- Strategy Settings -->
         <div class="form-section">
           <h2>Strategy Settings</h2>

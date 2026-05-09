@@ -1,0 +1,148 @@
+.admin-users-container {
+  padding: 24px;
+
+  .header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 16px;
+    h1 { margin: 0; color: var(--text); }
+  }
+
+  .auditor-banner,
+  .error-banner {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 10px 14px;
+    border-radius: 6px;
+    margin-bottom: 12px;
+    font-size: 13px;
+    mat-icon { font-size: 18px; width: 18px; height: 18px; }
+  }
+  .auditor-banner {
+    background: var(--surface-alt);
+    color: var(--text-muted);
+    border: 1px solid var(--border);
+  }
+  .error-banner {
+    background: var(--color-error-bg);
+    color: var(--color-error-fg);
+  }
+
+  .loading-row {
+    display: flex; justify-content: center; padding: 32px;
+  }
+
+  .page-body {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) 360px;
+    gap: 16px;
+    align-items: start;
+
+    @media (max-width: 1100px) {
+      grid-template-columns: 1fr;
+    }
+  }
+
+  .users-table-wrapper {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    overflow-x: auto;
+  }
+
+  .users-table {
+    width: 100%;
+
+    .user-cell {
+      .user-name { font-weight: 500; color: var(--text); }
+      .user-email { font-size: 12px; color: var(--text-muted); }
+    }
+
+    .role-pill {
+      display: inline-block;
+      padding: 2px 8px;
+      font-size: 11px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+      border-radius: 10px;
+      background: var(--surface-alt);
+      color: var(--text-muted);
+      border: 1px solid var(--border);
+    }
+
+    .role-field { width: 160px; }
+
+    mat-icon.active { color: var(--color-profit); }
+    mat-icon.inactive { color: var(--color-loss); }
+
+    .pnl-positive { color: var(--color-profit-strong); font-weight: 500; }
+    .pnl-negative { color: var(--color-loss-strong); font-weight: 500; }
+
+    tr.mat-mdc-row {
+      cursor: pointer;
+      &:hover { background: var(--surface-hover); }
+      &.selected { background: var(--surface-hover); }
+    }
+  }
+
+  .detail-panel {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 16px;
+
+    .detail-header {
+      display: flex; justify-content: space-between; align-items: center;
+      margin-bottom: 12px;
+      h2 { margin: 0; font-size: 16px; color: var(--text); }
+    }
+
+    .detail-section {
+      padding: 12px 0;
+      border-top: 1px solid var(--border);
+
+      &:first-of-type { border-top: none; }
+
+      h3 {
+        margin: 0 0 8px;
+        font-size: 11px;
+        text-transform: uppercase;
+        letter-spacing: 0.06em;
+        color: var(--text-muted);
+        font-weight: 600;
+      }
+
+      .detail-name { font-size: 18px; font-weight: 600; color: var(--text); }
+      .detail-email { font-size: 13px; color: var(--text-muted); margin-bottom: 8px; }
+
+      .role-pill {
+        display: inline-block;
+        padding: 2px 8px;
+        font-size: 11px;
+        font-weight: 600;
+        text-transform: uppercase;
+        letter-spacing: 0.04em;
+        border-radius: 10px;
+        background: var(--surface-alt);
+        color: var(--text-muted);
+        border: 1px solid var(--border);
+      }
+
+      .detail-row {
+        display: flex;
+        justify-content: space-between;
+        margin: 4px 0;
+        font-size: 13px;
+        color: var(--text-muted);
+
+        strong { color: var(--text); font-weight: 500; }
+      }
+
+      .pnl-positive { color: var(--color-profit-strong) !important; }
+      .pnl-negative { color: var(--color-loss-strong) !important; }
+    }
+  }
+}

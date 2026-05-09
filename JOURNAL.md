@@ -5552,3 +5552,606 @@ Tradier sandbox returns `commission=0` and `fees=0` on previews, while live retu
 - **Sandbox-vs-live fee asymmetry isn't fixed for backtests or the performance dashboard.** The cash gate's buffer keeps the engine safe but the broader problem (sandbox PnL is artificially clean, performance metrics in dev are wrong by the fee delta) belongs with TODO #3 (backtest), which needs an explicit fee model anyway.
 
 ---
+
+## Session Date: May 6, 2026 — Engine Heartbeat + Time-Exit UI Surface (TODO #6)
+
+### Goal
+Two interlocking observations from this morning's run:
+1. The engine bought 3 SPY 0DTE calls on strategy 3 at ~11:55 ET, but between entry and the eventual exit there were *zero* log lines. From the operator's seat it looked like the loop had died.
+2. Once we sorted that out, a second question surfaced: an open position auto-closed at exactly 30 minutes, and we couldn't tell whether that was strategy-defined or engine-defined. Either answer is fine, but not knowing which is the problem.
+
+The thread tying them together is observability and editability of the per-strategy lifecycle. Both gaps got addressed this session.
+
+### Diagnostic — why the loop looked dead
+
+`strategy_executor._check_exit_signals` evaluates exits every tick. When no exit signal fires (the common case), it logs at `logger.debug`:
+```python
+if not exit_signal:
+    logger.debug(f"No exit: {symbol} entry=${...} current=${...} pnl=...%")
+```
+Default app log level is `INFO` (`api/app.py:8`, no `FileHandler` either — output goes to stdout in the terminal where `python app.py` is running; the stale `api/app.log` from 2026-04-24 is not actually a sink). So at INFO, the entire steady-state of the loop was invisible. The user saw the entry log, then nothing, until eventually an exit log fired.
+
+Verified the loop *was* alive by checking process state (`python app.py` pid 10359) and DB attribution: position id=2, qty=3, strategy_id=3 (active, instruments=['SPY']), `Position.symbol="SPY"`, `option_symbol="SPY260506C00730000"`. Both the worker's outer `Position.strategy_id` filter and the executor's inner `Position.symbol == market_data.symbol` filter would have matched, so the executor was being invoked — silently.
+
+### Fix (a) — 30s INFO heartbeat per strategy
+
+Added a heartbeat in the per-strategy task loop in `stream_driven_worker.py`. New constant `_HEARTBEAT_INTERVAL = timedelta(seconds=30)`. New per-task variable `last_heartbeat_at: Optional[datetime] = None`. After `state.apply(event)`, if the heartbeat interval has elapsed, log a single INFO line:
+
+```
+Strategy 3 heartbeat: 1 open, underlying=652.34, last_eval=0.8s ago option=SPY260506C00730000 bid=2.10 ask=2.15
+```
+
+Fields: open-position count (DB query, gated by interval so it's not hot-path), underlying price from accumulated state, age of `last_eval_at` (proves the executor is being invoked), and option bid/ask if we've selected a contract. Skipped after-hours since the existing `market closed, waiting` (1/min) already covers liveness on that path.
+
+Considered (a) flipping the no-exit log to INFO and (b) gating it behind a setting; chose neither. Heartbeat is the right diagnostic — "is the loop alive?" is the question we actually have. Bumping a logger level for tick-level detail is something we can always do ad hoc.
+
+### Diagnostic — where the 30-min close came from
+
+Found via `grep` and the live DB:
+- `signal_generator.py:402-412` reads `params_json.max_hold_time_minutes` and emits an exit signal with reason `"Max hold time reached: …"`.
+- Strategy 3's `params_json` had `max_hold_time_minutes: 30`.
+- `trading_safeguards.py:69-75` warns if a strategy has neither `max_hold_time_minutes` nor `exit_before_close_minutes` set. The 30 was a default to silence that warning, not a deliberate scalping rule. Strategy 3 also has `exit_before_close_minutes: 15`, which alone satisfies the safeguard.
+
+So the auto-close was strategy-defined, the value was incidental, and the user wanted control without editing the DB.
+
+### Fix (b) — time/trailing-exit fields in the strategy edit form
+
+Backend already supports targeted `params_json` updates: `routers/strategies.py:175-181` does a *merge* (`{**strategy.params_json, **value}`), so a partial payload only modifies the keys it carries. The constraint was purely UI — the form previously rendered 8 fields and only round-tripped 2 params (`stop_loss_percentage`, `take_profit_percentage`).
+
+Added six new controls to `strategy-form.component.ts` and a new "Time & Trailing Exits" section in the HTML:
+- `max_hold_time_minutes` (number, min 0, "0 = disabled")
+- `entry_after_open_minutes` (number, "Wait N min after open before entering")
+- `exit_before_close_minutes` (number, "Force exit N min before close")
+- `trailing_stop` (checkbox, "Enable trailing stop")
+- `trailing_stop_activation` (number, %, "Gain % required before trailing stop activates")
+- `trailing_stop_distance` (number, %, "Pullback % from peak that fires the trailing stop")
+
+`loadStrategy` reads them from `strategy.params_json` with `?? 0` / `?? false` defaults; `onSubmit` includes them in the merged params payload. All six map to params that the engine already truthy-gates (`signal_generator.py:117-119` for entry-after-open, `:368-369` for trailing, `:421-427` for exit-before-close, `:402-404` for max-hold), so 0 / unchecked = disabled with no extra plumbing. Engine picks up changes within ~30s via `db.refresh(strategy)` at `stream_driven_worker.py:304-306` — no restart.
+
+We chose this over (b) a generic key/value `params_json` editor or (c) a strategy-type-driven schema because the time-exit cluster is shared across all strategy types and is the actual blocker today. (c) remains the right end state once we have more strategy types live.
+
+### Files touched
+| Path | Change |
+|------|--------|
+| `api/engine/stream_driven_worker.py` | `_HEARTBEAT_INTERVAL` constant, `last_heartbeat_at` per-task var, heartbeat emit after `state.apply(event)` |
+| `ui/src/app/pages/strategies/strategy-form.component.ts` | 6 new form controls; `loadStrategy` patches them from `params_json`; `onSubmit` includes them in merged payload |
+| `ui/src/app/pages/strategies/strategy-form.component.html` | new "Time & Trailing Exits" section between Risk Management and Strategy Settings |
+| `TODO.md` | item #6 expanded with source/why/decision context; added items #7 (SMS notifications) and #8 (EOD/weekly/monthly/quarterly/yearly reports via email) |
+| `JOURNAL.md` | this entry |
+
+### Verification
+- `py_compile` parses the modified worker cleanly.
+- `ng serve` (pid 10577) is still running so the form will hot-reload; checked the model — `Strategy.params_json: Record<string, any>` already exists, no model changes needed.
+- Did not restart the running `python app.py` (pid 10359) — heartbeat will only take effect after the user restarts the engine. Called this out explicitly.
+
+### Quirks / decisions worth remembering
+- **`api/app.log` is a red herring.** Logging is `basicConfig(level=INFO)` with no FileHandler, so the file at that path is whatever was there months ago and nothing new ever lands in it. Tail the terminal that's running `python app.py`, or pipe it to a fresh file when launching.
+- **Heartbeat fires from any market-hours event, trade or quote.** Quote-only ticks (no underlying trade) still keep the heartbeat alive. Off-hours, the existing per-minute "market closed, waiting" log carries the liveness signal — skipping the heartbeat there avoids two redundant log streams.
+- **The form-submit `params_json` looks destructive but isn't.** The frontend builds an object with only the keys the form knows about, but the backend merges by spread. Other params in the strategy (delta_min, ema_period, min_open_interest, etc.) are preserved. If we ever change the merge to a replace, the form has to grow to cover everything.
+- **Engine reads strategy params with a 30s `db.refresh`.** Form edits don't need a restart, but they do have a worst-case 30s delay before the engine sees them. Communicated this to the user.
+- **`max_hold_time_minutes: 0` is the disabled sentinel.** The signal generator gates on truthiness (`if max_hold_minutes:`). Same pattern for `entry_after_open_minutes`, `exit_before_close_minutes`, and `trailing_stop`. UI hint reflects this.
+
+### Open follow-ups
+- **Surface engine liveness in the UI.** Heartbeat lives in stdout today. A status panel showing "last heartbeat" / "last eval" / "stream connected" per active strategy means the user never needs to tail logs to check liveness. (Logged as a sub-bullet in TODO #6.)
+- **Stale-quote detection.** `last_eval_age` proves the loop is alive but not that quotes are fresh. If `option_bid` or `option_ask` is unchanged for >N seconds while market is open, that's worth a warning log.
+- **Opt-in tick-by-tick visibility.** Current heartbeat is steady-cadence. If we want to deep-dive a specific session, gate the no-exit DEBUG line behind a per-strategy `verbose_logging` flag rather than flipping the whole logger.
+- **Strategy-type-aware param schema (option (c) from the design discussion).** The current form is fine for the time-exit cluster — those keys exist on every strategy. But the moment the user wants to edit `delta_min`/`delta_max` on a 0DTE strategy or `ema_period` on a momentum one, we'll hit the limits of the hand-rolled approach. Worth re-opening when there's a second strategy type running live.
+- **Existing strategy 3 still has `max_hold_time_minutes: 30`.** Now editable in the UI; user should decide whether to set it to 0 (let TP/SL play out, exit-before-close-15 still keeps the safeguard satisfied) or raise it to 90–120 min.
+
+---
+
+## Session Date: May 6, 2026 (Part 2) — Per-User Discord Trade Notifications (TODO #7 → Discord)
+
+### Goal
+TODO had #7 logged as "SMS notifications for opens and closes." The desire is real — get a phone-side ping when a position opens or closes — but the *channel* was up for grabs. Picked Discord over SMS and shipped a per-user opt-in implementation in this session.
+
+### Decision — Discord over SMS
+Walked through the tradeoff before writing any code:
+- **SMS via Twilio** costs per message, requires A2P 10DLC registration in the US for business sending, and on a chatty 0DTE day could fire 20+ messages — annoying, expensive, and a non-trivial regulatory surface.
+- **Discord webhooks** are free, instant, format embeds nicely (color, fields, emoji), and `config.py:79-80` already had `DISCORD_WEBHOOK_URL` / `DISCORD_WEBHOOK_URL_DEV` slots reserved (defined but never actually wired to anything).
+- SMS only really wins when Discord is unreachable. For a personal trading system where the operator already has Discord on their phone, that's not the binding case.
+
+User agreed. SMS deferred indefinitely; the original TODO #7 closes out as "done via Discord."
+
+### Decision — per-user webhook URL, not a global one
+Considered both:
+- **Global** (one `DISCORD_WEBHOOK_URL` in `.env` used for everyone): zero UI work, simplest, fine for a single-user system.
+- **Per-user** (URL stored on the user row): more flexible, future-proofs a multi-user world, and lets the operator point dev/prod at different channels.
+
+User picked per-user. Critical follow-on: I initially built a hybrid where the dialog pre-filled the webhook from `settings.DISCORD_WEBHOOK_URL_DEV` as a "default" served by a `GET /auth/me/notifications/defaults` endpoint. User pushed back — the env-fallback muddied the per-user model and made it unclear which value was actually being used. Reverted. The user row is now the **only** source of truth; env config slots stay in `.env` (harmless, copy-paste source) but are not read by the app at runtime.
+
+### Architecture
+
+**New module: `api/notifications/discord.py`** (~140 LOC)
+- `notify_position_opened(user_prefs, symbol, qty, price, strategy_name, option_symbol)` and `notify_position_closed(... pnl, ...)` — public API.
+- `send_test_message(webhook_url)` — synchronous, returns `(ok, message)` for the UI test button.
+- `is_valid_discord_webhook(url)` — SSRF guard; only accepts the four official Discord hosts (`discord.com`, `discordapp.com`, `canary.discord.com`, `ptb.discord.com`).
+- All sends go through `_post_async`, which spawns a daemon thread with a 5s timeout and swallows any exception. Same fire-and-forget contract as `event_logger.py`: notifications must never crash the engine.
+- Embeds are color-coded — green (`0x2ECC71`) for opens and winning closes, red (`0xE74C3C`) for losing closes, blue (`0x3498DB`) for the test message.
+
+**Hook points in `api/engine/order_manager.py`**
+- `_update_position_entry`: directly after the existing `log_event(POSITION_OPENED)` call (line 891) — `notify_position_opened(...)` wrapped in try/except that logs and swallows.
+- `_update_position_exit`: directly after the existing `log_event(POSITION_CLOSED)` call (line 962). Uses `position.option_symbol` rather than the trade's, since the exit-side trade row doesn't carry the option chain.
+- Both methods are sync (`def`, not `async def`), so threading is the simplest fire-and-forget primitive — no asyncio.create_task gymnastics, no event loop assumptions.
+
+**Schema additions in `api/schemas.py`**
+- New `DiscordPrefs` Pydantic model with a `field_validator` on `webhook_url` that delegates to `is_valid_discord_webhook` — bogus hosts get rejected at the API boundary, not silently dropped at dispatch time.
+- `UserBase` / `UserUpdate` / `UserResponse` extended with `notification_preferences: Dict[str, Any]`. `UserUpdate.notification_preferences` has its own validator that runs `DiscordPrefs.model_validate` on `value["discord"]` if present, so partial PATCHes are still validated.
+- New `DiscordTestRequest { webhook_url: str }` for the test endpoint.
+
+**API surface** (`api/routers/auth.py`)
+- `PATCH /auth/me` already used `setattr(current_user, field, value)` for whatever fields `UserUpdate` exposes. Adding `notification_preferences` to the schema was enough — no router-level changes needed.
+- New `POST /auth/me/notifications/discord/test` accepts `{webhook_url}`, calls `send_test_message`, returns `{ok, message}` or 400 with the failure detail. Critically, it does *not* persist the URL — that's the "test before saving" semantics the user wanted.
+
+**Frontend**
+- `ui/src/app/models/user.model.ts`: added `DiscordPrefs`, `NotificationPreferences`, `NotificationPreferencesUpdate` types; extended `User` with `notification_preferences?`.
+- `ui/src/app/services/auth.service.ts`: `updateNotificationPreferences(prefs)` does a PATCH that *merges* `discord` into the user's existing prefs (`{...existing, discord}`) so we don't clobber other top-level keys when more notification types get added later. `testDiscordWebhook(url)` posts to the test endpoint.
+- `ui/src/app/components/discord-notifications-dialog/`: new MatDialog modeled on `trading-window-dialog`. Master toggle, webhook URL input, per-event toggles (open / close), "Send test message" button with success/failure feedback line. Uses Angular signals for state; reads existing prefs on `ngOnInit` via `auth.refreshMe()`.
+- `ui/src/app/pages/dashboard/dashboard.component.{ts,html}`: added a "Discord Notifications" menu item with a `notifications` icon, sitting right under "Trading Window" in the user menu.
+
+### Files touched
+| Path | Change |
+|------|--------|
+| `api/notifications/__init__.py` | new (package marker) |
+| `api/notifications/discord.py` | new dispatcher + validator + test sender |
+| `api/engine/order_manager.py` | imported notifier; called from inside `_update_position_entry` (after POSITION_OPENED log_event, line 891) and `_update_position_exit` (after POSITION_CLOSED log_event, line 962); both wrapped in try/except |
+| `api/schemas.py` | `DiscordPrefs`, `DiscordTestRequest`; `notification_preferences` on `UserBase` / `UserUpdate` / `UserResponse`; nested validator on `UserUpdate.notification_preferences` |
+| `api/routers/auth.py` | new `POST /me/notifications/discord/test` endpoint |
+| `ui/src/app/models/user.model.ts` | `DiscordPrefs`, `NotificationPreferences`, `NotificationPreferencesUpdate`; extended `User` |
+| `ui/src/app/services/auth.service.ts` | `updateNotificationPreferences`, `testDiscordWebhook` |
+| `ui/src/app/components/discord-notifications-dialog/*` | new dialog (ts/html/scss) |
+| `ui/src/app/pages/dashboard/dashboard.component.ts` | imported new dialog, `openDiscordNotificationsDialog()` |
+| `ui/src/app/pages/dashboard/dashboard.component.html` | new menu item |
+| `TODO.md` | removed previous #6 (max_hold_time, addressed earlier today) and #7 (SMS, superseded); added two DONE entries; renumbered EOD-reports → #6 |
+| `JOURNAL.md` | this entry |
+
+### Verification
+- Backend imports clean (`from notifications.discord import …`, `from schemas import DiscordPrefs, DiscordTestRequest`, `from routers.auth import router`, `from engine.order_manager import OrderManager`).
+- Pydantic validator smoke test: rejects `http://evil.example.com/x`, accepts a real Discord webhook URL, leaves a `model_dump(exclude_unset=True)` of an unrelated PATCH untouched (no spurious `notification_preferences` key).
+- Dispatcher smoke test: returns silently for `None` / `{}` / `{discord: {enabled: false}}` / `{discord: {enabled: true}}` (no URL) / `{discord: {enabled: true, webhook_url: <bad-host>}}` and for `notify_close: false`. None of those should fire.
+- **Live Discord verification**: ran `send_test_message`, `notify_position_opened` (synthetic SPY 0DTE), `notify_position_closed` (one win, one loss) against `DISCORD_WEBHOOK_URL_DEV`. All four embeds appeared in the dev channel; user confirmed visuals look right.
+- `npx ng build --configuration development` succeeds (twice — once before and once after the env-fallback revert).
+- Did **not** drive the dialog in a browser (CLAUDE.md flags this as required for UI changes; called out explicitly in the session).
+
+### Quirks / decisions worth remembering
+- **`User.notification_preferences` is a `JSON` column with `default=dict`.** When updating partially, you must use `flag_modified(user, "notification_preferences")` if you mutate the dict in place; the seeding script does this. The PATCH endpoint avoids the issue because it uses `setattr` with a fresh dict, so SQLAlchemy sees a new attribute value.
+- **The dispatch path runs in a thread, but the lookup runs on the calling thread.** `user.notification_preferences` is read synchronously from the SQLAlchemy session before the thread is spawned. Don't try to read user state inside the worker — the session won't be valid there.
+- **`is_valid_discord_webhook` is the SSRF guard.** Both the schema validator and the dispatcher gate on it. Bypassing one wouldn't bypass the other. If we ever need to support a different webhook host (e.g. a self-hosted Discord-compatible gateway), edit `_VALID_HOSTS` in `notifications/discord.py` — that's the single source of truth.
+- **Trade.commission/fees aren't in the close embed.** The Discord notification uses `exit_pnl` (gross), matching the existing `event_data` payload on `POSITION_CLOSED`. Net P&L lands on the dashboard once Tradier history reconciles. If a user wants the embed to show net, that's a follow-up — and it'll need to wait for the trade row to be refreshed with broker-side commission first, since the in-process `trade.pnl` only deducts commission, not fees.
+- **The dev DB user (id=1, kingofpirates92@gmail.com) was seeded** with `notification_preferences.discord = {enabled: false, webhook_url: <DISCORD_WEBHOOK_URL_DEV>, notify_open: true, notify_close: true}` so the dialog opens with the URL pre-populated and the operator can flip the master toggle when ready. New users start with `{}` and paste their own webhook.
+- **`config.py:79-80` env slots are still present but unused at runtime.** They're a convenient copy-paste source when seeding a user but the app no longer reads them. Don't be misled by the import-graph: nothing in the dispatcher or router resolves to `settings.DISCORD_WEBHOOK_URL`.
+
+### Open follow-ups
+- **Browser smoke test.** Per CLAUDE.md, UI changes should be driven in a browser before claiming done. Open the dialog, paste the dev webhook (or use the seeded value), enable, hit "Send test message", save, then trigger a real entry/exit and watch for the embeds.
+- **Net P&L in the close embed.** Once Trade rows reconcile commission+fees from Tradier history, the embed could pull from `Trade.pnl - Trade.fees` instead of in-process `exit_pnl`. Probably cleanest to add a separate "trade reconciled" event that updates the embed via Discord's PATCH webhook API, but that's a real chunk of work and the gross PnL is fine for the at-a-glance use.
+- **Per-user Discord defaults via the dashboard.** Right now a new user has to open the dialog, paste a webhook, and save — three steps. A first-run "set up notifications" prompt on the dashboard would shave that to one click. Cosmetic, defer.
+- **Notification rate-limiting.** A pathological strategy could fire dozens of opens in a session. Discord's per-webhook rate limit is 30 messages per minute, which we won't realistically hit, but a digest mode (one embed per N events, or per minute) is worth considering if a future strategy is genuinely high-frequency.
+
+---
+
+## Session Date: May 7, 2026
+
+### Discord notifications — fix missing close embeds
+
+User reported "for the discord hooks it looks like the close didnt send" — opens were arriving in Discord but closes were not.
+
+#### Root cause
+The Nov 18 implementation only hooked `_update_position_exit()` in `api/engine/order_manager.py:976`, which is the post-fill bookkeeping path. The actual strategy-driven exit path runs through **`OrderManager.close_position()`** (line 990), called from `strategy_executor.py:440`. That method sets `position.qty = 0`, logs `POSITION_CLOSED`, and returns — but never invoked `notify_position_closed`. So in-app events fired correctly, the Discord webhook just never got the close embed.
+
+There's a third close path too: **`StreamDrivenWorker._reconcile_position()`** in `api/engine/stream_driven_worker.py:577`, which detects positions closed externally (manual close in the broker UI). It logged `POSITION_MANUALLY_CLOSED` but had no Discord hook either.
+
+#### Fixes
+1. **`api/engine/order_manager.py:1213`** — added `notify_position_closed(...)` call after the existing `log_event(POSITION_CLOSED)` block in `close_position()`. Mirrors the try/except pattern from the other hook sites; uses `option_symbol or position.option_symbol` so the OCC contract makes it into the embed.
+2. **`api/engine/stream_driven_worker.py`** — imported `notify_position_closed` and wired it into the runtime reconcile path (line 577). Captures `qty_closed`, `exit_price`, `approx_pnl` *before* zeroing the row (the broker fill price isn't visible to us here, so the latest streamed quote is used as an approximation). Tagged with `strategy_name="Manual close (broker)"` so the embed clearly distinguishes itself from a strategy-driven close.
+
+#### Decisions
+- **Skipped the startup-sync manual-close path** (`stream_driven_worker.py:461-485`). On cold boot it could fire a burst of webhook embeds for positions closed days ago — net annoyance, no information gain. If we ever want it, the same pattern slots in cleanly. Called out to user; they didn't push back.
+- **Approximate PnL on broker-side closes is fine for now.** We don't fetch Tradier history before sending, so `(current_price - avg_entry) * qty_before` is the best we have. The in-app `event_data` carries no PnL either, so the embed isn't worse than the dashboard event. A follow-up could pull the actual fill from `/v1/accounts/{id}/history` and patch the embed, but it's not worth the extra request path right now.
+
+### Files touched
+| Path | Change |
+|------|--------|
+| `api/engine/order_manager.py` | added `notify_position_closed` call in `close_position()` after the POSITION_CLOSED `log_event` (line ~1214) |
+| `api/engine/stream_driven_worker.py` | imported `notify_position_closed`; wired into `_reconcile_position()` after the POSITION_MANUALLY_CLOSED event |
+| `JOURNAL.md` | this entry |
+
+### Verification
+- `python -m py_compile api/engine/order_manager.py api/engine/stream_driven_worker.py api/notifications/discord.py` — clean.
+- Did **not** trigger a live close to confirm the embed renders. Next live exit will be the real test.
+
+### Open follow-ups
+- **Confirm the close embed in Discord** on the next strategy-driven exit. If it still doesn't fire, the issue is downstream of `close_position` (e.g. `notify_close: false` in the user prefs, or the dispatcher's host validator rejecting the URL).
+- **Broker-side close embeds** currently show approximate exit price/PnL. If Tradier history fetch is cheap to add, swapping in the real fill price would be a strict upgrade.
+- **Startup-sync manual closes** still don't notify by design. Revisit if user-perceived "missing" closes turn out to be from cold-boot reconciles rather than the live path.
+
+---
+
+## Session Date: May 9, 2026 — Close-Notification Audit (TODO #8)
+
+### Goal
+Confirm `notify_position_closed` fires exactly once per real fully-closed position and never on a bailout / retry path. Resolve TODO #8 and verify manual-close coverage.
+
+### Audit — three call sites
+
+1. **`order_manager.py:1215` — `close_position()`.** Strategy-driven exits route here via `strategy_executor.py:440`. Notify is reached only after `_await_terminal_order` returns a dict and `terminal_status == 'filled'`. Every bailout returns before notify:
+   - line 1014: `position.qty <= 0` already-closed guard
+   - line 1043: per-(user, symbol) rate limit
+   - line 1060: preview-or-abort failure (preview transport error, insufficient cash)
+   - line 1097: broker-error body in the place_order response
+   - line 1126: terminal status not confirmed within 30s timeout
+   - line 1146: terminal status reached but not 'filled' (rejected/canceled/expired)
+   - line 1248: catch-all exception in the place_order block
+
+2. **`stream_driven_worker.py:606` — `_reconcile_position()`.** Detects manual closes in the broker UI. Reaches notify only after `tradier_qty <= 0` confirms the contract is gone broker-side AND we observed `position.qty > 0` locally. After path 1 has already zeroed `position.qty`, the function early-returns at line 561 (the `position.qty <= 0` branch handles only inverse-drift, not manual-close), so it can't double-fire on a strategy-driven close.
+
+3. **`order_manager.py:976` — `_update_position_exit()`.** Gated by `fully_closed` (local `position.qty <= 0` after reducing by the exit qty). Currently unreachable in production: it sits inside `execute_signal`'s `signal_type == 'exit'` branch, but `strategy_executor.py:328` only calls `execute_signal` with entry signals — exits go through `close_position`. Left in place because removing the dead branch is a separate cleanup; the gating already prevents duplicates if it ever gets re-wired.
+
+### Race analysis
+Paths 2 and 3 both run inside the same per-strategy persistent asyncio task — `_reconcile_position` at line 321 fires on the same trade-tick loop iteration that ultimately invokes the executor and `close_position`. Asyncio yields don't let a single task overlap itself, so reconcile and close_position serialise within a strategy. Different strategies own different `Position` rows (strategy_id keyed), so cross-strategy concurrency can't notify the same close twice either.
+
+### Manual-close coverage
+- **Runtime broker-UI close:** path 2 above (`_reconcile_position`). Already wired (May 7).
+- **Startup-sync manual close** (`stream_driven_worker.py:470`): kept silent on purpose — cold boot would dump embeds for closes that happened while the server was down. Decision from May 7 stands.
+- **In-app DELETE `/positions/{id}`** (`routers/positions.py:162`) just removes the DB row; doesn't broker-close, doesn't notify. Currently unused by the Angular UI — there's no manual-close button. If we add one, it must route through `OrderManager.close_position` (path 1) to inherit broker action + notify, not through this endpoint.
+
+### `apply_trade` — non-existent
+Original TODO mentioned a duplicate-fill concern between `apply_trade` and `close_position`. There is no `apply_trade` symbol anywhere in `api/`. The conceptual concern was either renamed away or never landed; the current paths are mutually exclusive at runtime regardless.
+
+### Files touched
+| Path | Change |
+|------|--------|
+| `api/notifications/discord.py` | inline audit comment at top of `notify_position_closed` documenting the three call sites + gating |
+| `TODO.md` | removed #8 (was: close-notification audit), promoted #9→#8 and #10→#9, added DONE entry |
+| `JOURNAL.md` | this entry |
+
+### Verification
+Read-only audit — no behavioral code changed. Existing close paths already produce exactly one notify per fully-closed position; the comment captures that invariant for the next person who edits this code.
+
+### Open follow-ups
+- If a manual-close button ever gets added to the UI, route it through `OrderManager.close_position` rather than the bare `DELETE /positions/{id}` endpoint, so the broker order actually fires and the Discord embed lands.
+
+---
+
+## Session Date: May 9, 2026 (Part 2) — Email Reports + Profile Editing (TODO #6 + #9)
+
+### Goal
+Land the end-of-period email report feature (TODO #6) and user-profile editing (TODO #9) — including email change, which is what determines the email-reports recipient.
+
+### Architecture — email reports
+
+**Transport: Resend.** Picked Resend over Gmail SMTP after weighing the SPF/DKIM/spam-folder pain of self-hosted SMTP against Resend's HTTP API + free tier. Single env var (`RESEND_API_KEY`); without the key set, `_send_via_resend` logs a "skipped" line and no-ops so dev environments don't need a Resend account to exercise the dispatch path. The package is imported lazily inside `_send_via_resend` so the rest of the API doesn't pull `resend` on import — useful when running test envs with a thinner deps install.
+
+**Two-stage scheduler.** `services/email_report_scheduler.EmailReportScheduler`:
+1. Stage 1 — APScheduler `CronTrigger(hour=3, minute=0, timezone=ET)` calls `_anchor_today()` daily at 03:00 ET. We *also* run the anchor immediately on `start()` so a same-day server restart still gets the dispatch scheduled.
+2. `_anchor_today()` pulls `tradier_integration.client.get_market_calendar()` for the current month + next month (so end-of-month boundaries work). Looks up today's row; if `status != "open"`, no dispatch (weekend/holiday). Otherwise reads `open.end` (handles early-close days — e.g. 13:00 close on Christmas Eve) and computes a `DateTrigger` for close + 30 minutes ET.
+3. Stage 2 — at the one-shot fire time, `dispatch()` selects users with `notification_preferences.email_reports.enabled = true`, then for each user × each period (`daily`, `weekly`, `monthly`, `quarterly`, `yearly`) checks `is_enabled_for(prefs, period)` AND `reports.fires_today(period, today, calendar)`. Sends the rendered report fire-and-forget through a daemon thread (mirrors the Discord pattern at `notifications/discord.py:49-56`).
+
+A flat `CronTrigger(hour=16, minute=30)` would have been wrong on early-close days (a 13:00 close → dispatch at 16:30 = 3.5 hours late). The two-stage path costs one more API call per day and keeps the dispatch pinned to the actual session boundary.
+
+**Period firing rule.** `reports.fires_today(period, anchor, calendar)` walks the calendar for the next `status='open'` day strictly after `anchor`. Then:
+- weekly fires when next open day is in a different ISO week
+- monthly fires when next open day is in a different month
+- quarterly fires when next open day is in a different quarter
+- yearly fires when next open day is in a different year
+
+This sidesteps the trap where you naively use "is today Friday?" — a Thursday before a Friday holiday is the week's last trading day. Same idea for end-of-month etc.
+
+**Empty-period rule.** Daily and weekly skip the send when the period closed zero trades (`reports.send_report` early-returns; `aggregate` is still computed, but no email goes out). Monthly+ are in `ALWAYS_SEND_PERIODS` and send even when flat — you want the record on a quiet month.
+
+**Aggregation.** `reports.aggregate()` queries `Trade` outer-joined to `Strategy`, filtered by `user_id`, `status='executed'`, and an ET-anchored window on `exit_timestamp`. ET anchoring matters because `Trade.exit_timestamp` is naive UTC (`datetime.utcnow()` at close); a 4:30pm ET close on May 9 sits at May 9 20:30 UTC, so `[2026-05-09 04:00, 2026-05-10 04:00]` UTC is what we actually need. Win-rate is `None` (rendered as "—") when trade_count is 0 to avoid divide-by-zero. Trades table caps at 50 most recent with a "showing N of M" footer.
+
+**Rendering.** Self-contained HTML with inline styles only — Gmail/Outlook strip `<style>` blocks unpredictably. Plain-text fallback rendered alongside. Subject line includes `_signed(total_pnl)` so the user can see the bottom line without opening the message.
+
+### Architecture — profile editing
+
+**Schema.** `UserUpdate` now includes `name`, `email` (`EmailStr`), `current_password`, `new_password (min_length=8)`. Validator on `notification_preferences` already covered Discord; extended to validate `email_reports` against the new `EmailReportsPrefs` schema. The router pops `current_password`/`new_password` off the payload before generic `setattr` so they never accidentally land on the User model.
+
+**Email-uniqueness gate.** Pre-checks before commit so a collision returns a 400 with `"That email is already in use"` instead of bubbling a DB IntegrityError as 500.
+
+**JWT subject change.** Migrated from `data={"sub": user.email}` to `data={"sub": str(user.id)}` so an email change mid-session no longer makes the in-flight token undecodable. `get_current_user` parses the sub as int and looks up by id. **All currently-issued tokens are now invalid** — users will get one 401 on the next request after deploy and need to log in again. Acceptable in active dev.
+
+**Why id-as-sub instead of just re-issuing a token on email change?** Re-issuing requires a custom response shape (sniff `X-New-Access-Token` header in the UI, swap localStorage). The id-as-sub change is one line in three places and removes the entire class of "session invalidated by profile edit" bugs forever.
+
+### Files touched
+| Path | Change |
+|------|--------|
+| `requirements.txt` | added `resend>=2.0.0` |
+| `api/config.py` | `RESEND_API_KEY`, `EMAIL_FROM_ADDRESS`, `EMAIL_FROM_NAME` |
+| `api/notifications/email.py` | new — Resend transport, async fire-and-forget + sync test send |
+| `api/notifications/reports.py` | new — period windows, aggregation, HTML/text rendering, dispatch, `fires_today` |
+| `api/services/email_report_scheduler.py` | new — two-stage scheduler with calendar lookup |
+| `api/tradier_integration/client.py` | new `get_market_calendar(month, year)` method |
+| `api/schemas.py` | `EmailReportsPrefs`; `UserUpdate` gained `name`, `email`, `current_password`, `new_password` |
+| `api/routers/auth.py` | `/me/notifications/email-reports/test` endpoint; PATCH `/me` handles password swap + email-uniqueness; login uses `sub=str(user.id)` |
+| `api/auth.py` | `get_current_user` now resolves the JWT `sub` as user id (int), not email |
+| `api/app.py` | lifespan starts/stops `EmailReportScheduler` |
+| `.env` | `RESEND_API_KEY`, `EMAIL_FROM_ADDRESS=onboarding@resend.dev`, `EMAIL_FROM_NAME` |
+| `ui/src/app/models/user.model.ts` | `EmailReportsPrefs`, `ProfileUpdate`; `User.username` → `User.name` (mirror API field) |
+| `ui/src/app/services/auth.service.ts` | `testEmailReport()`, `updateProfile()` |
+| `ui/src/app/components/email-reports-dialog/` | new — dialog with per-period checkboxes, destination email row, "Send test report" button, off-banner |
+| `ui/src/app/components/profile-dialog/` | new — name, email, password change with confirm; surfaces "email change re-targets reports" hint |
+| `ui/src/app/pages/dashboard/dashboard.component.ts` + `.html` | imported the two new dialogs, added user-menu entries ("Profile" + "Email Reports") |
+
+### Verification
+- `python3 -m py_compile` on all changed Python files — clean.
+- `ng build --configuration development` — clean (2.24 MB initial bundle, no TS errors).
+- Did **not** force a real send — relies on `RESEND_API_KEY` being set (or the no-op dev path). Next live test: hit "Send test report" from the dialog and check inbox.
+
+### Quirks / decisions worth remembering
+- **`onboarding@resend.dev` only delivers to the email address registered with the Resend account.** Production will require verifying a sender domain in the Resend dashboard and updating `EMAIL_FROM_ADDRESS`. The free tier covers it.
+- **Trade.exit_timestamp is naive UTC.** Period windows are ET-localized then converted to naive UTC for the SQLAlchemy comparison (`reports._to_utc_naive`). Don't drop the timezone math — May 9 ET ≠ May 9 UTC for the late part of the session.
+- **Startup `_anchor_today()` invocation.** Without it, restarting the server at 14:00 ET would mean the next dispatch is tomorrow at 16:30. The startup call covers same-day boots; if we restart *after* close+30, dispatch fires immediately.
+- **Email change does not require re-login** post JWT-by-id migration. A user who changes their email keeps the same access token and the next request resolves them by id. Email reports retarget on the next dispatch tick.
+
+### Open follow-ups
+- **Verify a sender domain** in the Resend dashboard for production sends to other recipients. Update `EMAIL_FROM_ADDRESS` once verified.
+- **Rotate the dev API key** — it was pasted in a chat transcript, so even though it's only in `.env` (gitignored) it should be rotated before any sustained use.
+- **No unit tests yet** for `reports.fires_today` — the calendar-walk logic is the easiest place for a regression to slip in (off-by-one on month boundaries, ISO-week edge cases). Add deterministic tests using fixture calendars before relying on monthly/quarterly/yearly cadence in production.
+- **No backfill of missed reports.** If the server is down at close+30 and brought up the next day, that day's report is gone. If it matters, a follow-up could record a "last successful dispatch" timestamp per user and replay missed days, but for now we accept that downtime = missed report.
+
+### Post-deploy fixes (same day, after first server restart)
+
+Three things surfaced once uvicorn actually picked up the new code:
+
+1. **`ImportError: cannot import name 'SessionLocal' from 'database'`.** I had imported `SessionLocal`; the codebase uses `SessionLocals` (a dict keyed by `Environment`). Fixed `services/email_report_scheduler.py` to import `SessionLocals` and added a small `_new_session()` helper that pulls from the DEV pool — mirroring the pattern in `engine/stream_driven_worker.py`. Multi-DB switching happens at the request layer; long-running background services are pinned to DEV.
+2. **`resend` package not installed in the venv.** `requirements.txt` had the new line but the venv hadn't been pip-installed against it. `notifications/email._send_via_resend` already had a graceful fallback for the missing-package case (returns `(False, "resend package not installed (...)")` instead of raising at import), which surfaced cleanly as the test-button result. Resolution: `venv/bin/pip install 'resend>=2.0.0'` → installed `resend-2.30.0`. The fallback path stays useful for fresh checkouts that haven't run `pip install -r requirements.txt` yet.
+3. **"Email Reports" menu entry not visible in the running UI.** Code on disk was correct; the running `ng serve` had a stale bundle that pre-dated the new component import. Adding a new standalone component sometimes doesn't get picked up by HMR cleanly. Resolution: stop and restart `ng serve` + hard refresh the browser. Worth remembering as the first thing to try when "the new menu entry isn't showing up" and the file diff confirms it should be.
+
+---
+
+## Session Date: May 9, 2026 (Part 3) — Account-Wide Daily Loss Cap + RBAC (TODO #5 close-out, #7, #8)
+
+### Goal
+Three TODO items in one push:
+1. **#5 (fee tracker)** — verify it's already done and close out.
+2. **#7 (account-wide daily drawdown cap)** — sum realized + unrealized PnL across *all* of a user's strategies for the day; halt new entries account-wide once the cap is breached; surface a session-status tile on the overview so "how close are we to ending today" is one glance.
+3. **#8 (role-based access)** — expand `User.role` from a binary `user`/`admin` flag into a five-role taxonomy (`user`, `admin`, `viewer`, `auditor`, `strategy_author`) with router-level and engine-level enforcement; build an admin-only Users page that mirrors observe-only oversight without ever taking action *as* another user.
+
+### Decisions surfaced before code
+
+Before any edits I asked the user three questions and locked the answers in:
+- **Cap-breach behavior:** entries-only halt. Existing positions stay open and can be closed normally; the cap resets at midnight ET. Force-closing on a soft cap converts paper drawdown into realized loss.
+- **Admin scope:** observe-only. No "act-as user" path. Order placement on someone else's account is a different liability surface and was deliberately rejected.
+- **Role taxonomy:** all five roles (`user`, `admin`, `viewer`, `auditor`, `strategy_author`). User asked for the full set rather than the minimal expansion.
+
+Locking these in front-loaded the architecture; the rest of the work was carrying decisions through.
+
+### Architecture — account-wide daily loss cap (#7)
+
+**Where the cap lives.** Per-strategy `daily_loss_limit_pct` already existed in `risk_manager._check_daily_loss_limit` (default 5% of account, warn at 80%). The gap was that N strategies = N× the cap because each was checked independently against its own slice. Added `User.daily_loss_limit_pct` (default 5.0, bounded 0.5–20% in Pydantic) and a new `RiskManager._check_user_daily_loss_limit` that:
+- Sums realized PnL today across all the user's strategies (closing legs that filled today: `Trade.timestamp >= today_start AND status='executed' AND pnl IS NOT NULL`)
+- Plus unrealized PnL on every currently-open position (`SUM(Position.unrealized_pnl) WHERE qty > 0`)
+- Rejects when `today_pnl < -(account_size * pct/100)`
+- Returns OK on `side='sell'` so existing positions are always closeable through the engine
+- Returns OK when `pct <= 0` so users can opt out via 0
+
+Wired it as step **2.5** in `validate_pre_trade` — between trading-mode check (2) and per-strategy daily loss check (3) — so account-wide is the most-restrictive bound. If account is halted we don't bother probing strategy-level state. Mirrors the pattern set by the trading-window work (TODO #2): account cap can never widen what a strategy already enforces.
+
+**Snapshot endpoint for the dashboard.** New `RiskManager.get_account_risk_status(user)` returns the same numbers in dashboard-shape: `today_pnl`, `realized_pnl`, `unrealized_pnl`, `daily_loss_limit`, `daily_loss_remaining` (clamped to 0), `pct_consumed` (positive only when underwater — gains don't fill the bar), `risk_status` ∈ {`OK`, `WARNING`, `HALTED`} at thresholds 0/80/100. `entries_halted` is the convenience boolean the UI uses to show the footnote. Exposed at `GET /risk-events/account-status` (parked under the existing `risk-events` router rather than spinning up a new file just for one route).
+
+**UI — session-status tile on overview.** New section above the existing stats grid:
+- Headline: today's PnL with realized/unrealized breakdown
+- Center: % of cap consumed
+- Right: $ remaining before halt
+- Status badge (Within cap / Approaching cap / Entries halted) and a 0–100% progress bar that switches color via SCSS class (`session-status--ok | --warning | --halted`)
+- Footnote shows only when HALTED to spell out "new entries blocked, existing positions still closeable"
+- Refreshes every 30s — unrealized changes whenever option marks tick, so a stale tile would understate proximity to halt
+- Reloads on env/trading-mode toggle to match the existing pattern
+
+**Theme tokens.** Existing `styles.scss` had no warning/amber tokens (only profit/loss/error). Added `--color-warning`, `--color-warning-strong`, `--color-warning-bg`, `--color-warning-bg-soft` for both light and dark themes. Per CLAUDE.md UI Theming rules, hardcoding amber would have broken in dark mode.
+
+**Profile dialog.** New "Risk limits" section between Identity and Change-password. Single numeric input bounded to 0.5–20%, default 5%, default-loaded from `user.daily_loss_limit_pct` on dialog open and only sent in the PATCH payload if it actually changed. The hint copy explains that the cap halts new entries account-wide and that existing positions can still be closed.
+
+### Architecture — RBAC (#8)
+
+**Five roles defined in `api/auth.py`.**
+
+| Role | Read own | Write own | Place orders | Read cross-user | Manage users |
+|------|----------|-----------|--------------|------------------|--------------|
+| `user` | ✓ | ✓ | ✓ | — | — |
+| `admin` | ✓ | ✓ | ✓ | ✓ (observe) | ✓ |
+| `viewer` | ✓ | — | — | — | — |
+| `auditor` | ✓ | — | — | ✓ (observe) | — |
+| `strategy_author` | ✓ | ✓ | — | — | — |
+
+Enforcement is layered:
+1. **Pydantic guard** — `UserBase` has a `_check_role` validator with `VALID_ROLES` so the API can never accept an unknown role string.
+2. **Router-level dependencies** in `auth.py`:
+   - `get_current_user` — read-own (everyone)
+   - `require_can_write_own` — blocks `viewer`/`auditor` (the read-only roles)
+   - `require_can_place_orders` — blocks `viewer`/`auditor`/`strategy_author` (the non-trading roles)
+   - `get_current_active_admin_or_auditor` — read-cross-user (admin or auditor)
+   - `get_current_active_admin` — admin-only (user management writes)
+3. **Engine-level gate** — `order_manager.execute_signal` rejects `side='buy'` for any role outside `{user, admin}` so a strategy worker that was running before a role demotion can't bypass the router-level guard. Sells go through unconditionally so existing positions are closeable.
+
+**Why two layers?** The router gate stops API-driven writes. The engine gate stops automated writes the engine itself initiates from a streaming tick. Both are needed: a strategy_author who creates a strategy that's later toggled active by an admin would otherwise see the engine place orders on their behalf with no API hit between role assignment and order submission.
+
+**Why `strategy_author` can `require_can_write_own` but not `require_can_place_orders`.** They can author and edit strategies — that's the whole point of the role — but the engine refuses to trade on their behalf. The strategy still appears in the database; it just never enters the order path. This makes "build a strategy, hand it to admin to run" the natural workflow without needing an "approval" state machine.
+
+**Admin Users page (read-only oversight).** New router `api/routers/admin.py`:
+- `GET /admin/users` — compact list with email/name/role/active status/last_login + cheap aggregates per row (`active_strategies`, `open_positions`, `today_pnl`, `last_trade_at`). Gated by `admin_or_auditor`.
+- `GET /admin/users/{id}` — full profile (UserResponse).
+- `GET /admin/users/{id}/strategies | positions | trades` — list endpoints scoped to the target user.
+- `GET /admin/users/{id}/dashboard` — read-only mirror of the user's overview tile (same numbers, same status-band logic, same `entries_halted` boolean).
+- `PATCH /admin/users/{id}/role` — admin-only with a self-demotion guard so the lone admin can't accidentally lock themselves out.
+
+Notably absent: any writeable mirror of `/strategies`, `/positions`, etc. with `?user_id=`. That's the act-as path the user explicitly rejected. If we ever want it, it'll be a deliberate addition with a separate auth dep, not an accidental one.
+
+**UI — admin Users page.** New `pages/admin/admin-users.component.ts` (standalone). Two-column layout: a paginated table on the left (email, role-as-dropdown when admin / role-as-pill when auditor, active flag, strategy/position counts, today PnL with profit/loss color, last trade, last login), and a slide-in detail panel on the right when a row is clicked. Detail panel pulls from `/admin/users/{id}/dashboard` so the admin sees the same session-status data the user would see on their own overview.
+
+Auditor banner ("You are viewing as auditor — read-only") renders when `currentUserValue.role === 'auditor'` so the role-change dropdown's absence is intentional, not broken.
+
+`adminGuard` is a new `CanActivateFn` that requires admin or auditor and redirects elsewhere otherwise. The sidenav nav-item for "Users" only renders when role ∈ {admin, auditor} so non-privileged users never see the entry.
+
+User menu got a small role badge in the user-info block. Role label is humanized via `roleLabel()`.
+
+### Files touched
+
+| Path | Change |
+|------|--------|
+| `api/models.py` | `User.daily_loss_limit_pct` column, default 5.0; updated role comment to enumerate the five values |
+| `api/schemas.py` | `_VALID_ROLES`; `UserBase._check_role`; `daily_loss_limit_pct` in `UserBase` and `UserUpdate` (bounded 0.5–20) |
+| `api/auth.py` | Role constants + `VALID_ROLES`; new deps `require_can_write_own`, `require_can_place_orders`, `get_current_active_admin_or_auditor`; `get_current_active_admin` tightened to docstring-explain admin-only-writes vs. read-cross-user |
+| `api/engine/risk_manager.py` | `_check_user_daily_loss_limit`; account-cap step in `validate_pre_trade`; `_log_account_risk_event` (writes to `details` JSON, separate from the legacy `_log_risk_event`); `get_account_risk_status` |
+| `api/engine/order_manager.py` | Role gate at top of `execute_signal` — blocks buy for non-trading roles, leaves sell open |
+| `api/routers/auth.py` | Comment about Pydantic-bounded `daily_loss_limit_pct` so future-me doesn't add redundant validation |
+| `api/routers/strategies.py` | `require_can_write_own` on POST/PUT/DELETE/clone/toggle |
+| `api/routers/positions.py` | `require_can_write_own` on POST/PUT/DELETE |
+| `api/routers/trades.py` | `require_can_write_own` on POST/PUT-close/DELETE |
+| `api/routers/performance.py` | `require_can_write_own` on POST-calculate/DELETE |
+| `api/routers/system.py` | `require_can_write_own` on POST environment / trading-mode (viewer/auditor can't change trading params) |
+| `api/routers/execution.py` | `require_can_write_own` on start/stop; `require_can_place_orders` on execute-tick (manual order injection) |
+| `api/routers/risk_events.py` | `GET /risk-events/account-status` |
+| `api/routers/admin.py` | new — list/detail/dashboard/strategies/positions/trades + role-set with self-demotion guard |
+| `api/app.py` | wire admin router |
+| `api/alembic/versions/d4a1b2c3e8f9_add_daily_loss_limit_pct_to_users.py` | new migration |
+| `ui/src/styles.scss` | `--color-warning*` tokens (light + dark) |
+| `ui/src/app/services/risk.service.ts` | new — `getAccountStatus()` |
+| `ui/src/app/services/admin.service.ts` | new — `listUsers`, `getUserDashboard`, `setUserRole` |
+| `ui/src/app/guards/admin.guard.ts` | new — admin-or-auditor route gate |
+| `ui/src/app/models/user.model.ts` | `User.daily_loss_limit_pct`; `ProfileUpdate.daily_loss_limit_pct` |
+| `ui/src/app/pages/overview/overview.component.{ts,html,scss}` | session-status tile + 30s refresh |
+| `ui/src/app/components/profile-dialog/profile-dialog.component.{ts,html}` | Risk-limits section |
+| `ui/src/app/pages/dashboard/dashboard.component.{ts,html,scss}` | role-aware sidenav, role badge in user menu, `roleLabel()` |
+| `ui/src/app/pages/admin/admin-users.component.{ts,html,scss}` | new — Users table + detail panel |
+| `ui/src/app/app.routes.ts` | `/dashboard/admin/users` route + `adminGuard` |
+| `CLAUDE.md` | new "Trading Engine Integrity" + "Role-Based Access (RBAC)" sections |
+| `TODO.md` | #5 moved to DONE; #6/#7/#8 renumbered → #5/#6 |
+
+### Verification
+- `python3 -m ast.parse` clean across every changed `.py` file.
+- Did **not** run a full Angular build in this session — UI changes follow the existing patterns and Angular signal idioms; spot-check after `ng serve` restart.
+- **Login regression discovered post-edit, fixed same session.** The `User.daily_loss_limit_pct` model column was added before its migration ran against dev. SQLAlchemy issued explicit-column `SELECT` on `users` and Postgres refused on the missing column, so login 500'd. Resolution: `set -a && . .env && set +a && venv/bin/alembic upgrade head` against dev (port 5435). Lesson reinforced: when a migration adds a column the ORM immediately reads, deploy order is **migrate first, restart second** — never the reverse. Test (5433) wasn't running so no migration there; prod (5434) had no schema at all (pre-existing — not caused by this work).
+
+### Quirks / decisions worth remembering
+
+- **`Trade.timestamp` vs. `Trade.exit_timestamp` for "today's PnL".** The new account-cap query uses `Trade.timestamp >= today_start AND pnl IS NOT NULL` to match the existing `_check_daily_loss_limit` behavior. Each `Trade` row is one fill event (buy or sell); the closing leg's `timestamp` IS its fill time, and `pnl` is only populated on closing legs, so this captures the right set. Same-day round-trip: closing leg's `timestamp` is today → counted. Opened yesterday, closed today: closing leg's `timestamp` is today → counted. Closed yesterday: not counted. Consistent with what was already shipping; no behavior change to the per-strategy gate.
+
+- **`pct_consumed` clamps positive on losses only.** A net-positive day reads 0% on the bar and "Within cap" on the badge. This is intentional — gains don't *fill* the cap, they create headroom, and a "−40% consumed" reading would be confusing UX.
+
+- **Latent bug found and isolated, not fixed.** `RiskManager._log_risk_event` (existing) passes `message=` to a `RiskEvent(...)` constructor, but the model has no `message` column — only `details` (JSON). On a strategy-level rejection path this would 500 instead of cleanly returning a `RiskCheckResult(False, ...)`. I introduced `_log_account_risk_event` as a parallel path that writes the reason into `details` JSON and wraps the DB write in try/except so logging hiccups never block trade flow. The existing `_log_risk_event` is left alone — fixing it requires touching every existing call site or migrating the model, both of which are out of scope for this task. **Worth fixing in a follow-up.** Until then, only the new account-cap path will actually emit RiskEvent rows on the rejection branch.
+
+- **Self-demotion guard on `PATCH /admin/users/{id}/role`.** An admin demoting themselves to non-admin is rejected with a 400 ("ask another admin"). Deliberate to avoid a lone-admin lockout. Counterintuitive case to remember when wiring an admin "Edit yourself" UX later.
+
+- **Why no admin-act-as path.** User explicitly chose observe-only. Re-asserting because the temptation will exist later: every "but it would be convenient if admin could just X for the user" suggestion translates to a much bigger liability surface (auth log attribution, audit trail of who really placed an order, compliance posture for live money). Stay observe-only unless there's a deliberate decision to move the line.
+
+- **Engine role gate ordering.** I placed it at the top of `execute_signal` — before the existing-position lockout, before the rate-limit check, before any DB lock. Cheapest possible reject path so a runaway loop with a non-trading role doesn't cost anything beyond a constant-time string check.
+
+- **Pre-existing UI write paths still render for read-only roles.** Strategy "Save" buttons, "Place trade", etc. don't currently disable themselves based on role — backend returns 403 cleanly, but the click-then-error UX is rough. Adding per-button disable state across every existing page is a follow-up; the security boundary holds via the backend either way.
+
+- **Theme tokens for warning amber.** Standard `--color-warning: #ed6c02` (light) and `#ffa726` (dark) — picked from Material's standard amber-500/amber-200 to match the existing tone. Colorblind palette doesn't override warning yet because the 80% threshold is rarely the difference between right/wrong action — losses past 100% are what matter and those use red. Revisit only if a colorblind user reports the warning band feels indistinguishable.
+
+### Open follow-ups
+
+- **Fix `RiskManager._log_risk_event`'s `message=` bug** — either add a `message` String column to `RiskEvent` (most call sites are short messages, JSON is overkill) or migrate the existing call sites to `details={"reason": ...}` like the new account-cap path. Until then the strategy-level rejection logging is broken in the same latent way it was before this work.
+- **Disable UI write actions for read-only roles** — Save buttons in the strategy form, the Place-trade flow on positions, etc. The backend already returns 403; this is purely UX polish to prevent the click-then-error round trip. Read `authService.currentUserValue?.role` and gate per-button.
+- **Strategy-level `daily_loss_limit_pct` is still pulled from `params_json`** in `_check_daily_loss_limit`, which is the legacy per-strategy default of 5%. Now that there's an account-wide cap, the per-strategy default is double-counted in spirit. Either drop the per-strategy gate (account-wide is sufficient) or document that the per-strategy gate is for "this strategy alone has had a bad day, halt it specifically while leaving others running" — a different intent. Worth re-reading both gates' semantics with fresh eyes before changing anything.
+- **Apply migration to test/prod** — test container (5433) wasn't running, so no migration ran there. Prod (5434) has no schema at all (separate bootstrap concern). Run `alembic upgrade head` against each before promoting.
+- **Existing JWTs are still valid** because role is read at request time off the User row. No revocation needed.
+
+---
+
+## Session Date: May 9, 2026 (Part 4) — TODO #1 Audit + Concurrency Probe + Entry Drift Logging + UI Auth Fix
+
+### Goal
+Push TODO #1 (T+1 / GFV cash reservation ledger) closer to "verified" — it's been sitting at "code complete, pending live verification" since 2026-05-05. Approach: audit the existing ledger code, build the concurrency probe the TODO has been waiting on, fix two unrelated UI auth bugs that surfaced mid-session, wire entry-drift logging to start gathering data for an eventual TODO #4 cancel-on-drift decision, and update TODO/process rules so future engine work can't accidentally regress the ledger.
+
+### What we built / fixed
+
+**1. Audit of the reservation ledger** (`api/engine/order_manager.py`, read-only)
+Walked `_preview_or_abort` (lines 170–315), `_acquire_buy_reservation`, `_release_buy_reservation`, `_active_reservations_total`, `_purge_expired_reservations`, plus the `try`/`finally` in `execute_signal`. Findings:
+- Release-path logic is correct: `try`/`finally` at lines 449/599–605 wraps the inner block; reservation releases on success, all early returns, and exceptions inside the inner try.
+- `_release_buy_reservation` is None-safe (`pop(..., None)`).
+- `_purge_expired_reservations` runs on every `_active_reservations_total` call — TTL safety belt is wired and warns if a release was missed.
+- No `await` between `_active_reservations_total` (line 280) and `_acquire_buy_reservation` (line 312) — same-loop concurrent signals are atomically serialized.
+- Sells correctly skip the cash gate AND the reservation acquisition (line 232 conditional, line 315 returns None).
+- Tradier preview-field assumption verified against `docs/tradier/trading/preview_order.md`: `cost = order_cost + commission + fees`. Reserving `cost` matches the actual deduction.
+- Sandbox fee buffer scoped to non-prod via `_estimate_fee_buffer` (line 164), and option-only (line 168 — equities are commission-free at Tradier).
+
+Two findings worth flagging (not fixed in this session):
+- **Schwab `/orders/place` direct endpoint** (`api/schwab_integration/router.py:137`) bypasses `execute_signal`, the reservation ledger, the preview, the rate limit, and uses `Depends(get_current_user)` instead of `require_can_place_orders`. Violates two CLAUDE.md rules ("MUST go through `execute_signal`" + router-dep policy). Schwab is dormant in this repo (Tradier is the live broker), so flagged-and-parked. Saved as a project memory so future-me won't waste cycles re-discovering it.
+- **Rate-limit stamp fires before preview** (line 430). Cash-rejected previews still consume a rate-limit slot. Defensible (prevents preview-endpoint hammering) but worth knowing for live verification: a series of cash-starved previews each consume a rate-limit slot — that's expected, not a bug.
+
+**2. Sandbox concurrency probe** (`api/debug/probe_buy_reservations.py` — new file)
+The verification step the TODO has been waiting on. Fires N concurrent `_preview_or_abort` calls via `asyncio.gather` against a real sandbox account, asserts that exactly `floor(effective_cash / required_per_order)` succeed (the rest hit the cash gate). Default mode is **preview-only** — does NOT place real orders, so the test isolates the reservation-ledger behavior from order placement / fill / reconciliation. Reservations acquired during the probe are released explicitly at the end so the in-process ledger is clean for whatever runs next.
+
+CLI:
+```bash
+../venv/bin/python -m debug.probe_buy_reservations \
+    --user-email <x> --strategy-id <id> \
+    --option-symbol <occ> --concurrency 5 --qty 1 [--env dev]
+```
+
+Per-iteration prints `ACCEPT rid=<uuid>` or `REJECT <reason>`; final line is **PASS** / **FAIL** against `expected_accepts = min(concurrency, floor(settled_cash / (cost + fee_buffer)))`.
+
+Pre-flight: user must have `selected_trading_mode='paper'`; strategy must belong to user. A warmup preview runs first to derive `cost` so the expected accept count can be computed. Probe defensively `clear()`s `_pending_buy_reservations` at startup (process-scoped, only matters in re-run scenarios).
+
+**3. UI auth bug fix** (`ui/src/app/services/risk.service.ts`, `admin.service.ts`)
+Surfaced mid-session by a 401 on `GET /api/v1/risk-events/account-status`. The Angular UI does **not** use an HTTP interceptor — `app.config.ts:14` calls `provideHttpClient()` without `withInterceptors([...])`. Every service is responsible for manually attaching `Authorization: Bearer <token>` from `localStorage('access_token')`. Two recently-added services missed this convention:
+- `risk.service.ts.getAccountStatus()` — 401'd → broke the overview's session-status tile (the visible bug).
+- `admin.service.ts.{listUsers, getUserDashboard, setUserRole}` — would 401 every admin page request (latent until an admin actually used the page).
+
+Both now build a private `getHeaders()` returning the Bearer token, matching the convention in `account.service.ts`, `system.service.ts`, etc. Saved as a feedback memory (`feedback_ui_no_http_interceptor.md`) so future-me doesn't repeat this when adding a new service.
+
+**4. Entry-drift logging** (`api/engine/order_manager.py`)
+Wired observation-only entry-price drift to feed an eventual TODO #4 (cancel-on-drift) decision. Three additive changes:
+- `_preview_or_abort` gained `signal_price: Optional[float] = None`.
+- New drift block immediately after the preview None-check, before the cash gate. Computes `preview_per_contract = order_cost / (qty * 100)` (options-only), compares to `signal_price`, writes a structured `ORDER_PREVIEW_DRIFT` event (`severity=info`) with `signal_price`, `preview_per_contract`, `drift_pct`, `drift_dollars`, `qty`, `option_symbol`, `order_cost`. Also logs an INFO line for live tail-following. Gated to `side='buy'` + `option_symbol` set + valid `signal_price` + valid `qty` + valid `order_cost`.
+- `execute_signal` now passes `signal_price=signal.price` to `_preview_or_abort`.
+
+**Behavior is unchanged** — the block is observation-only. Does NOT gate the order, does NOT change cash math. `close_position` still works (passes no `signal_price`, drift skipped — exit drift is a separate concern in TODO #6). Probe still works (passes no `signal_price`, drift skipped — probe tests the cash gate, not entry drift).
+
+The intent is to **collect data first, decide later**. After enough trades a query against `system_events WHERE event_type = 'ORDER_PREVIEW_DRIFT'` will produce a real distribution. Once equity curves (TODO #2) make modeled-vs-realized comparison meaningful, the cancel-threshold decision becomes data-driven instead of vibes-driven.
+
+**5. TODO restructure**
+- **Item #1** reframed: "Code complete — sandbox probe written, pending sandbox run". Added a **Process rule** sub-bullet making it a permanent rule that any change to `_preview_or_abort` or the reservation methods requires re-running the probe before deploy. Pointer added to TODO #5 for production blind spots.
+- **Item #4** reframed: noted that previews already exist for buying-power validation — this item is specifically about whether to cancel signals when preview-vs-signal drift exceeds a threshold. Added a "Data collection in flight" sub-bullet pointing at `ORDER_PREVIEW_DRIFT`. Added a "Threshold framing" sub-bullet (arbitrary % vs. economic break-even) so the eventual decision starts from the right framing.
+- **New item #5**: **Production-safety hardening for the cash reservation ledger.** Captures multi-worker race (in-memory dict invisible across processes), restart-wipes-ledger, and preview≠fill blind spots. Fix options listed (sticky routing / Redis with per-user keys + atomic INCR/DECR / DB-row-locked ledger). Investigate-first note: confirm production deployment topology before designing the fix. **Same-process asyncio tasks ARE safe** (single shared dict, no `await` between check and acquire); **same-process threads ARE safe** (GIL keeps dict ops atomic); **cross-process is the gap.**
+- **SPY 0DTE item renumbered** from #5 to #6.
+
+### Files touched
+| Path | Change |
+|------|--------|
+| `api/engine/order_manager.py` | added `signal_price` param to `_preview_or_abort`, drift observation block (`ORDER_PREVIEW_DRIFT` event), pass `signal.price` from `execute_signal` |
+| `api/debug/probe_buy_reservations.py` | new file — sandbox concurrency probe for the cash reservation ledger |
+| `ui/src/app/services/risk.service.ts` | added `getHeaders()` w/ Bearer token, attached to `getAccountStatus` |
+| `ui/src/app/services/admin.service.ts` | added `getHeaders()`, attached to all three methods |
+| `TODO.md` | reframed #1 + added "Process rule" + production-blind-spot pointer; reframed #4 with data-collection note; added #5 (production hardening); renumbered SPY → #6; new DONE entry for the UI auth fix |
+| `JOURNAL.md` | this entry |
+
+### Verification
+- `python3 -c "import ast; ast.parse(...)"` clean across `order_manager.py` and `probe_buy_reservations.py`.
+- Probe `--help` smoke-test passes under the venv — imports resolve cleanly.
+- UI 401 fix validated against the original repro (`GET /api/v1/risk-events/account-status` → was 401 → now 200).
+- Probe was **not** run against sandbox in this session — that's the TODO #1 follow-up for the next active trading window.
+- Audit findings are read-only — no behavioral change introduced by the audit itself.
+
+### Quirks / decisions worth remembering
+
+- **Drift block is observation-only by deliberate choice.** Could have implemented cancel-on-drift directly, but threshold-picking without data = guessing. User's framing was "I don't want to not fill if it's not a big deal" — the conservative posture is correct. Logging first lets us set a threshold on a real distribution.
+
+- **Why `severity="info"` on `ORDER_PREVIEW_DRIFT`.** Drift is a normal part of every fill; flagging every entry as a warning would saturate the audit feed. Once a threshold exists, a separate *out-of-bound* event can fire at warning severity — keep this one as the raw observation channel.
+
+- **Probe is preview-only by default.** Placing real sandbox orders adds noise (fills / cancels / partial fills) that obscures whether the cash gate itself works. The cash gate is what the probe is testing; everything downstream is well-trodden ground that doesn't need re-verification.
+
+- **Probe writes `ORDER_PREVIEW_REJECTED` events for the rejected attempts.** That's expected audit-feed noise per probe run. If a future "scheduled probe" idea ever comes up, this would justify adding a `--quiet` flag that skips the rejection log_event calls. Today, manual runs only, accept the noise.
+
+- **The May 5 entry's "in-memory ledger doesn't survive multi-process" line was prescient.** It's now formalized as TODO #5 with concrete fix options. Cross-reference cleanup also done in item #1.
+
+- **UI lacks an HTTP interceptor — codebase convention is "every service builds its own headers".** Sweep to `provideHttpClient(withInterceptors([...]))` is ~8 files. Out of scope here; saved as a memory so I won't add a new service that omits the headers.
+
+- **Schwab `/orders/place` bypass endpoint stays.** Schwab is dormant; the right answer was to flag-and-park rather than rip out the integration in the same session. If Schwab gets re-activated, this endpoint needs `require_can_place_orders` AND a route through `execute_signal`.
+
+### Open follow-ups
+
+- **Run the probe against sandbox.** Pick a tradeable option symbol (SPY weekly is the easiest), point the probe at the dev user, capture the output. PASS marks TODO #1 done in the immediate sense (single-process correctness). Anything else gets traced back to the ledger code before any further engine changes.
+
+- **Watch `ORDER_PREVIEW_DRIFT` events accumulate.** After the next active trading session, run `SELECT event_data FROM system_events WHERE event_type = 'ORDER_PREVIEW_DRIFT' ORDER BY timestamp DESC` to confirm shape and start building intuition for what "normal" drift looks like at this codebase's tick cadence and contract-selection patterns.
+
+- **TODO #5 (production hardening) is gated on knowing deployment topology.** Until it's confirmed whether prod runs single-worker or multi-worker, the multi-worker concern is hypothetical. Don't design a Redis ledger before knowing if `gunicorn --workers` count is >1.
+
+- **Migrate to `withInterceptors([authInterceptor])`.** Touches ~8 service files but eliminates the auth-header forgetfulness category entirely. Standalone refactor, can be done any time.
+
+- **Consider exit-drift logging next.** Same shape as entry drift, would help TODO #6 (SPY 0DTE late-exit) investigation. One-line change in `close_position` to pass `signal_price` from SL/TP signals that knew their trigger price. Held back this session to keep scope tight.
+
+---

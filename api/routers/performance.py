@@ -11,7 +11,7 @@ import math
 from database import get_db
 from models import PerformanceMetrics, User, Strategy, Trade
 from schemas import PerformanceMetricsResponse
-from auth import get_current_user
+from auth import get_current_user, require_can_write_own
 
 router = APIRouter(prefix="/performance", tags=["Performance Metrics"])
 
@@ -94,7 +94,7 @@ def calculate_performance_metrics(
     strategy_id: int,
     period: str = Query(..., description="Period to calculate (daily/weekly/monthly/all_time)"),
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
+    current_user: User = Depends(require_can_write_own)
 ):
     """
     Calculate and store performance metrics for a strategy.
@@ -276,7 +276,7 @@ def calculate_performance_metrics(
 def delete_performance_metric(
     metrics_id: int,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
+    current_user: User = Depends(require_can_write_own)
 ):
     """
     Delete a performance metrics record.

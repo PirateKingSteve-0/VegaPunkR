@@ -12,6 +12,52 @@
     {{ error() }}
   </div>
 
+  <!-- Today's session status: how close are we to the account-wide daily loss cap. -->
+  <ng-container *ngIf="accountRisk() as risk">
+    <mat-card
+      class="session-status"
+      [class.session-status--ok]="risk.risk_status === 'OK'"
+      [class.session-status--warning]="risk.risk_status === 'WARNING'"
+      [class.session-status--halted]="risk.risk_status === 'HALTED'">
+      <mat-card-content>
+        <div class="session-status-row">
+          <div class="session-status-headline">
+            <div class="session-status-label">Today's Session</div>
+            <div class="session-status-pnl">
+              <mat-icon>{{ risk.today_pnl >= 0 ? 'trending_up' : 'trending_down' }}</mat-icon>
+              <span class="pnl-value">{{ formatSignedCurrency(risk.today_pnl) }}</span>
+              <span class="pnl-sub">realized {{ formatSignedCurrency(risk.realized_pnl) }} · unrealized {{ formatSignedCurrency(risk.unrealized_pnl) }}</span>
+            </div>
+          </div>
+
+          <div class="session-status-cap">
+            <div class="cap-pct">{{ risk.pct_consumed.toFixed(0) }}%</div>
+            <div class="cap-label">of cap consumed</div>
+          </div>
+
+          <div class="session-status-remaining">
+            <div class="remaining-value">{{ formatCurrency(risk.daily_loss_remaining) }}</div>
+            <div class="remaining-label">remaining before halt</div>
+          </div>
+
+          <div class="session-status-badge">
+            <mat-icon>{{ risk.risk_status === 'HALTED' ? 'block' : risk.risk_status === 'WARNING' ? 'warning' : 'check_circle' }}</mat-icon>
+            <span>{{ risk.risk_status === 'HALTED' ? 'Entries halted' : risk.risk_status === 'WARNING' ? 'Approaching cap' : 'Within cap' }}</span>
+          </div>
+        </div>
+
+        <div class="session-status-bar">
+          <div class="session-status-bar-fill" [style.width.%]="riskBarPct()"></div>
+        </div>
+
+        <div class="session-status-footnote" *ngIf="risk.risk_status === 'HALTED'">
+          New entries are blocked across all of your strategies. Existing
+          positions can still be closed normally; the cap resets at midnight ET.
+        </div>
+      </mat-card-content>
+    </mat-card>
+  </ng-container>
+
   <div class="stats-grid">
     <mat-card *ngFor="let stat of stats; let i = index" class="stat-card">
       <mat-card-content>

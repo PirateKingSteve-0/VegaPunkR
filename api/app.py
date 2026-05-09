@@ -13,7 +13,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from config import settings
-from routers import auth, strategies, positions, trades, performance, risk_events, system, execution, trading, events
+from routers import auth, strategies, positions, trades, performance, risk_events, system, execution, trading, events, admin
 from schwab_integration import router as schwab_router
 from tradier_integration import router as tradier_router
 
@@ -25,9 +25,11 @@ async def lifespan(app: FastAPI):
     # --------------- startup ---------------
     from engine.tradier_stream_manager import get_stream_manager
     from engine.stream_driven_worker import get_stream_driven_worker
+    from services.email_report_scheduler import get_email_report_scheduler
 
     stream_mgr = get_stream_manager()
     worker = get_stream_driven_worker()
+    email_scheduler = get_email_report_scheduler()
 
     try:
         await stream_mgr.start()
@@ -39,10 +41,19 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.error(f"Stream worker failed to start (non-fatal): {e}")
 
+    try:
+        email_scheduler.start()
+    except Exception as e:
+        logger.error(f"Email report scheduler failed to start (non-fatal): {e}")
+
     logger.info("VegaPunkR startup complete")
     yield
 
     # --------------- shutdown ---------------
+    try:
+        email_scheduler.stop()
+    except Exception:
+        pass
     try:
         await worker.stop()
     except Exception:
@@ -107,6 +118,7 @@ app.include_router(schwab_router.router, prefix=settings.API_V1_PREFIX)
 app.include_router(tradier_router.router, prefix=settings.API_V1_PREFIX)
 app.include_router(trading.router, prefix=settings.API_V1_PREFIX)
 app.include_router(events.router, prefix=settings.API_V1_PREFIX)
+app.include_router(admin.router, prefix=settings.API_V1_PREFIX)
 
 
 if __name__ == "__main__":

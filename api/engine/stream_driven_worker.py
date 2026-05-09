@@ -20,6 +20,7 @@ from engine.strategy_executor import StrategyExecutor
 from engine.stream_router import get_stream_router
 from engine.tradier_stream_manager import get_stream_manager
 from engine.event_logger import log_event
+from notifications.discord import notify_position_closed
 from utils.market_hours import is_market_open
 
 logger = logging.getLogger(__name__)
@@ -27,6 +28,11 @@ logger = logging.getLogger(__name__)
 _GREEKS_REFRESH_INTERVAL = timedelta(minutes=5)
 _MARKET_CLOSED_LOG_INTERVAL = timedelta(minutes=1)
 _RECONCILE_INTERVAL = timedelta(seconds=60)
+# Per-strategy "still alive" heartbeat at INFO. Without this, an open
+# position evaluating cleanly (no exit signal) produces zero output, since
+# the no-exit log in strategy_executor is DEBUG. Heartbeat surfaces loop
+# liveness, eval cadence, and current quote state without flooding logs.
+_HEARTBEAT_INTERVAL = timedelta(seconds=30)
 # Minimum interval between strategy evaluations on the same strategy. Stream
 # ticks can arrive 10+ per second on liquid names; without this, every tick
 # triggers a fresh executor pass before the previous fill has settled, which
@@ -237,6 +243,7 @@ class StreamDrivenWorker:
                 last_closed_reconcile_at: Optional[datetime] = None
                 last_eval_at: Optional[datetime] = None
                 last_forced_reconcile_at: Optional[datetime] = None
+                last_heartbeat_at: Optional[datetime] = None
 
                 try:
                     while self._running and strategy.is_active:
@@ -270,6 +277,32 @@ class StreamDrivenWorker:
                             continue
 
                         state.apply(event)
+
+                        # Heartbeat — proves the loop is alive between entries/exits.
+                        # Any market-hours event keeps this ticking; after-hours and
+                        # 60s queue-idle have their own log paths.
+                        now_hb = datetime.utcnow()
+                        if (
+                            last_heartbeat_at is None
+                            or now_hb - last_heartbeat_at >= _HEARTBEAT_INTERVAL
+                        ):
+                            open_count = db.query(Position).filter(
+                                Position.strategy_id == strategy_id,
+                                Position.qty > 0,
+                            ).count()
+                            last_eval_age = (
+                                f"{(now_hb - last_eval_at).total_seconds():.1f}s"
+                                if last_eval_at else "never"
+                            )
+                            quote_str = (
+                                f" option={state.option_symbol} bid={state.option_bid:.2f} ask={state.option_ask:.2f}"
+                                if state.option_symbol else ""
+                            )
+                            logger.info(
+                                f"Strategy {strategy_id} heartbeat: {open_count} open, "
+                                f"underlying={state.underlying_price:.2f}, last_eval={last_eval_age}{quote_str}"
+                            )
+                            last_heartbeat_at = now_hb
 
                         # Fire signal check on every underlying trade tick with valid price
                         if (
@@ -547,6 +580,13 @@ class StreamDrivenWorker:
                     f"Strategy {strategy_id}: {contract} not found in Tradier — "
                     "position was manually closed externally"
                 )
+                # Snapshot pre-close state so we can send an approximate
+                # manual-close notification (broker-side fill price is unknown
+                # here, so we use the latest streamed price as the exit).
+                qty_closed = position.qty
+                exit_price = position.current_price or position.avg_entry_price
+                approx_pnl = (exit_price - position.avg_entry_price) * qty_closed
+
                 position.qty = 0
                 position.unrealized_pnl = 0.0
                 db.commit()
@@ -561,6 +601,19 @@ class StreamDrivenWorker:
                     severity="warning",
                     event_data={"option_symbol": contract},
                 )
+                try:
+                    user = position.user
+                    notify_position_closed(
+                        user_prefs=user.notification_preferences if user else None,
+                        symbol=position.symbol,
+                        qty=qty_closed,
+                        price=exit_price,
+                        pnl=approx_pnl,
+                        strategy_name="Manual close (broker)",
+                        option_symbol=contract,
+                    )
+                except Exception as e:
+                    logger.warning(f"Discord notify (manual close) failed: {e}")
 
                 # Clear so next entry picks a fresh contract
                 state.option_symbol = None
