@@ -139,6 +139,39 @@
     .delete-action {
       color: var(--color-loss);
     }
+
+    .equity-spark {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 4px 6px;
+      border-radius: 4px;
+      cursor: pointer;
+      transition: background-color 0.15s ease;
+
+      &:hover {
+        background-color: var(--surface-hover);
+      }
+
+      .equity-spark-chart {
+        width: 100px;
+        height: 28px;
+      }
+
+      .equity-spark-value {
+        font-size: 12px;
+        font-variant-numeric: tabular-nums;
+        color: var(--text-muted);
+
+        &.profit { color: var(--color-profit); }
+        &.loss { color: var(--color-loss); }
+      }
+    }
+
+    .equity-spark-empty {
+      color: var(--text-faint);
+      font-size: 13px;
+    }
   }
 }
 

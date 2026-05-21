@@ -55,10 +55,6 @@ export const routes: Routes = [
         loadComponent: () => import('./pages/performance/performance.component').then(m => m.PerformanceComponent)
       },
       {
-        path: 'risk',
-        loadComponent: () => import('./pages/risk/risk.component').then(m => m.RiskComponent)
-      },
-      {
         path: 'admin/users',
         canActivate: [adminGuard],
         loadComponent: () => import('./pages/admin/admin-users.component').then(m => m.AdminUsersComponent)

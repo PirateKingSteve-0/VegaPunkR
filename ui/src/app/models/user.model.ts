@@ -26,6 +26,12 @@ export interface ProfileUpdate {
   current_password?: string;
   new_password?: string;
   daily_loss_limit_pct?: number;
+  account_size_usd?: number;
+  max_trade_percentage?: number;
+  trading_window_enabled?: boolean;
+  trading_window_start?: string;
+  trading_window_end?: string;
+  notification_preferences?: NotificationPreferences;
 }
 
 export interface User {
@@ -34,6 +40,8 @@ export interface User {
   name: string;
   role?: string;
   daily_loss_limit_pct?: number;
+  account_size_usd?: number;
+  max_trade_percentage?: number;
   trading_window_enabled?: boolean;
   trading_window_start?: string;
   trading_window_end?: string;

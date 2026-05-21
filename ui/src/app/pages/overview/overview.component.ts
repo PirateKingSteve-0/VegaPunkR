@@ -1,4 +1,4 @@
-import { Component, OnInit, OnDestroy, inject, signal } from '@angular/core';
+import { Component, OnInit, OnDestroy, inject, signal, ChangeDetectionStrategy } from '@angular/core';
 import { CommonModule } from '@angular/common';
 import { MatCardModule } from '@angular/material/card';
 import { MatIconModule } from '@angular/material/icon';
@@ -19,14 +19,14 @@ import { RiskService, AccountRiskStatus } from '../../services/risk.service';
     MatButtonModule
   ],
   templateUrl: './overview.component.html',
-  styleUrls: ['./overview.component.scss']
+  styleUrls: ['./overview.component.scss'],
+  changeDetection: ChangeDetectionStrategy.OnPush,
 })
 export class OverviewComponent implements OnInit, OnDestroy {
   private accountService = inject(AccountService);
   private systemService = inject(SystemService);
   private riskService = inject(RiskService);
   private settingsSubscription?: Subscription;
-  private accountStatusInterval?: ReturnType<typeof setInterval>;
 
   // Reactive signals for stat values
   portfolioValue = signal('$0.00');
@@ -53,10 +53,6 @@ export class OverviewComponent implements OnInit, OnDestroy {
     // Load initial data
     this.loadAccountData();
     this.loadAccountRisk();
-    // Refresh the session-status tile every 30s. The cap is computed from
-    // realized+unrealized PnL, and unrealized PnL changes whenever option
-    // marks update — a stale tile would understate how close to halt we are.
-    this.accountStatusInterval = setInterval(() => this.loadAccountRisk(), 30_000);
 
     // Subscribe to environment/trading mode changes and reload data
     // Skip the first emission to avoid double-loading on init
@@ -82,9 +78,6 @@ export class OverviewComponent implements OnInit, OnDestroy {
 
   ngOnDestroy() {
     this.settingsSubscription?.unsubscribe();
-    if (this.accountStatusInterval) {
-      clearInterval(this.accountStatusInterval);
-    }
   }
 
   loadAccountRisk() {

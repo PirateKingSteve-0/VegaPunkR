@@ -14,9 +14,6 @@ import { MatDialog, MatDialogModule } from '@angular/material/dialog';
 import { AuthService } from '../../services/auth.service';
 import { SystemService, EnvironmentSettings } from '../../services/system.service';
 import { ThemeService } from '../../services/theme.service';
-import { TradingWindowDialogComponent } from '../../components/trading-window-dialog/trading-window-dialog.component';
-import { DiscordNotificationsDialogComponent } from '../../components/discord-notifications-dialog/discord-notifications-dialog.component';
-import { EmailReportsDialogComponent } from '../../components/email-reports-dialog/email-reports-dialog.component';
 import { ProfileDialogComponent } from '../../components/profile-dialog/profile-dialog.component';
 
 @Component({
@@ -62,7 +59,6 @@ export class DashboardComponent implements OnInit {
     { icon: 'bookmarks', label: 'Watchlists', route: '/dashboard/watchlists', roles: null },
     { icon: 'event_note', label: 'Events', route: '/dashboard/events', roles: null },
     { icon: 'analytics', label: 'Performance', route: '/dashboard/performance', roles: null },
-    { icon: 'warning', label: 'Risk', route: '/dashboard/risk', roles: null },
     { icon: 'admin_panel_settings', label: 'Users', route: '/dashboard/admin/users', roles: ['admin', 'auditor'] },
   ];
 
@@ -232,30 +228,13 @@ export class DashboardComponent implements OnInit {
     return mode.charAt(0).toUpperCase() + mode.slice(1);
   }
 
-  openTradingWindowDialog(): void {
-    this.dialog.open(TradingWindowDialogComponent, {
-      width: '420px',
-      autoFocus: false,
-    });
-  }
-
-  openDiscordNotificationsDialog(): void {
-    this.dialog.open(DiscordNotificationsDialogComponent, {
-      width: '480px',
-      autoFocus: false,
-    });
-  }
-
-  openEmailReportsDialog(): void {
-    this.dialog.open(EmailReportsDialogComponent, {
-      width: '500px',
-      autoFocus: false,
-    });
-  }
-
-  openProfileDialog(): void {
+  openSettingsDrawer(): void {
     this.dialog.open(ProfileDialogComponent, {
-      width: '500px',
+      width: '520px',
+      maxWidth: '100vw',
+      height: '100vh',
+      position: { right: '0', top: '0' },
+      panelClass: 'settings-drawer-panel',
       autoFocus: false,
     });
   }

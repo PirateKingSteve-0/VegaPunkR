@@ -153,3 +153,20 @@ body {
   color: var(--text);
   transition: background-color 150ms ease, color 150ms ease;
 }
+
+// Right-edge drawer styling for ProfileDialog opened via MatDialog
+.settings-drawer-panel {
+  height: 100vh !important;
+  max-height: 100vh !important;
+
+  .mat-mdc-dialog-container,
+  .mdc-dialog__surface {
+    border-radius: 0 !important;
+    height: 100vh;
+    max-height: 100vh;
+  }
+
+  .mat-mdc-dialog-surface {
+    border-radius: 0 !important;
+  }
+}

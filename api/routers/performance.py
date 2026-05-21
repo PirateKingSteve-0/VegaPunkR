@@ -66,6 +66,54 @@ def get_performance_metrics(
     return metrics
 
 
+@router.get("/equity-curves")
+def get_equity_curves(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """
+    Per-strategy lifetime realized-PnL equity curves for the current user.
+
+    Each curve is the running sum of `Trade.pnl` over the strategy's closing
+    trades, ordered by `exit_timestamp` ascending, starting from zero. Only
+    closed trades (those with both `exit_timestamp` and `pnl` populated) are
+    included; open positions don't contribute because their PnL is unrealized.
+
+    Shape:
+        [{strategy_id, name, points: [{t, cum_pnl, trade_pnl}, ...]}, ...]
+    """
+    strategies = db.query(Strategy).filter(
+        Strategy.user_id == current_user.id
+    ).order_by(Strategy.id.asc()).all()
+
+    result = []
+    for s in strategies:
+        trades = db.query(Trade).filter(
+            Trade.strategy_id == s.id,
+            Trade.user_id == current_user.id,
+            Trade.exit_timestamp.isnot(None),
+            Trade.pnl.isnot(None),
+        ).order_by(Trade.exit_timestamp.asc()).all()
+
+        cum = 0.0
+        points = []
+        for t in trades:
+            cum += t.pnl or 0.0
+            points.append({
+                "t": t.exit_timestamp.isoformat(),
+                "cum_pnl": round(cum, 2),
+                "trade_pnl": round(t.pnl or 0.0, 2),
+            })
+
+        result.append({
+            "strategy_id": s.id,
+            "name": s.name,
+            "points": points,
+        })
+
+    return result
+
+
 @router.get("/{metrics_id}", response_model=PerformanceMetricsResponse)
 def get_performance_metric(
     metrics_id: int,

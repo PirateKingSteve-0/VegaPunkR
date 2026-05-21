@@ -1,4 +1,4 @@
-import { Component, OnInit, OnDestroy } from '@angular/core';
+import { Component, OnInit, OnDestroy, ChangeDetectionStrategy, ChangeDetectorRef } from '@angular/core';
 import { CommonModule, CurrencyPipe } from '@angular/common';
 import { HttpClient, HttpHeaders } from '@angular/common/http';
 import { MatTableModule } from '@angular/material/table';
@@ -10,8 +10,7 @@ import { MatProgressSpinnerModule } from '@angular/material/progress-spinner';
 import { MatBadgeModule } from '@angular/material/badge';
 import { MatDialog, MatDialogModule } from '@angular/material/dialog';
 import { MatTooltipModule } from '@angular/material/tooltip';
-import { interval, Subscription } from 'rxjs';
-import { switchMap, startWith } from 'rxjs/operators';
+import { Subscription } from 'rxjs';
 import { environment } from '../../../environments/environment';
 import { PositionChartDialogComponent } from './position-chart-dialog/position-chart-dialog.component';
 
@@ -44,7 +43,8 @@ export interface DbPosition {
     CurrencyPipe,
   ],
   templateUrl: './positions.component.html',
-  styleUrls: ['./positions.component.scss']
+  styleUrls: ['./positions.component.scss'],
+  changeDetection: ChangeDetectionStrategy.OnPush,
 })
 export class PositionsComponent implements OnInit, OnDestroy {
   displayedColumns: string[] = ['symbol', 'quantity', 'entryPrice', 'currentPrice', 'pnl', 'pnlPercent', 'openedAt'];
@@ -52,9 +52,12 @@ export class PositionsComponent implements OnInit, OnDestroy {
   loading = true;
   private sub?: Subscription;
   private apiUrl = `${environment.apiUrl}/trading/positions`;
-  poll_interval: number = 10000;
 
-  constructor(private http: HttpClient, private dialog: MatDialog) {}
+  constructor(
+    private http: HttpClient,
+    private dialog: MatDialog,
+    private cdr: ChangeDetectorRef,
+  ) {}
 
   openChart(p: DbPosition): void {
     this.dialog.open(PositionChartDialogComponent, {
@@ -70,15 +73,27 @@ export class PositionsComponent implements OnInit, OnDestroy {
   }
 
   ngOnInit(): void {
-    this.sub = interval(this.poll_interval).pipe(
-      startWith(0),
-      switchMap(() => this.http.get<DbPosition[]>(this.apiUrl, { headers: this.headers() }))
-    ).subscribe({
+    this.loadPositions();
+  }
+
+  refresh(): void {
+    this.loadPositions();
+  }
+
+  private loadPositions(): void {
+    this.sub?.unsubscribe();
+    this.loading = true;
+    this.cdr.markForCheck();
+    this.sub = this.http.get<DbPosition[]>(this.apiUrl, { headers: this.headers() }).subscribe({
       next: (positions) => {
         this.positions = positions.filter(p => p.qty > 0);
         this.loading = false;
+        this.cdr.markForCheck();
       },
-      error: () => { this.loading = false; }
+      error: () => {
+        this.loading = false;
+        this.cdr.markForCheck();
+      }
     });
   }
 

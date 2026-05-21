@@ -76,4 +76,22 @@ export class StrategyService {
       headers: this.getHeaders()
     });
   }
+
+  getEquityCurves(): Observable<EquityCurve[]> {
+    return this.http.get<EquityCurve[]>(`${this.apiUrl}/performance/equity-curves`, {
+      headers: this.getHeaders()
+    });
+  }
+}
+
+export interface EquityCurvePoint {
+  t: string;          // ISO timestamp of trade close
+  cum_pnl: number;    // running sum of realized PnL from zero
+  trade_pnl: number;  // pnl of the individual trade at this point
+}
+
+export interface EquityCurve {
+  strategy_id: number;
+  name: string;
+  points: EquityCurvePoint[];
 }

@@ -1,0 +1,306 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>VegaPunkR Engine Flow — Overview</title>
+<link rel="stylesheet" href="_diagram-styles.css">
+</head>
+<body>
+
+<div class="print-hint no-print">
+  <strong>Print tip:</strong> Open in browser → <span class="kbd">Cmd/Ctrl + P</span> →
+  Save as PDF. Use <strong>portrait</strong>, scale 100%, margins "Default". Two pages.
+  Then print on paper and mark up with pen/pencil.
+</div>
+
+<!-- ============================================================== -->
+<!-- PAGE 1: Engine flow                                             -->
+<!-- ============================================================== -->
+<section class="page">
+  <h1>VegaPunkR — Trading Engine Flow</h1>
+  <div class="subtitle">
+    Cash-only account · No margin · GFV is the real constraint · Exits are sacred
+  </div>
+
+  <div class="legend">
+    <span><span class="swatch" style="background:#fffbe6"></span>gate (can reject)</span>
+    <span><span class="swatch" style="background:#fff0e0;border-width:2px"></span>cash / GFV (critical)</span>
+    <span><span class="swatch" style="background:#f0fff0"></span>broker call</span>
+    <span><span class="swatch" style="background:#eef6ff"></span>exit path</span>
+    <span><span class="swatch" style="background:#f6f6f6"></span>state change</span>
+  </div>
+
+  <div class="row" style="align-items:flex-start;">
+
+    <!-- ============== ENTRY PATH (left column, ~60%) ============== -->
+    <div class="col" style="flex:1.6">
+      <h2 style="margin-top:0">Entry path · buy</h2>
+
+      <div class="box">
+        <div class="title">1. Market tick arrives</div>
+        <div class="ref">tradier_stream_manager.py → stream_driven_worker.py</div>
+        <ul><li>Tradier WS pushes quote/trade for symbol</li></ul>
+      </div>
+      <div class="arrow">▼</div>
+
+      <div class="box gate">
+        <div class="title">2. Entry-window gate</div>
+        <div class="ref">signal_generator.py:114–150</div>
+        <ul>
+          <li>Strategy: <code>open + entry_after_open_minutes</code></li>
+          <li>Account: <code>user.trading_window_start</code> (if enabled)</li>
+          <li><strong>Effective start = LATER of the two</strong> (never widens)</li>
+          <li>If <code>now &gt;= trading_window_end</code> → block entry</li>
+        </ul>
+      </div>
+      <div class="arrow">▼</div>
+
+      <div class="box gate">
+        <div class="title">3. Signal indicators</div>
+        <div class="ref">signal_generator.check_entry_signal:152–270</div>
+        <ul>
+          <li>EMA(9): price &gt; EMA (long) or &lt; EMA (short)</li>
+          <li>VWAP: price on the right side of VWAP</li>
+          <li>Volume spike: <code>vol / avg20 &gt;= min_volume_multiplier</code></li>
+          <li>Delta in <code>[delta_min, delta_max]</code></li>
+          <li>Liquidity: open_interest, bid-ask spread</li>
+          <li>$TICK (optional, off by default)</li>
+          <li>Confirmation: ≥2 indicators must align</li>
+        </ul>
+      </div>
+      <div class="arrow">▼</div>
+
+      <div class="box gate">
+        <div class="title">4. Risk validation</div>
+        <div class="ref">risk_manager.validate_pre_trade:109–218</div>
+        <ul>
+          <li>Strategy active? Mode matches user?</li>
+          <li><strong>Account-wide daily loss cap</strong> (sum of realized + unrealized)</li>
+          <li>Strategy daily loss · max drawdown</li>
+          <li>Position cap: count of open <code>(strategy, symbol)</code> rows</li>
+          <li>Size sanity: <code>qty ≤ calculated_qty × 1.5</code></li>
+        </ul>
+        <div class="note">All loss caps are <strong>entries-only</strong>: <code>side='sell'</code> is auto-approved.</div>
+      </div>
+      <div class="arrow">▼</div>
+
+      <div class="box gate">
+        <div class="title">5. Role gate</div>
+        <div class="ref">order_manager.execute_signal:416–439</div>
+        <ul>
+          <li>Buys: only <code>user</code> or <code>admin</code></li>
+          <li>Blocks: <code>viewer</code>, <code>auditor</code>, <code>strategy_author</code></li>
+          <li><strong>Sells bypass this gate</strong> — closeable on demotion</li>
+        </ul>
+      </div>
+      <div class="arrow">▼</div>
+
+      <div class="box gate">
+        <div class="title">6. Lock-out + rate limit</div>
+        <div class="ref">order_manager.py:442–502</div>
+        <ul>
+          <li>Existing position on <code>(user, strategy, symbol)</code> → skip entry (row lock)</li>
+          <li>Per <code>(user, symbol)</code> throttle: 5.0 s minimum interval</li>
+        </ul>
+      </div>
+      <div class="arrow">▼</div>
+
+      <div class="box cash critical">
+        <div class="title">7. CASH / GFV GATE  ★</div>
+        <div class="ref">order_manager._preview_or_abort:298–382</div>
+        <ul>
+          <li>Tradier preview returns <code>cost</code> (= order_cost + commission + fees)</li>
+          <li>Fetch <code>balances.cash.cash_available</code> (settled cash only)</li>
+          <li>Sandbox adds <code>fee_buffer = qty × $0.65</code> (parity with live)</li>
+          <li><code>required = cost + fee_buffer</code></li>
+          <li><code>effective_avail = settled_cash − Σ pending reservations</code></li>
+          <li><strong>If <code>required &gt; effective_avail</code> → REJECT</strong></li>
+          <li>Else: acquire reservation UUID (60 s TTL), proceed</li>
+        </ul>
+        <div class="note">This is what prevents GFV: buying with unsettled funds is impossible because <code>cash_available</code> already excludes them.</div>
+      </div>
+      <div class="arrow">▼</div>
+
+      <div class="box broker">
+        <div class="title">8. Place order</div>
+        <div class="ref">trading_client_manager → Tradier (or Alpaca paper)</div>
+        <ul><li>Market order; routed by <code>user.selected_trading_mode</code></li></ul>
+      </div>
+      <div class="arrow">▼</div>
+
+      <div class="box broker">
+        <div class="title">9. Poll fill</div>
+        <div class="ref">order_manager.py:543–607</div>
+        <ul><li>Loop until terminal: filled / rejected / canceled / expired</li></ul>
+      </div>
+      <div class="arrow">▼</div>
+
+      <div class="box terminal">
+        <div class="title">10. Record + reconcile</div>
+        <div class="ref">order_manager.py:609–674</div>
+        <ul>
+          <li>Insert <code>Trade</code> row</li>
+          <li>Create/update <code>Position</code> (the source of truth for "are we long X")</li>
+          <li><strong><code>finally:</code> release reservation UUID</strong></li>
+        </ul>
+      </div>
+    </div>
+
+    <!-- ============== EXIT PATH (right column, ~40%) ============== -->
+    <div class="col" style="flex:1.1">
+      <h2 style="margin-top:0">Exit path · sell</h2>
+
+      <div class="box terminal">
+        <div class="title">Open position</div>
+        <div class="ref">Position row · peak_price / trough_price tracked per tick</div>
+      </div>
+      <div class="arrow">▼ each tick</div>
+
+      <div class="box exit">
+        <div class="title">check_exit_signal</div>
+        <div class="ref">signal_generator.py:298–457</div>
+        <div class="note">First trigger wins. Order matters:</div>
+        <ul>
+          <li><strong>1. Take profit:</strong> <code>pnl_pct ≥ TP%</code></li>
+          <li><strong>2. Stop loss:</strong> <code>pnl_pct ≤ −SL%</code></li>
+          <li><strong>3. Trailing stop:</strong> after <code>pnl_pct ≥ activation</code>,
+            exit if <code>price ≤ peak × (1 − dist/100)</code></li>
+          <li><strong>4. Max hold time:</strong> <code>elapsed ≥ max_hold_minutes</code></li>
+          <li><strong>5. Time of day:</strong> EARLIEST of
+            <code>close − exit_before_close_minutes</code> and
+            <code>user.trading_window_end</code></li>
+        </ul>
+      </div>
+      <div class="arrow">▼ sell signal</div>
+
+      <div class="box broker">
+        <div class="title">close_position</div>
+        <div class="ref">order_manager.py:1084–1346</div>
+        <ul>
+          <li>Same rate limit, preview path</li>
+          <li><strong>No role gate · no cash gate · no daily-loss block</strong></li>
+          <li>Sells generate cash → never insufficient-cash rejected</li>
+        </ul>
+      </div>
+      <div class="arrow">▼</div>
+
+      <div class="box terminal">
+        <div class="title">Fill → position.qty = 0</div>
+        <div class="ref">order_manager.py:1200–1297</div>
+        <ul>
+          <li>Reconcile exit reason</li>
+          <li>P&L realized into account</li>
+        </ul>
+      </div>
+
+      <h3 style="margin-top:14pt">Composition rule</h3>
+      <div class="box" style="background:#f6f6f6">
+        <ul>
+          <li><strong>Entry windows</strong>: most-restrictive wins (LATER start, EARLIER end).</li>
+          <li><strong>Caps</strong>: account-wide cap is checked before strategy cap.</li>
+          <li><strong>Exits</strong>: every entry gate falls through for sells.</li>
+        </ul>
+      </div>
+    </div>
+
+  </div>
+
+  <div class="verify">
+    <h3>Verify by hand — circle ✓ / ✗ and annotate</h3>
+    <span class="check">Buys check <strong>settled cash</strong> (<code>cash.cash_available</code>), not total/margin BP. <span class="blank"></span></span>
+    <span class="check">Sells skip role gate, cash gate, daily-loss cap. (exits sacred) <span class="blank"></span></span>
+    <span class="check">Concurrent buys: 2nd signal sees subtracted <code>effective_avail</code>. (no double-spend) <span class="blank"></span></span>
+    <span class="check">Entry window: <code>max(strategy_start, account_start)</code>. Exit: <code>min(strategy_end, account_end)</code>. <span class="blank"></span></span>
+    <span class="check">Reservation released in <code>finally</code> on every terminal outcome. <span class="blank"></span></span>
+    <span class="check">TTL safety belt: 60 s expiry logs a warning if release path was missed. <span class="blank"></span></span>
+  </div>
+
+  <div class="footer">
+    <span>VegaPunkR · engine_flow_overview · page 1 of 2</span>
+    <span>Source: <code>api/engine/{order_manager,risk_manager,signal_generator}.py</code></span>
+  </div>
+</section>
+
+
+<!-- ============================================================== -->
+<!-- PAGE 2: SPY vs TSLA                                              -->
+<!-- ============================================================== -->
+<section class="page">
+  <h1>Strategy comparison · SPY vs TSLA</h1>
+  <div class="subtitle">
+    Source: <code>api/strategy_templates.py</code> · Yellow cells = values differ between strategies
+  </div>
+
+  <table class="strat">
+    <colgroup>
+      <col style="width:38%"><col style="width:31%"><col style="width:31%">
+    </colgroup>
+    <thead>
+      <tr>
+        <th>Parameter</th>
+        <th>SPY 0DTE Scalping</th>
+        <th>TSLA 0DTE Scalping</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr class="section-head"><td colspan="3">Entry conditions</td></tr>
+      <tr><td>EMA period</td><td class="num">9</td><td class="num">9</td></tr>
+      <tr><td>Use VWAP</td><td>yes</td><td>yes</td></tr>
+      <tr><td>Entry signal</td><td>price above 9EMA &amp; VWAP</td><td>price above 9EMA &amp; VWAP</td></tr>
+      <tr class="diff"><td>Volume spike multiplier</td><td class="num">2.0×</td><td class="num">2.5×</td></tr>
+      <tr><td>Delta range</td><td class="num">0.60 – 0.85</td><td class="num">0.60 – 0.85</td></tr>
+      <tr><td>Min open interest</td><td class="num">3,000</td><td class="num">3,000</td></tr>
+      <tr><td>Max bid-ask spread</td><td class="num">20%</td><td class="num">20%</td></tr>
+      <tr><td>$TICK indicator</td><td>off</td><td>off</td></tr>
+      <tr><td>Confirmation required</td><td>yes (≥2 indicators)</td><td>yes (≥2 indicators)</td></tr>
+
+      <tr class="section-head"><td colspan="3">Risk &amp; sizing</td></tr>
+      <tr class="diff"><td>Risk per trade</td><td class="num">1.5% of account</td><td class="num">1.0% of account</td></tr>
+      <tr class="diff"><td>Max position $</td><td class="num">$500</td><td class="num">$400</td></tr>
+      <tr class="diff"><td>Max contracts</td><td class="num">3</td><td class="num">2</td></tr>
+      <tr class="diff"><td>Max positions (open)</td><td class="num">2</td><td class="num">1</td></tr>
+
+      <tr class="section-head"><td colspan="3">Exits</td></tr>
+      <tr class="diff"><td>Take profit</td><td class="num">25%</td><td class="num">30%</td></tr>
+      <tr class="diff"><td>Stop loss</td><td class="num">50%</td><td class="num">40%</td></tr>
+      <tr class="diff"><td>Reward : risk ratio</td><td class="num">1 : 2.0  (asymmetric)</td><td class="num">1 : 1.33</td></tr>
+      <tr><td>Trailing stop enabled</td><td>yes</td><td>yes</td></tr>
+      <tr class="diff"><td>Trailing activation</td><td class="num">+15% pnl</td><td class="num">+20% pnl</td></tr>
+      <tr><td>Trailing distance</td><td class="num">10% off peak</td><td class="num">10% off peak</td></tr>
+
+      <tr class="section-head"><td colspan="3">Time windows (entry &amp; exit)</td></tr>
+      <tr><td>Entry after open</td><td class="num">30 min</td><td class="num">30 min</td></tr>
+      <tr class="diff"><td>Exit before close</td><td class="num">15 min</td><td class="num">20 min</td></tr>
+      <tr class="diff"><td>Max hold time</td><td class="num">30 min</td><td class="num">20 min</td></tr>
+
+      <tr class="section-head"><td colspan="3">Account / meta</td></tr>
+      <tr class="diff"><td>Recommended min account</td><td class="num">$1,000</td><td class="num">$2,000</td></tr>
+      <tr class="diff"><td>Difficulty</td><td>intermediate</td><td>advanced</td></tr>
+      <tr><td>0DTE options</td><td>yes</td><td>yes (+ gamma_scalping_mode)</td></tr>
+    </tbody>
+  </table>
+
+  <div class="verify">
+    <h3>Sanity checks — circle ✓ / ✗ and write the why</h3>
+    <span class="check">SPY R:R is 1:2 (lose $1 to gain $0.50). Win rate &gt; 67% needed for positive expectancy. Hit rate target? <span class="blank"></span></span>
+    <span class="check">TSLA R:R is 1:1.33 — needs &gt;57% hit rate. Aligns with higher vol &amp; tighter SL. <span class="blank"></span></span>
+    <span class="check">Trailing activation &lt; TP for both (SPY 15&lt;25, TSLA 20&lt;30). Trail only kicks in if a TP miss starts pulling back. <span class="blank"></span></span>
+    <span class="check">Max position $ vs risk %: at $1k account, SPY 1.5% = $15 risk, $500 size → tolerates 3% adverse before stop. <span class="blank"></span></span>
+    <span class="check">Max hold (30m / 20m) vs 0DTE theta decay (steepens after 2pm): are these tight enough? <span class="blank"></span></span>
+    <span class="check">TSLA <code>max_positions = 1</code>: prevents stacking single-name concentration. <span class="blank"></span></span>
+    <span class="check">Volume spike multiplier higher on TSLA (2.5 vs 2.0): demands clearer momentum confirmation. <span class="blank"></span></span>
+  </div>
+
+  <div class="notes-area">
+    <h3 style="margin-top:0">Notes / changes I want</h3>
+    <div class="lines"></div>
+  </div>
+
+  <div class="footer">
+    <span>VegaPunkR · engine_flow_overview · page 2 of 2</span>
+    <span>Templates loaded into DB <code>Strategy.params_json</code> via clone-from-template API</span>
+  </div>
+</section>
+
+</body>
+</html>

@@ -77,6 +77,38 @@
               </td>
             </ng-container>
 
+            <!-- Equity Column -->
+            <ng-container matColumnDef="equity">
+              <th mat-header-cell *matHeaderCellDef>Equity</th>
+              <td mat-cell *matCellDef="let strategy">
+                @if (hasCurve(strategy)) {
+                  <div
+                    class="equity-spark"
+                    (click)="openEquityChart(strategy)"
+                    matTooltip="Click to expand equity curve"
+                  >
+                    <div class="equity-spark-chart">
+                      <canvas
+                        baseChart
+                        [data]="sparkDataById.get(strategy.id)!"
+                        [options]="sparkOptions"
+                        [type]="sparkChartType"
+                      ></canvas>
+                    </div>
+                    <span
+                      class="equity-spark-value"
+                      [class.profit]="(curveLastPnl(strategy) ?? 0) > 0"
+                      [class.loss]="(curveLastPnl(strategy) ?? 0) < 0"
+                    >
+                      {{ curveLastPnl(strategy) | currency }}
+                    </span>
+                  </div>
+                } @else {
+                  <span class="equity-spark-empty">—</span>
+                }
+              </td>
+            </ng-container>
+
             <!-- Updated Column -->
             <ng-container matColumnDef="updated">
               <th mat-header-cell *matHeaderCellDef>Last Updated</th>

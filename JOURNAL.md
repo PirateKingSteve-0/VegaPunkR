@@ -6155,3 +6155,349 @@ The intent is to **collect data first, decide later**. After enough trades a que
 - **Consider exit-drift logging next.** Same shape as entry drift, would help TODO #6 (SPY 0DTE late-exit) investigation. One-line change in `close_position` to pass `signal_price` from SL/TP signals that knew their trigger price. Held back this session to keep scope tight.
 
 ---
+
+## Session Date: May 9, 2026 (Part 5) — Per-Strategy Equity Curves on the Strategies Page
+
+### Context
+TODO list got reordered by priority earlier in the session — SPY 0DTE exit drift to #1, T+1 probe to #2, ledger hardening to #3, equity curves to #4 (was #2), preview-cancel to #5, backtesting to #6. Picked up the equity-curves item next because it's a hard prerequisite for the cancel-on-drift threshold decision (#5) and the backtest UI (#6) — without per-strategy realized cumulative PnL, there's no shape to compare modeled-vs-actual against, and no chart for the backtest output to overlay onto. Implemented over a remote-control session steered from phone, alignment-first conversation before any code: confirmed data source (our `Trade` rows, NOT Tradier history), curve shape (cumulative realized from zero, NOT daily PnL), trade-by-trade granularity, realized-only (no unrealized tip), sparkline-column UX. Built end-to-end in one pass.
+
+### Backend — `GET /performance/equity-curves`
+
+New endpoint in `api/routers/performance.py`. Returns one curve per strategy owned by the calling user. Each curve is the running sum of `Trade.pnl` over the strategy's closing trades, ordered by `exit_timestamp` ascending, starting from zero.
+
+```
+GET /api/v1/performance/equity-curves
+→ [
+    {
+      "strategy_id": 1,
+      "name": "SPY 0DTE Momentum",
+      "points": [
+        {"t": "2026-04-30T14:32:11.012", "cum_pnl": 42.50, "trade_pnl": 42.50},
+        {"t": "2026-05-01T10:18:44.500", "cum_pnl": 17.30, "trade_pnl": -25.20},
+        ...
+      ]
+    },
+    ...
+  ]
+```
+
+Filter is strict: `Trade.exit_timestamp IS NOT NULL AND Trade.pnl IS NOT NULL`. The opening leg of a position has `pnl=NULL` and `exit_timestamp=NULL` until the close trade is recorded — only the closing trades show up on the curve, which is the right semantic ("PnL is realized at close, not entry").
+
+`trade_pnl` is included alongside `cum_pnl` so the dialog tooltip can show the individual trade contribution at each point without a second round-trip.
+
+**Route ordering matters.** Put `/equity-curves` BEFORE `/{metrics_id}` in the file. FastAPI matches routes top-to-bottom; if `/{metrics_id}` came first, the literal `equity-curves` would be captured as the path-param and coerced to `int`, returning a 422.
+
+Auth: `Depends(get_current_user)` — read-only own data, no role gate beyond authenticated. Strategy filter is `Strategy.user_id == current_user.id` so cross-user reads are impossible regardless of role.
+
+### Frontend — Sparkline column + expanded dialog
+
+**Service** — `getEquityCurves()` added to `ui/src/app/services/strategy.service.ts`. Standard `getHeaders()` pattern (Bearer token from `localStorage('access_token')` via `AuthService`), matching the rest of the codebase. New `EquityCurve` and `EquityCurvePoint` interfaces exported from the same file — small enough to colocate, not worth a new model file.
+
+**Strategy list** (`pages/strategies/strategy-list.component.{ts,html,scss}`):
+- New "Equity" column inserted between "Symbols" and "Last Updated"
+- Loads curves alongside strategies on `ngOnInit` — two parallel HTTP calls, neither blocks the other
+- Sparkline rendered with `BaseChartDirective` from ng2-charts (`type='line'`, all axes/grids/tooltips/legends disabled, `pointRadius: 0`, `borderWidth: 1.5`). Cell size: 100px × 28px
+- Stroke color: `palette.profit` if last cumulative is positive, `palette.loss` if negative, `palette.textMuted` if exactly zero
+- Adjacent value label shows lifetime cumulative dollar amount in profit/loss color
+- Click anywhere on the sparkline cell → opens the expanded dialog
+- Strategies with zero closed trades render "—" instead of an empty canvas (would otherwise be a 0-width line)
+- `effect()` rebuilds spark data when `themeService.chartColors()` changes — same pattern the performance page already uses for live theme/CB recoloring
+
+**Expanded dialog** (`pages/strategies/equity-curve-dialog.component.ts`, single-file inline template + styles):
+- Title: strategy name with `show_chart` icon, dialog-close button
+- Subtitle: "Lifetime cumulative realized PnL · N closed trades"
+- Stats grid (4 tiles): Total Realized, Best Trade, Worst Trade, Win Rate (% of trades with `trade_pnl > 0`)
+- Chart: full Chart.js line, x-axis with truncated dates, y-axis with currency-short formatting (`$1.2k`, `$3.4M`)
+- Hover tooltip: `index` mode (locks to nearest x-position), shows trade #, full timestamp (`May 7, 2026, 2:32 PM`), this-trade PnL with explicit sign, cumulative PnL — pulls from the original `points[idx]` so all four values come from one closure with no re-derivation
+- Filled area: `palette.profitFill` if last cum is non-negative, `palette.lossFill` otherwise (matches the performance page's equity chart convention)
+- Same `effect()` pattern for live theme recoloring
+
+**Cleanup wired:** `loadEquityCurves()` is called again after delete/clone — keeps the spark column consistent with the strategies list.
+
+### Files touched
+
+| File | Change |
+|---|---|
+| `api/routers/performance.py` | new `GET /equity-curves` handler, registered before `/{metrics_id}` |
+| `ui/src/app/services/strategy.service.ts` | `getEquityCurves()` + `EquityCurve` / `EquityCurvePoint` types |
+| `ui/src/app/pages/strategies/strategy-list.component.ts` | curve loading, spark data builder, theme effect, dialog launcher, `equity` column wiring |
+| `ui/src/app/pages/strategies/strategy-list.component.html` | new `<ng-container matColumnDef="equity">` with sparkline canvas + value label |
+| `ui/src/app/pages/strategies/strategy-list.component.scss` | `.equity-spark`, `.equity-spark-chart`, `.equity-spark-value`, `.equity-spark-empty` rules |
+| `ui/src/app/pages/strategies/equity-curve-dialog.component.ts` | new component (inline template + styles) |
+| `TODO.md` | moved equity-curves item from active list to DONE; updated cross-references in #4 (preview cancel) and #5 (backtesting) since the unblock-prerequisite they pointed to is now satisfied |
+| `JOURNAL.md` | this entry |
+
+### Verification
+
+- `npx tsc --noEmit` clean — no type errors across the UI.
+- `npx ng build --configuration development` clean — `strategy-list-component | 115.04 kB`, all other chunks rebuilt.
+- `python3 -c "import ast; ast.parse(...)"` clean on `routers/performance.py`.
+- Visual browser test was **not** performed in this session (built clean but didn't click into the dialog or watch the sparklines render against real data). Recommend confirming with a real user that has at least a few closed trades on a strategy.
+
+### Quirks / decisions worth remembering
+
+- **Realized-only is a deliberate stability choice, not a missing feature.** Including unrealized PnL would make the curve tip move every tick, which (a) makes the chart feel noisy and unstable, (b) breaks the visual analogy with backtest output (which is always realized), and (c) means today's number changes tomorrow even if no trades happened. Could add a dotted "live tip" later that shows current unrealized as a separate visual element, but the main curve stays anchored on closing-trade events.
+
+- **Tradier history is NOT the data source — even though it could *almost* work.** Tradier's `/account/history` is keyed by symbol, not strategy. If two strategies trade SPY (which is the realistic case here, since the SPY 0DTE momentum strategy is the active one and other strategies might also touch SPY), the history can't tell you which trade belonged to which strategy. Our `Trade` table has `strategy_id` because we set it at order placement — that's why this is OUR source of truth, not the broker's.
+
+- **`x` axis is `exit_timestamp`, not `timestamp`.** `Trade.timestamp` is the entry time (TimescaleDB partition key). `Trade.exit_timestamp` is when PnL was realized. For the curve to mean "cumulative realized PnL over time", x must be when the realization happened. Same gotcha that's noted in the original TODO.
+
+- **Route ordering bug averted on the FastAPI side.** Easy to get wrong: registering `/{metrics_id}` first would silently capture `/equity-curves` and try to coerce it to int. Caught at design time by reading the existing handler order. Worth flagging for any future literal-path additions to this router.
+
+- **Sparkline canvas dimensions must be set on the wrapper div, not the canvas itself.** Chart.js sizes the canvas to fill its parent; setting `width`/`height` on the canvas directly fights with `responsive: true`. The `.equity-spark-chart` wrapper is `100px × 28px`; the canvas adapts.
+
+- **Zero-trade strategies render "—" instead of an empty canvas.** A canvas with zero points still gets rendered as a 0-pixel-wide artifact in some browsers — ugly. Cheaper to gate at the template level with `@if (hasCurve(strategy))`.
+
+- **`@Inject(MAT_DIALOG_DATA)` parameter property assigns AFTER class field initializers.** The dialog's `chartOptions` references `this.data.points[idx]` inside the tooltip callback. At the moment `chartOptions` is initialized (during construction, before the constructor body runs), `this.data` is undefined. But the callback is invoked lazily by Chart.js on hover — by then, `this.data` is set. So this works, but it's worth knowing why if anyone later moves the chartOptions around or tries to compute a derived value at init time.
+
+- **The dialog is single-file with inline template + styles.** Looked at `template-gallery-modal.component.ts` which uses an external template — that pattern is right when the template is large and worth a separate file. The equity dialog template is ~30 lines with simple structure, so inline is cleaner. No precedent broken either way; both patterns coexist in this repo.
+
+- **Built remotely from phone via `claude remote-control`.** First substantial UI feature implemented this way. Worked well — the alignment conversation upfront (data source, curve shape, granularity, sparkline UX) was the right place to confirm decisions before code. Context-window cost for the back-and-forth was lower than the cost of writing the wrong feature.
+
+### Open follow-ups
+
+- **Visual browser test.** Build is clean but the actual click-through wasn't done. Confirm: (a) sparkline column renders on the strategies page, (b) values match what the performance page shows for the same strategy, (c) clicking opens the dialog with correct stats and chart, (d) toggling theme/CB recolors live, (e) strategies with zero closed trades show "—".
+
+- **Multi-strategy roll-up on the overview page is still pending.** Original TODO mentioned this as a separate UI surface. Out of scope for this session — strategies page was the primary placement the user wanted. Easy follow-up: same data, multi-line chart with one `dataset` per strategy, distinct colors. Reuses `getEquityCurves()` so no new endpoint.
+
+- **Open positions' unrealized PnL as an optional "live tip" overlay.** Currently strictly realized. If a "current" indicator becomes useful (e.g., for a dashboard glance), a dotted segment from the last realized point to `last_realized + sum(open_positions.unrealized_pnl)` would do it. Cheap addition, gated on whether anyone wants it.
+
+- **Cancel-on-drift decision (TODO #4) is now formally unblocked.** With per-strategy realized curves visible, a few weeks of `ORDER_PREVIEW_DRIFT` events accumulating, and the ability to compare modeled-vs-actual visually, the threshold-picking exercise can move from "guessing %" to "looking at the data". Don't act on this yet — let the data accumulate.
+
+- **Backtesting (TODO #5) chart shape is locked in.** When backtest output is built, it should return the same `[{t, cum_pnl, trade_pnl}]` point shape so the frontend can overlay a backtest curve on a live curve in the same dialog without divergent chart code. Worth keeping in mind when scoping #5.
+
+---
+
+## Session Date: May 9, 2026 (Part 6) — Risk Page Removal + Unified Settings Drawer + UI Perf Pass
+
+### Context
+The risk page in the dashboard sidenav had grown a set of cards (Portfolio Risk "Low / 25%", Concentration "Medium / 50%", Leverage 2.0x, VaR $0.00, Max Drawdown 10%, Max Position Size $10,000) that were entirely hardcoded — `risk.component.ts` never called the backend, and several of the metrics didn't even apply (cash-only account, so leverage isn't a thing; no engine code computes VaR or portfolio-level drawdown). The user flagged this and asked whether we should connect the page to the User row's actual risk fields (`daily_loss_limit_pct`, `account_size_usd`, `max_trade_percentage`, `trading_window_*`) since those are real and engine-honored.
+
+Mapped the live status (`getAccountStatus()` → today PnL + % cap consumed + OK/WARNING/HALTED state) and confirmed the overview already surfaces it (`overview.component.html:19-53`). So the risk page was double-counting that part and inventing the rest. Decided to remove the risk page entirely, fold all editable user settings into a single right-edge drawer launched from the user-avatar menu, and use the freed-up signal to also do an opportunistic perf pass since the user separately reported render lag.
+
+### Settings drawer — four dialogs collapsed into one
+
+Avatar menu was four separate dialog launchers: **Profile**, **Trading Window**, **Discord Notifications**, **Email Reports**. All four now live as sections inside a single drawer (`ProfileDialogComponent`, file kept under that name to minimize import churn). Avatar menu shrunk to **Settings** + **Logout**.
+
+Drawer styling is a `MatDialog` repositioned to the right edge with full viewport height, not a `MatSidenav` — keeps the existing dialog lifecycle (backdrop click-to-close, focus management, escape-to-close) and skipped a structural refactor of the dashboard shell. Right-edge config:
+
+```ts
+this.dialog.open(ProfileDialogComponent, {
+  width: '520px',
+  maxWidth: '100vw',
+  height: '100vh',
+  position: { right: '0', top: '0' },
+  panelClass: 'settings-drawer-panel',
+  autoFocus: false,
+});
+```
+
+Global CSS in `styles.scss` strips border-radius on the MDC dialog surface so it visually pins to the right edge:
+
+```scss
+.settings-drawer-panel {
+  height: 100vh !important;
+  max-height: 100vh !important;
+  .mat-mdc-dialog-container,
+  .mdc-dialog__surface,
+  .mat-mdc-dialog-surface { border-radius: 0 !important; height: 100vh; max-height: 100vh; }
+}
+```
+
+Form is one long scrolling form (no tabs) with section dividers: **Identity** (name, email) → **Risk limits** (daily loss %, account size $, max trade %) → **Trading window** (enabled toggle + start/end ET) → **Discord notifications** (enabled toggle + webhook URL + notify-on-open/close + test button) → **Email reports** (enabled toggle + 5 period checkboxes + test button) → **Change password**. Each section ports the validation/save logic from its prior dialog.
+
+**One unified `save()`.** Builds a single `ProfileUpdate` patch with every dirty field and POSTs once to `PATCH /auth/me`. Notification preferences merge with existing `User.notification_preferences` so we don't clobber other keys. The backend `UserUpdate` schema already accepted all of these — no API change needed.
+
+**Field conversion gotcha.** `User.max_trade_percentage` is stored as a fraction (`0.02 = 2%`) but the UI shows it as a percent. Read converts `frac * 100` (rounded to 4dp); save converts `pct / 100` (rounded to 6dp). Initial values cached so the dirty-check compares like-for-like. Got this wrong once on first pass and noticed before commit.
+
+**`ProfileUpdate` extended** to carry `account_size_usd`, `max_trade_percentage`, `trading_window_enabled` / `start` / `end`, and `notification_preferences`. `User` interface mirrored. `AuthService.updateTradingWindow` and `updateNotificationPreferences` are now redundant for this drawer's path but left in place — they're harmless dead code paths after the four dialog files were removed; no other caller. Could be cleaned up in a future pass but not worth the risk this session.
+
+### Risk page deletion
+
+Deleted four folders:
+
+- `ui/src/app/pages/risk/` — the placeholder dashboard
+- `ui/src/app/components/trading-window-dialog/`
+- `ui/src/app/components/discord-notifications-dialog/`
+- `ui/src/app/components/email-reports-dialog/`
+
+Sidenav item `{ icon: 'warning', label: 'Risk', route: '/dashboard/risk' }` removed from `dashboard.component.ts:65`. Route `/risk` removed from `app.routes.ts:58-59`. Imports for the three dialogs removed from `dashboard.component.ts`; `openTradingWindowDialog`, `openDiscordNotificationsDialog`, `openEmailReportsDialog` deleted; `openProfileDialog` renamed to `openSettingsDrawer` and reconfigured as the drawer launcher above.
+
+`RiskService.getAccountStatus()` is **kept** — overview still uses it for the live session-status tile.
+
+### UI perf pass — static audit + Firefox profile read
+
+User reported occasional render lag. Did two complementary passes:
+
+**Static audit.** Suspected hotspots ranked: (1) `positions.component.ts:73` — `interval(10000)` polling on default-CD component; (2) `overview.component.ts:59` — `setInterval(loadAccountRisk, 30_000)` on default-CD landing page; (3) `performance.component.ts:160` — `MatTableDataSource` with up to 200 closed rows, sort/filter pipeline runs on every period change, no virtual scroll. Suspicious: stream-drawer flushing every 100ms calling `markForCheck` (`stream-drawer.component.ts:84,99`); strategy-list rebuilding all sparklines on every theme toggle; trades-page filter form controls without `debounceTime` except symbol.
+
+**Firefox profile read.** User exported `Zen 2026-05-09 19.19 profile.json` (309 MB uncompressed, 90 MB gzipped). Wrote a Python analyzer (`/tmp/analyze_final.py`) that walks the preprocessed Firefox-profile shape: shared `stringArray`/`stackTable`/`frameTable`/`funcTable` tables at top-level, per-thread samples + markers. Identified the app's content thread by intersecting `data['pages']` (URL → innerWindowID) with each thread's `usedInnerWindowIDs` — the localhost:4200 page mapped to thread[23] pid=10197. Findings:
+
+- **Main thread is idle 90.7% of the time** — `__libc_poll` dominates the leaf-frame distribution. Active CPU is only ~7% of wall time (≈3.5s out of 50s capture).
+- **Active CPU is almost entirely Angular CD** — top inclusive frames: `Subject2.prototype.next` 7.2% → `tickImpl` 7.1% → `detectChangesInViewWhileDirty` 7.1% → `detectChangesInView` 7.1% → `detectChangesInComponent` 7.0% → `detectChangesInEmbeddedViews` 7.0%. RxJS subject emission pumping zone-based change detection through the tree.
+- **31 LongTask markers (≥50ms) in 50s, max 329.7ms.** Investigated the biggest one — within that 350ms window, 340/350 samples were `__libc_poll`. The actual work was Firefox-internal: 6 `RefreshDriver tick`, 4 `Paint` / `nsLayoutUtils::PaintFrame`, 2 `Incremental CC` / `nsCycleCollector_collectSlice`, plus a `setTimeout` callback. Not a JS blocker we can fix in code — Firefox's LongTask threshold flagged a window where the page yielded back to GC/paint, not where our JS was blocking.
+- **CSS transitions are heavy** — 499 events totaling 68 seconds cumulative (overlapping in parallel), avg 136ms, max 400ms. These are Material's default ripple/slide/fade transitions. They run on the compositor (don't block JS) but delay visual feedback. Possible quick win: globally shorten via CSS custom property override or honor `prefers-reduced-motion`. Not done this session.
+- **Backend latency surfaced too** — Tradier endpoints (`account/balances`, `account/history/*`, `account/gainloss`, `positions`, `risk-events/account-status`) clustered at 200–500ms each. Network, not main thread. User-perceived but not a UI fix.
+
+Conclusion: the static audit's top 2 findings are confirmed by the trace; #3 (performance virtual scroll) wasn't visited in this capture so kept on backlog rather than acted on.
+
+### OnPush + polling removal
+
+**Overview** is already 100% signal-driven (`portfolioValue.set(...)`, `cashAvailable.set(...)`, `openPositions.set(...)`, `totalPnL.set(...)`, `accountRisk.set(...)`, `loading.set(...)`, `error.set(...)`). Adding `changeDetection: ChangeDetectionStrategy.OnPush` requires zero callback changes — signals auto-trigger CD on the OnPush'd component only.
+
+**Positions** uses plain properties (`positions: DbPosition[]`, `loading: boolean`) and `[dataSource]="positions"` on `mat-table`. Added `OnPush`, injected `ChangeDetectorRef`, called `cdr.markForCheck()` after each subscribe callback (success and error).
+
+User then made a stronger call: since Discord alerts cover position open/close, real-time price updates aren't necessary — refreshing on demand is enough. Removed both polls entirely:
+
+- `positions.component.ts` — `interval(this.poll_interval).pipe(startWith(0), switchMap(...))` replaced with a one-shot `this.http.get(...)`. Dropped `interval`, `switchMap`, `startWith` imports and the `poll_interval` field. Subtitle `Refreshes every {{ poll_interval / 1000 }} seconds` removed from the template.
+- `overview.component.ts` — `this.accountStatusInterval = setInterval(() => this.loadAccountRisk(), 30_000)` removed entirely, along with the field declaration and the `clearInterval` in `ngOnDestroy`. Existing `refresh()` button on overview's header still triggers manual reloads.
+
+Then factored the positions fetch into `loadPositions()` and added a refresh button on the positions header that mirrors the overview pattern (`mat-raised-button color="primary"` with `refresh` icon, `[disabled]="loading"`). Header SCSS updated to `justify-content: space-between` so the button anchors right.
+
+**Net effect:** zero background CD churn from these two pages while idle. They load once on mount, refresh on env/mode change (overview only), or refresh on user click. The trace's confirmed CD-via-RxJS hot path (~7% of CPU) is removed for the always-mounted landing surfaces.
+
+### Files touched
+
+| File | Change |
+|---|---|
+| `ui/src/app/models/user.model.ts` | extended `ProfileUpdate` and `User` with `account_size_usd`, `max_trade_percentage`, `trading_window_*`, `notification_preferences` |
+| `ui/src/app/components/profile-dialog/profile-dialog.component.ts` | rewritten as unified Settings drawer with 6 sections, single `save()`, fraction↔percent conversion for `max_trade_percentage` |
+| `ui/src/app/components/profile-dialog/profile-dialog.component.html` | new template with all sections + test buttons |
+| `ui/src/app/components/profile-dialog/profile-dialog.component.scss` | drawer-fill layout (host flex column, content flex 1, sticky bottom action bar) |
+| `ui/src/styles.scss` | new global `.settings-drawer-panel` for right-edge full-height MDC dialog |
+| `ui/src/app/pages/dashboard/dashboard.component.ts` | removed three dialog imports + open methods, dropped `Risk` from menu, renamed `openProfileDialog` → `openSettingsDrawer` with right-edge config |
+| `ui/src/app/pages/dashboard/dashboard.component.html` | avatar menu shrunk from 4 settings entries to 1 (`Settings`) |
+| `ui/src/app/app.routes.ts` | `/risk` route removed |
+| `ui/src/app/pages/overview/overview.component.ts` | added `ChangeDetectionStrategy.OnPush`; removed `setInterval` 30s poll, `accountStatusInterval` field, and `clearInterval` cleanup |
+| `ui/src/app/pages/positions/positions.component.ts` | added OnPush + injected `ChangeDetectorRef`; removed `interval`/`switchMap`/`startWith`/`poll_interval`; factored `loadPositions()`; added `refresh()` |
+| `ui/src/app/pages/positions/positions.component.html` | removed "Refreshes every X seconds" subtitle; added refresh button matching overview |
+| `ui/src/app/pages/positions/positions.component.scss` | header `justify-content: space-between` so the new button anchors right |
+| **deleted** | `ui/src/app/pages/risk/`, `ui/src/app/components/trading-window-dialog/`, `ui/src/app/components/discord-notifications-dialog/`, `ui/src/app/components/email-reports-dialog/` |
+| `JOURNAL.md` | this entry |
+
+### Verification
+
+- `npx ng build --configuration development` clean across all four edit checkpoints — drawer rewrite, OnPush flag, polling removal, refresh button. Final build 4.2s. No type or template errors.
+- Visual browser test was **not** performed in this session. Build is clean but the drawer's right-edge pinning, the click-outside-to-close behavior with the new positioning, and the refresh button layout were not eyeballed. Recommended before next deploy.
+- Profile re-capture not performed — would confirm CD% drop on overview/positions, but the static reasoning (signal-driven overview already has zero non-signal mutations; positions has zero polling now) is enough for an interim sign-off.
+
+### Quirks / decisions worth remembering
+
+- **`MatDialog` repositioned, not `MatSidenav`.** Right-side drawers are conventionally a `MatSidenav` living in the dashboard shell, but that requires plumbing a `MatSidenavContainer` around the existing layout and managing open/close state. `MatDialog` with `position: { right: '0', top: '0' }` + `panelClass` gets the same UX (modal overlay, click-outside-to-close, escape-to-close) for ~10 lines of CSS and zero shell changes. The `!important` selectors in `styles.scss` are needed because Material's MDC dialog defaults override panel-class border-radius — this is fragile across Material versions; if a future upgrade adds another wrapper layer, expect to add a selector.
+
+- **Avatar menu didn't have a "Profile" entry — it had four.** Original avatar menu had `Profile`, `Trading Window`, `Discord Notifications`, `Email Reports` as separate launchers. The drawer absorbs all four. Discord webhook URL validation, email destination, "Send test" buttons all moved over with their original logic intact.
+
+- **`AuthService.updateTradingWindow` and `updateNotificationPreferences` are now dead code.** The unified `save()` uses `updateProfile()` with the full patch, including `notification_preferences`. The two specialized methods aren't called from anywhere after the dialog deletions but stay in the service file. Removing them is a separate, low-risk cleanup; left for a future pass to keep this session's diff scoped.
+
+- **The 329ms LongTask was a red herring.** Investigated the largest long-task in the trace expecting to find a JS hot path. 340/350 samples in `__libc_poll` — the thread was actually idle most of the window. Firefox's LongTask threshold fires whenever ≥50ms elapses between user-perceptible work, which can include GC, cycle collector, and paint inside Firefox itself. Lesson: don't assume LongTask = JS-blocking; verify with stack samples in the window before chasing.
+
+- **CSS transitions are a real perceptual cost the trace surfaced.** 68 seconds cumulative across 499 events isn't main-thread blocking (compositor handles transitions), but it does delay visual feedback by ~136ms per interaction. Material's defaults favor smoothness over snappiness. A global override (`--mat-app-transition-duration: 80ms` or honoring `prefers-reduced-motion`) would shave perceptible latency without breaking style. Quick win, not done this session.
+
+- **Polling removal is a behavioral change, not just a perf win.** Previously the positions page auto-refreshed every 10s — open it, leave it, prices kept updating. Now it's snapshot-on-mount. User signed off on this: Discord alerts already cover position open/close events, and the refresh button covers the "I want to look right now" case. If a daily-loss halt fires, however, **Discord doesn't alert on that** — only `notify_open` and `notify_close` exist as Discord prefs. So a user who relies entirely on alerts won't know about a halt until they reopen overview. Flagged but not addressed; the fix is either (a) extend Discord prefs with `notify_risk_event`, or (b) reintroduce a low-frequency overview poll (e.g. 5min) for the cap status only.
+
+- **Discord alerts were the lever for removing polling, not the OnPush fix.** OnPush alone would have been the smaller change — keep polling, just make the per-tick CD cost cheaper. But the user reasoned that polling itself is wasted work given the alert coverage, which is a stronger statement (eliminates the work entirely vs. making it cheap). Worth remembering as a pattern: when a notification path covers the events users actually care about, the UI doesn't need to poll just to keep visuals current.
+
+- **Performance component was on the static audit's top-3 but not actioned.** The capture didn't visit `/performance` so we have no real evidence it's the lag the user is feeling. Leaving on backlog rather than acting on the static suspicion alone — the trace re-prioritized #1 and #2 above #3.
+
+- **The audit also flagged stream-drawer's 100ms flush, strategy-list sparkline rebuild, and trades-page filter debouncing.** None acted on this session. Stream-drawer is already OnPush and buffers outside the zone correctly — only concern is cadence (10×/sec markForCheck), low priority. Sparkline rebuild affects theme-toggle UX, not idle render cost, also low priority. Trades-page filter debouncing is a one-line fix per filter, easy follow-up.
+
+### Open follow-ups
+
+- **Visual smoke test of the Settings drawer.** Click the avatar → Settings, confirm: (a) drawer pins to the right edge full-height, no rounded corners, (b) backdrop dim is visible and clicking it closes, (c) all six sections render with correct initial values, (d) Save round-trips successfully and reflects on next open, (e) Discord webhook test button still works against a real webhook, (f) email test button still sends.
+
+- **Re-capture a Firefox profile after the OnPush + polling removal.** Same nav (overview → positions → idle). Compare: `detectChanges*` family inclusive % should drop materially; `__libc_poll` should rise; long-tasks count should be similar (those were Firefox-internal, not our fix surface). Confirms the trace-driven reasoning held.
+
+- **CSS transition duration override.** Cheapest perf-perception win still on the table. Either override the Material `--mat-app-transition-duration` token globally to ~80ms, or add a `prefers-reduced-motion` honoring rule. ~5 lines in `styles.scss`. Held back this session to keep scope tight.
+
+- **Daily-loss halt notification gap.** Removed polling means a user with Discord-alerts-only won't know about a `HALTED` state until they reopen overview. Two paths: extend Discord prefs with `notify_risk_event` and post on halt, OR keep a low-frequency (5min) overview poll for `loadAccountRisk()` only. The Discord path is more useful long-term; the polling path is faster to implement.
+
+- **Performance page virtual scroll (audit #3).** Backlog item. Not visited in this trace, no evidence it's hurting yet. If the user reports lag specifically on Performance with full history loaded (200 closed positions + sort/filter clicks), revisit and add `cdk-virtual-scroll-viewport`.
+
+- **Remove dead `AuthService` methods.** `updateTradingWindow` and `updateNotificationPreferences` no longer have callers after the four dialog deletions. Trivial cleanup, low risk, not done this session to keep the diff focused on the visible behavior changes.
+
+- **Trades page filter debouncing.** Audit finding: only the symbol filter has `debounceTime(400)`. Event-type and date filters fire HTTP per-keystroke. Add `debounceTime(300)` + `distinctUntilChanged()` to each. ~5 lines, easy win.
+
+---
+
+## Session Date: May 20, 2026
+
+### Dev environment: launching Claude with the venv pre-activated
+
+Documenting so we don't re-debug this:
+
+- **Symptom.** Every Claude session opened with `source /home/gorillapops/Github/VegaPunkR/venv/bin/activate` appearing as a user message at the top of the transcript. Looked like an auto-paste into Claude's input.
+- **Root cause.** VS Code's Python extension setting `python.terminal.activateEnvironment` defaults to `true`. Combined with `claudeCode.useTerminal: true`, the Python ext was sending the activate command as keystrokes into the same terminal the Claude REPL was already running in — so the text was consumed by Claude as a user prompt instead of by a bash shell.
+- **Fix applied.** Set `"python.terminal.activateEnvironment": false` in `~/.config/Code/User/settings.json`, and added a `vclaude` shell function to `~/.bashrc` that handles venv activation explicitly:
+
+  ```bash
+  vclaude() {
+    (cd ~/Github/VegaPunkR && source venv/bin/activate && claude "$@")
+  }
+  ```
+
+  The subshell `( ... )` keeps the activated venv scoped to the Claude session — the outer terminal isn't left with a polluted `PATH` after Claude exits.
+- **How to use.** From any terminal: `vclaude` (or `vclaude --resume`, etc.). Env vars set by `activate` are inherited by Claude and by every Bash tool call inside the session, so no per-command `source venv/bin/activate &&` prefix is needed.
+- **If a future session shows the paste again.** Either (a) the VS Code setting got flipped back on by a settings sync, or (b) you launched `claude` directly (without `vclaude`) from a terminal that didn't have the venv active. Re-check the VS Code setting first, then verify `which python` resolves to `venv/bin/python` after running `vclaude`.
+
+---
+
+### Dedupe `ORDER_RATE_LIMITED` events per throttle window
+
+- **Symptom.** Today's events tab showed **70 `ORDER_RATE_LIMITED`** rows alongside 19 `POSITION_OPENED` + 19 `POSITION_CLOSED`. Broker exports (`orders(2).csv`, `gainloss(2).csv`) showed all 19 buy/sell pairs filled cleanly with no rejections — so on the surface the engine looked like it was misprocessing real orders.
+- **Investigation.** Counted event types for `created_at >= 2026-05-20` in `system_events`. Every single throttle row had the title `"Close throttled: SPY"` — none were entry throttles. Pulled the first 60 events in time order and found the repeating pattern below for every cycle:
+
+  ```
+  19:45:32.68  ORDER_PLACED       BUY  (entry fills)
+  19:45:32.71  ORDER_RATE_LIMITED  wait=3.46s   ← worker re-attempts close 30ms later
+  19:45:33.74  ORDER_RATE_LIMITED  wait=2.82s
+  19:45:34.39  ORDER_RATE_LIMITED  wait=1.51s
+  19:45:35.69  ORDER_RATE_LIMITED  wait=0.42s
+  19:45:38.19  POSITION_CLOSED                 ← 5s throttle lapses, close fills
+  ```
+
+  A SQL window query confirmed 3–4 throttle rows per close: `19 cycles × ~3.7 ≈ 70 ✓`.
+- **Root cause.** `OrderManager._check_order_rate_limit` (`api/engine/order_manager.py:95-103`) is per-(user, symbol) with `MIN_ORDER_INTERVAL_SECONDS = 5.0`. The stream-driven worker ticks every ~1s and the strategy fires an exit signal immediately after each entry (SL/TP eval), so the close path correctly gets blocked 3–4 times before the throttle window lapses. The throttle was doing its job — but each blocked attempt called `log_event(ORDER_RATE_LIMITED, ...)`, flooding the events table.
+- **Fix.** Added a class-level dedupe dict + helper in `api/engine/order_manager.py`:
+
+  ```python
+  _throttle_logged_for: Dict[Tuple[int, str], datetime] = {}
+
+  @classmethod
+  def _should_log_throttle(cls, user_id: int, symbol: str) -> bool:
+      """First hit in a window logs; subsequent hits referencing the same
+      _last_order_at value are suppressed. A new stamp advances the
+      timestamp and re-enables logging for the next window."""
+      current = cls._last_order_at.get((user_id, symbol))
+      if current is None:
+          return True
+      if cls._throttle_logged_for.get((user_id, symbol)) == current:
+          return False
+      cls._throttle_logged_for[(user_id, symbol)] = current
+      return True
+  ```
+
+  Then wrapped the two existing `log_event(...)` call sites — entry-path (`~470`) and close-path (`~1107`) — with `if self._should_log_throttle(...)`. No state-cleanup needed since the dict is keyed by `(user_id, symbol)` and the value advances naturally each time `_stamp_order_submitted` fires.
+- **Verified locally.** Manual classmethod replay: `True, True, False, False` for repeats in one window; after `_stamp_order_submitted`, the next hit returns `True` again, then `False`. Cuts today's pattern from ~70 → ~19 `system_events` rows without touching the throttle behavior, order placement, or `OrderResult` returned. `logger.warning(...)` to `app.log` was deliberately left alone so the tail log still has every tick for forensics.
+- **Things deliberately not changed.** No reduction of `MIN_ORDER_INTERVAL_SECONDS`. No severity downgrade. No "act on first miss" shortcut. The retry loop is the thing keeping exits reliable — only the event-log surface was noisy.
+- **Side observation (not addressed here).** Every `ORDER_PREVIEW_DRIFT` row today showed `-99.5%`, e.g. `signal_price: 741.10 / preview_per_contract: 3.30`. That's the underlying SPY price being compared against an option contract price — a unit mismatch in the drift calculator. Separate issue; flagged for later.
+
+---
+
+### Printable engine-flow + strategy-comparison diagrams (for hand-annotation)
+
+- **Goal.** Wanted a paper artifact to verify by hand that the engine actually enforces what we think it enforces: cash-only, no GFV path, exits never gated, entry/exit math sensible. Pen/pencil on paper is the right medium for this — easier to slow down and challenge each gate than scrolling code.
+- **Output.** Two self-contained, printable HTML files under `docs/diagrams/`:
+  - `engine_flow_overview.html` — 2 pages. Page 1: full entry pipeline (10 boxes, tick → fill) with parallel exit-path column; each gate annotated with the `file:line` it lives at. Page 2: SPY vs TSLA params side-by-side, diffs shaded yellow.
+  - `engine_flow_cash_deepdive.html` — 3 pages. Page 1: compressed pipeline showing where the cash gate sits. Page 2: T0–T8 worked timeline of a 2-contract SPY buy through the reservation ledger, including the concurrent-signal case (T6 sees shrunken `effective_avail`), plus six failure-mode scenarios A–F. Page 3: same SPY/TSLA table but with cash-gate stress-test verifications (max simultaneous reservation, what fits in $1k vs $2k accounts).
+  - Shared print stylesheet: `_diagram-styles.css`. Letter paper, generous whitespace, ☐ checkbox + blank-line pattern under every section so you can mark up directly.
+- **What this is sourced from (not paraphrased).** Values pulled directly from:
+  - `api/strategy_templates.py` (SPY: lines 40–108, TSLA: 110–158) for every strategy parameter on page 2.
+  - `api/engine/order_manager.py` for the cash gate (lines 298–382), reservation ledger (24–172), and `finally`-block release (~674).
+  - `api/engine/signal_generator.py` for the window gate (114–150), indicator checks (152–270), and exit triggers (298–457).
+  - `api/engine/risk_manager.py` for the validation order (109–218).
+- **Gap surfaced by the deep-dive (worth deciding on).** The `_pending_buy_reservations` dict is a class attribute on `OrderManager`, i.e. **process-scoped, in-memory**. Single worker process → works perfectly. Multi-process scale-out (gunicorn workers, two API replicas, etc.) → each process holds its own ledger and the no-double-spend guarantee breaks because process A's reservation isn't visible to process B's cash check. Today's single-process deployment is fine; flagging because the next time someone considers horizontal scaling, this gate needs to move to a shared store (Redis with TTL, DB row with `SELECT … FOR UPDATE`, or similar). Documented on page 2 of the deep-dive as a verify-checkbox so it stays visible.
+- **Other things the diagrams clarified for me.** (a) Exits really do bypass every entry gate (role, cash, daily-loss cap, position cap) by design — pages call this out as "exits sacred". (b) Entry window composition is "later of strategy-start, account-start"; exit window is "earlier of strategy-end, account-end" — most-restrictive-bound wins on both sides. (c) Sandbox fee buffer (`qty × $0.65`) exists because Tradier sandbox returns `commission=0/fees=0` on previews, which would otherwise let a sandbox-validated buy slip past the gate at the edge of live cash.
+- **How to use.** Open either file in a browser → `Cmd/Ctrl + P` → Save as PDF (portrait, 100% scale, default margins) → print and mark up. No build step, no dependency, no JS — pure HTML/CSS so it'll render and print the same on any machine.
+- **Things deliberately not done.** No SVG flowchart (HTML/CSS boxes print just as well and are trivially editable). No regenerated artifact on the codebase (these are docs, not code). No Mermaid (renders inconsistently across browsers when printed). No `git add` — left untracked so the next person can decide whether to commit or keep them as throwaway working docs.
+
+---

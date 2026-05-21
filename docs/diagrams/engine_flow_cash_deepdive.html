@@ -1,0 +1,343 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>VegaPunkR Engine Flow — Cash / GFV Deep-Dive</title>
+<link rel="stylesheet" href="_diagram-styles.css">
+</head>
+<body>
+
+<div class="print-hint no-print">
+  <strong>Print tip:</strong> Open in browser → <span class="kbd">Cmd/Ctrl + P</span> →
+  Save as PDF. Use <strong>portrait</strong>, scale 100%, margins "Default". Three pages.
+</div>
+
+<!-- ============================================================== -->
+<!-- PAGE 1: Compressed engine flow + where cash gate sits           -->
+<!-- ============================================================== -->
+<section class="page">
+  <h1>Engine flow — cash gate in context</h1>
+  <div class="subtitle">
+    Where the GFV protection lives in the order pipeline · what feeds into it · what it rejects
+  </div>
+
+  <div class="legend">
+    <span><span class="swatch" style="background:#fffbe6"></span>gate</span>
+    <span><span class="swatch" style="background:#fff0e0;border-width:2px"></span>cash / GFV (this doc's focus)</span>
+    <span><span class="swatch" style="background:#f0fff0"></span>broker call</span>
+    <span><span class="swatch" style="background:#eef6ff"></span>exit path</span>
+  </div>
+
+  <div class="row" style="align-items:flex-start;">
+
+    <div class="col" style="flex:1.6">
+      <h2 style="margin-top:0">Entry pipeline (compressed)</h2>
+
+      <div class="box">
+        <div class="title">Tick → Signal indicators OK</div>
+        <div class="ref">tradier_stream_manager → signal_generator</div>
+      </div>
+      <div class="arrow">▼</div>
+
+      <div class="box gate">
+        <div class="title">Entry window · Risk · Role · Rate limit · Lock-out</div>
+        <div class="ref">signal_generator · risk_manager · order_manager</div>
+        <ul>
+          <li>Strategy active, mode match, account-wide daily loss cap</li>
+          <li>Position cap, size sanity, role ∈ {user, admin}</li>
+          <li>5 s per-symbol throttle · existing-position row lock</li>
+        </ul>
+      </div>
+      <div class="arrow">▼</div>
+
+      <div class="box broker">
+        <div class="title">Tradier preview call</div>
+        <div class="ref">trading_client.preview_order</div>
+        <ul>
+          <li>Returns: <code>cost</code> = <code>order_cost + commission + fees</code></li>
+          <li>Validates contract, surfaces real fees (in prod)</li>
+          <li>Drift check: preview vs signal price &gt; threshold → log <code>ORDER_PREVIEW_DRIFT</code></li>
+        </ul>
+      </div>
+      <div class="arrow">▼</div>
+
+      <div class="box cash critical">
+        <div class="title">★ Cash / GFV gate</div>
+        <div class="ref">order_manager._preview_or_abort:298–382</div>
+        <ul>
+          <li>Fetch <code>balances.cash.cash_available</code> (settled cash)</li>
+          <li>Fallback to <code>total_cash</code> if account isn't a cash type (logs warning)</li>
+          <li>Subtract sum of pending <strong>buy reservations</strong> for this user</li>
+          <li>Reject if <code>cost + fee_buffer &gt; effective_avail</code></li>
+          <li>On approve: acquire reservation UUID (60 s TTL)</li>
+        </ul>
+      </div>
+      <div class="arrow">▼</div>
+
+      <div class="box broker">
+        <div class="title">Place order → poll fill → record Trade + Position</div>
+        <div class="ref">order_manager.py:543–674</div>
+      </div>
+      <div class="arrow">▼</div>
+
+      <div class="box terminal">
+        <div class="title">finally: release reservation</div>
+        <div class="ref">order_manager.py:674</div>
+      </div>
+    </div>
+
+    <div class="col" style="flex:1.1">
+      <h2 style="margin-top:0">Why this matters</h2>
+
+      <div class="box" style="background:#fffbe6">
+        <div class="title">The two failure modes we prevent</div>
+        <ul>
+          <li><strong>GFV (Good Faith Violation):</strong> buying with funds from
+            a sale that hasn't settled yet, then selling the new position before
+            those funds settle. 3 GFVs in 12 months → 90-day settled-cash-only
+            restriction by the broker.</li>
+          <li><strong>Double-spend race:</strong> two signals fire in the same
+            tick window. Both call <code>get_balances</code> before either
+            order is registered server-side. Without a reservation ledger,
+            both gates see the same cash and approve.</li>
+        </ul>
+      </div>
+
+      <div class="box exit" style="margin-top:8pt">
+        <div class="title">Exit path — never blocked by cash</div>
+        <ul>
+          <li>Sells generate cash → no GFV from a close</li>
+          <li><code>_preview_or_abort</code> only runs the cash gate <code>if side == 'buy'</code></li>
+          <li>Existing positions remain closeable even when:
+            <ul>
+              <li>cash is zero</li>
+              <li>account daily-loss cap is breached</li>
+              <li>user role was demoted mid-session</li>
+            </ul>
+          </li>
+        </ul>
+      </div>
+
+      <div class="box" style="background:#f6f6f6;margin-top:8pt">
+        <div class="title">What's NOT in our gate (intentionally)</div>
+        <ul>
+          <li>No buying-power calc — we're cash-only, no margin</li>
+          <li>No PDT counter — settled-cash accounts aren't subject to PDT</li>
+          <li>No GFV counter — we just never allow the conditions for one</li>
+        </ul>
+      </div>
+    </div>
+
+  </div>
+
+  <div class="footer">
+    <span>VegaPunkR · cash_deepdive · page 1 of 3</span>
+    <span>Continues with reservation lifecycle on page 2</span>
+  </div>
+</section>
+
+
+<!-- ============================================================== -->
+<!-- PAGE 2: Reservation lifecycle (timeline + scenarios)            -->
+<!-- ============================================================== -->
+<section class="page">
+  <h1>Cash reservation ledger — lifecycle</h1>
+  <div class="subtitle">
+    Process-scoped, in-memory, UUID-keyed · class attr on <code>OrderManager</code> ·
+    survives nothing across restarts (broker is source of truth on restart)
+  </div>
+
+  <h2>Worked example — buy 2 SPY 0DTE calls @ $1.50</h2>
+  <div class="timeline">
+
+    <div class="event">
+      <div><span class="stamp">T0</span> <span class="desc"><strong>Signal generated</strong> · qty=2, est. premium $1.50</span></div>
+    </div>
+
+    <div class="event">
+      <div><span class="stamp">T1</span> <span class="desc">Tradier <code>preview_order</code> returns:</span></div>
+      <div class="formula">cost = 2 × 100 × $1.50 + commission + fees = $300.00 (prod) | $300.00 (sandbox)</div>
+    </div>
+
+    <div class="event">
+      <div><span class="stamp">T2</span> <span class="desc">Fetch <code>balances.cash.cash_available</code> from Tradier</span></div>
+      <div class="formula">settled_cash = $1,000.00</div>
+      <div class="note">If <code>cash</code> block is absent (non-cash account, sandbox quirks), falls back to <code>total_cash</code> and logs a warning.</div>
+    </div>
+
+    <div class="event">
+      <div><span class="stamp">T3</span> <span class="desc">Sum active reservations for this user (purges expired first)</span></div>
+      <div class="formula">active_reservations = $0.00  (none pending)</div>
+    </div>
+
+    <div class="event">
+      <div><span class="stamp">T4</span> <span class="desc">Compute required &amp; effective</span></div>
+      <div class="formula">fee_buffer = qty × $0.65 = $1.30 (sandbox) | $0.00 (prod, fees already in cost)</div>
+      <div class="formula">required = cost + fee_buffer = $301.30 (sandbox) | $300.00 (prod)</div>
+      <div class="formula">effective_avail = settled_cash − active_reservations = $1,000.00</div>
+    </div>
+
+    <div class="event critical">
+      <div><span class="stamp">T5</span> <span class="desc"><strong>Decision:</strong> $301.30 ≤ $1,000.00 → APPROVE</span></div>
+      <div class="formula">reservation_id = uuid4() · expires_at = now + 60 s · amount = $301.30</div>
+      <div class="note">Inserted into <code>_pending_buy_reservations</code> class dict.</div>
+    </div>
+
+    <div class="event">
+      <div><span class="stamp">T6</span> <span class="desc"><em>(concurrent)</em> Second signal fires same tick — wants $400 buy</span></div>
+      <div class="formula">settled_cash = $1,000.00  (Tradier hasn't reflected our T5 order yet)</div>
+      <div class="formula">active_reservations = $301.30  (from T5 — still held)</div>
+      <div class="formula">effective_avail = $698.70  ← <strong>shrunk by reservation</strong></div>
+      <div class="formula">$400 ≤ $698.70 → APPROVE second buy as well</div>
+      <div class="note">Had T6 been $750, it would have been REJECTED. No double-spend.</div>
+    </div>
+
+    <div class="event">
+      <div><span class="stamp">T7</span> <span class="desc">Tradier fills the T5 order · Trade + Position rows written · notification fires</span></div>
+    </div>
+
+    <div class="event critical">
+      <div><span class="stamp">T8</span> <span class="desc"><strong><code>finally:</code> release reservation UUID</strong></span></div>
+      <div class="formula">_pending_buy_reservations.pop(reservation_id, None)</div>
+      <div class="note">Runs on every terminal outcome — filled, rejected, canceled, expired, exception. Even if the cash gate approved but the broker call later raised.</div>
+    </div>
+
+  </div>
+
+  <h2 style="margin-top:12pt">Failure-mode scenarios</h2>
+  <div class="scenario-grid">
+
+    <div class="scenario">
+      <div class="title">A. Concurrent same-tick buys ($1k cash, two $600 buys)</div>
+      <div>1st: approved, reserves $600. 2nd: sees $400 effective → <strong>rejected</strong>. No double-spend on $1,000 of settled cash.</div>
+      <div class="outcome">Outcome: at most one of the two fills. ✓</div>
+    </div>
+
+    <div class="scenario">
+      <div class="title">B. Approved but broker call raises</div>
+      <div>Preview OK, reservation acquired, then <code>place_order</code> throws (network, rate limit). <code>finally:</code> releases the UUID immediately.</div>
+      <div class="outcome">Outcome: cash freed up for next signal. No orphan reservation. ✓</div>
+    </div>
+
+    <div class="scenario">
+      <div class="title">C. Process crashes after acquire, before release</div>
+      <div>Class dict is in-memory only — full restart wipes all reservations. If just the calling task dies, TTL kicks in after 60 s, the next sum-call purges and logs a warning.</div>
+      <div class="outcome">Outcome: cash gets unlocked at most 60 s late. ✓</div>
+    </div>
+
+    <div class="scenario">
+      <div class="title">D. Just sold for $500; immediately try to buy with that cash</div>
+      <div>Tradier's <code>cash.cash_available</code> reflects only <strong>settled</strong> cash. Until T+1 settlement, the $500 isn't in <code>cash_available</code> — our gate sees no $500.</div>
+      <div class="outcome">Outcome: buy rejected. GFV scenario impossible. ✓</div>
+    </div>
+
+    <div class="scenario">
+      <div class="title">E. Sandbox env, preview returns commission=0/fees=0</div>
+      <div><code>fee_buffer = qty × $0.65</code> is added so the gate behaves like prod. Without it, a sandbox-approved buy could fail at the edge of settled cash in live.</div>
+      <div class="outcome">Outcome: dev/test parity with prod. ✓</div>
+    </div>
+
+    <div class="scenario">
+      <div class="title">F. Strategy demoted mid-session (user → viewer)</div>
+      <div>Next buy: role gate rejects (line 421). Existing position: <code>close_position</code> doesn't run the role gate or the cash gate. Open position can still exit on SL/TP/time.</div>
+      <div class="outcome">Outcome: open trades remain closeable. ✓</div>
+    </div>
+
+  </div>
+
+  <div class="verify">
+    <h3>Verify — circle which scenario applies, write any concern</h3>
+    <span class="check">Reservation amount = <code>required</code> (cost + fee_buffer), not just cost. Matches what the broker will debit. <span class="blank"></span></span>
+    <span class="check">TTL of 60 s · short enough for fast unlock, long enough that normal fills (1–5 s) finish well before expiry. <span class="blank"></span></span>
+    <span class="check">Process-scoped: if you run multiple worker processes, each holds its own ledger. <strong>This is a gap if you scale out.</strong> <span class="blank"></span></span>
+    <span class="check">Tradier's <code>cash.cash_available</code> is authoritative — verify it on the live account before relying on this gate. <span class="blank"></span></span>
+    <span class="check">Sells never enter this gate — confirmed by reading line 299 (<code>if side == "buy":</code>). <span class="blank"></span></span>
+  </div>
+
+  <div class="footer">
+    <span>VegaPunkR · cash_deepdive · page 2 of 3</span>
+    <span>Source: <code>api/engine/order_manager.py</code> lines 24–172, 298–382, 668–674</span>
+  </div>
+</section>
+
+
+<!-- ============================================================== -->
+<!-- PAGE 3: SPY vs TSLA                                              -->
+<!-- ============================================================== -->
+<section class="page">
+  <h1>Strategy comparison · SPY vs TSLA</h1>
+  <div class="subtitle">
+    Source: <code>api/strategy_templates.py</code> · Yellow cells = values differ between strategies
+  </div>
+
+  <table class="strat">
+    <colgroup>
+      <col style="width:38%"><col style="width:31%"><col style="width:31%">
+    </colgroup>
+    <thead>
+      <tr>
+        <th>Parameter</th>
+        <th>SPY 0DTE Scalping</th>
+        <th>TSLA 0DTE Scalping</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr class="section-head"><td colspan="3">Entry conditions</td></tr>
+      <tr><td>EMA period</td><td class="num">9</td><td class="num">9</td></tr>
+      <tr><td>Use VWAP</td><td>yes</td><td>yes</td></tr>
+      <tr><td>Entry signal</td><td>price above 9EMA &amp; VWAP</td><td>price above 9EMA &amp; VWAP</td></tr>
+      <tr class="diff"><td>Volume spike multiplier</td><td class="num">2.0×</td><td class="num">2.5×</td></tr>
+      <tr><td>Delta range</td><td class="num">0.60 – 0.85</td><td class="num">0.60 – 0.85</td></tr>
+      <tr><td>Min open interest</td><td class="num">3,000</td><td class="num">3,000</td></tr>
+      <tr><td>Max bid-ask spread</td><td class="num">20%</td><td class="num">20%</td></tr>
+      <tr><td>Confirmation required</td><td>yes (≥2 indicators)</td><td>yes (≥2 indicators)</td></tr>
+
+      <tr class="section-head"><td colspan="3">Risk &amp; sizing</td></tr>
+      <tr class="diff"><td>Risk per trade</td><td class="num">1.5% of account</td><td class="num">1.0% of account</td></tr>
+      <tr class="diff"><td>Max position $</td><td class="num">$500</td><td class="num">$400</td></tr>
+      <tr class="diff"><td>Max contracts</td><td class="num">3</td><td class="num">2</td></tr>
+      <tr class="diff"><td>Max positions (open)</td><td class="num">2</td><td class="num">1</td></tr>
+
+      <tr class="section-head"><td colspan="3">Exits</td></tr>
+      <tr class="diff"><td>Take profit</td><td class="num">25%</td><td class="num">30%</td></tr>
+      <tr class="diff"><td>Stop loss</td><td class="num">50%</td><td class="num">40%</td></tr>
+      <tr class="diff"><td>Reward : risk</td><td class="num">1 : 2.0</td><td class="num">1 : 1.33</td></tr>
+      <tr><td>Trailing stop</td><td>yes</td><td>yes</td></tr>
+      <tr class="diff"><td>Trailing activation</td><td class="num">+15% pnl</td><td class="num">+20% pnl</td></tr>
+      <tr><td>Trailing distance</td><td class="num">10% off peak</td><td class="num">10% off peak</td></tr>
+
+      <tr class="section-head"><td colspan="3">Time windows</td></tr>
+      <tr><td>Entry after open</td><td class="num">30 min</td><td class="num">30 min</td></tr>
+      <tr class="diff"><td>Exit before close</td><td class="num">15 min</td><td class="num">20 min</td></tr>
+      <tr class="diff"><td>Max hold time</td><td class="num">30 min</td><td class="num">20 min</td></tr>
+
+      <tr class="section-head"><td colspan="3">Account / meta</td></tr>
+      <tr class="diff"><td>Recommended min account</td><td class="num">$1,000</td><td class="num">$2,000</td></tr>
+      <tr class="diff"><td>Difficulty</td><td>intermediate</td><td>advanced</td></tr>
+      <tr><td>0DTE options</td><td>yes</td><td>yes (+ gamma_scalping_mode)</td></tr>
+    </tbody>
+  </table>
+
+  <div class="verify">
+    <h3>Cash-gate stress test against these params</h3>
+    <span class="check">SPY worst case: 2 positions × $500 = $1,000 reserved. Needs ≥$1,000 settled cash to open both. <span class="blank"></span></span>
+    <span class="check">TSLA worst case: 1 position × $400 = $400 reserved. Single-name concentration intentional. <span class="blank"></span></span>
+    <span class="check">Both running together: $1,000 SPY + $400 TSLA = $1,400 max reservation at once. <span class="blank"></span></span>
+    <span class="check">If account is $2,000 settled: 70% of cash can be reserved. Buffer left for next signal? <span class="blank"></span></span>
+    <span class="check">After full SL hit (lose 50% of $500 = $250 on SPY, 40% of $400 = $160 on TSLA): cash drops to ~$1,590 but unsettled until T+1. <span class="blank"></span></span>
+    <span class="check">Account-wide daily loss cap should trip before you lose enough to risk GFV from re-deployment urgency. <span class="blank"></span></span>
+  </div>
+
+  <div class="notes-area">
+    <h3 style="margin-top:0">Notes / changes I want</h3>
+    <div class="lines"></div>
+  </div>
+
+  <div class="footer">
+    <span>VegaPunkR · cash_deepdive · page 3 of 3</span>
+    <span>Templates loaded into DB via clone-from-template API</span>
+  </div>
+</section>
+
+</body>
+</html>

@@ -1,6 +1,6 @@
 <h2 mat-dialog-title>
-  <mat-icon class="title-icon">account_circle</mat-icon>
-  Profile
+  <mat-icon class="title-icon">settings</mat-icon>
+  Settings
 </h2>
 
 <mat-dialog-content>
@@ -37,9 +37,10 @@
     <mat-divider class="section-divider"></mat-divider>
     <h3 class="section-title">Risk limits</h3>
     <p class="section-hint">
-      Halts new entries account-wide once today's realized + unrealized loss
-      reaches this percentage of your account size. Existing positions can
-      still be closed normally; the cap resets at midnight ET.
+      Daily loss halts new entries account-wide once today's realized + unrealized
+      loss reaches this percentage of your account size. Existing positions stay
+      closeable; the cap resets at midnight ET. Account size and max trade size
+      drive position sizing.
     </p>
 
     <mat-form-field appearance="outline" class="full-width">
@@ -55,6 +56,215 @@
       />
       <mat-hint>0.5% – 20%. Default 5%.</mat-hint>
     </mat-form-field>
+
+    <mat-form-field appearance="outline" class="full-width">
+      <mat-label>Account size (USD)</mat-label>
+      <input
+        matInput
+        type="number"
+        min="0"
+        step="100"
+        [value]="accountSizeUsd()"
+        (input)="accountSizeUsd.set(+$any($event.target).value)"
+      />
+      <mat-hint>Used as the denominator for daily loss and position sizing.</mat-hint>
+    </mat-form-field>
+
+    <mat-form-field appearance="outline" class="full-width">
+      <mat-label>Max trade size (% of account)</mat-label>
+      <input
+        matInput
+        type="number"
+        min="0.1"
+        max="100"
+        step="0.1"
+        [value]="maxTradePercentage()"
+        (input)="maxTradePercentage.set(+$any($event.target).value)"
+      />
+      <mat-hint>Default 2%. Sizing cap per individual position.</mat-hint>
+    </mat-form-field>
+
+    <mat-divider class="section-divider"></mat-divider>
+    <h3 class="section-title">Trading window</h3>
+    <p class="section-hint">
+      When enabled, no entries fire before <strong>start</strong> or after
+      <strong>end</strong>, and any open position is force-exited at
+      <strong>end</strong>. The strategy's own opening-noise and exit-before-close
+      rules still apply — the more restrictive bound wins.
+    </p>
+
+    <div class="row">
+      <mat-slide-toggle
+        [checked]="windowEnabled()"
+        (change)="windowEnabled.set($event.checked)"
+      >
+        Enforce account window
+      </mat-slide-toggle>
+    </div>
+
+    <div class="row time-row" [class.disabled]="!windowEnabled()">
+      <mat-form-field appearance="outline">
+        <mat-label>Start (ET)</mat-label>
+        <input
+          matInput
+          type="time"
+          [value]="windowStart()"
+          (change)="windowStart.set($any($event.target).value)"
+          [disabled]="!windowEnabled()"
+        />
+      </mat-form-field>
+
+      <mat-form-field appearance="outline">
+        <mat-label>End (ET)</mat-label>
+        <input
+          matInput
+          type="time"
+          [value]="windowEnd()"
+          (change)="windowEnd.set($any($event.target).value)"
+          [disabled]="!windowEnabled()"
+        />
+      </mat-form-field>
+    </div>
+
+    <mat-divider class="section-divider"></mat-divider>
+    <h3 class="section-title">Discord notifications</h3>
+    <p class="section-hint">
+      Posts a Discord embed for every position open and close. Create a webhook
+      in your server's channel settings → Integrations → Webhooks, then paste
+      the URL below.
+    </p>
+
+    <div class="row">
+      <mat-slide-toggle
+        [checked]="discordEnabled()"
+        (change)="discordEnabled.set($event.checked)"
+      >
+        Enable Discord notifications
+      </mat-slide-toggle>
+    </div>
+
+    <div class="row" [class.disabled]="!discordEnabled()">
+      <mat-form-field appearance="outline" class="full-width">
+        <mat-label>Webhook URL</mat-label>
+        <input
+          matInput
+          type="url"
+          placeholder="https://discord.com/api/webhooks/..."
+          [value]="discordWebhookUrl()"
+          (input)="discordWebhookUrl.set($any($event.target).value)"
+          [disabled]="!discordEnabled()"
+        />
+      </mat-form-field>
+    </div>
+
+    <div class="row toggles" [class.disabled]="!discordEnabled()">
+      <mat-slide-toggle
+        [checked]="discordNotifyOpen()"
+        (change)="discordNotifyOpen.set($event.checked)"
+        [disabled]="!discordEnabled()"
+      >
+        Notify on open
+      </mat-slide-toggle>
+      <mat-slide-toggle
+        [checked]="discordNotifyClose()"
+        (change)="discordNotifyClose.set($event.checked)"
+        [disabled]="!discordEnabled()"
+      >
+        Notify on close
+      </mat-slide-toggle>
+    </div>
+
+    <div class="row test-row">
+      <button
+        mat-stroked-button
+        (click)="sendDiscordTest()"
+        [disabled]="discordTesting() || saving() || !discordWebhookUrl()"
+      >
+        @if (discordTesting()) {
+          <mat-spinner diameter="18"></mat-spinner>
+        } @else {
+          <ng-container>
+            <mat-icon>send</mat-icon>
+            Send test message
+          </ng-container>
+        }
+      </button>
+    </div>
+
+    @if (discordTestResult(); as res) {
+      <div class="result-row" [class.success]="res.ok" [class.failure]="!res.ok">
+        {{ res.message }}
+      </div>
+    }
+
+    <mat-divider class="section-divider"></mat-divider>
+    <h3 class="section-title">Email reports</h3>
+    <p class="section-hint">
+      End-of-period trade summaries 30 minutes after market close. Daily and
+      weekly skip empty periods; monthly, quarterly, and yearly always send.
+      Reports go to <strong>{{ email() || '(no email on file)' }}</strong>.
+    </p>
+
+    <div class="row">
+      <mat-slide-toggle
+        [checked]="emailEnabled()"
+        (change)="emailEnabled.set($event.checked)"
+      >
+        Enable email reports
+      </mat-slide-toggle>
+    </div>
+
+    <div class="row checkboxes" [class.disabled]="!emailEnabled()">
+      <mat-checkbox
+        [checked]="emailDaily()"
+        (change)="emailDaily.set($event.checked)"
+        [disabled]="!emailEnabled()"
+      >Daily <span class="cb-hint">(skipped on empty days)</span></mat-checkbox>
+      <mat-checkbox
+        [checked]="emailWeekly()"
+        (change)="emailWeekly.set($event.checked)"
+        [disabled]="!emailEnabled()"
+      >Weekly <span class="cb-hint">(skipped on empty weeks)</span></mat-checkbox>
+      <mat-checkbox
+        [checked]="emailMonthly()"
+        (change)="emailMonthly.set($event.checked)"
+        [disabled]="!emailEnabled()"
+      >Monthly</mat-checkbox>
+      <mat-checkbox
+        [checked]="emailQuarterly()"
+        (change)="emailQuarterly.set($event.checked)"
+        [disabled]="!emailEnabled()"
+      >Quarterly</mat-checkbox>
+      <mat-checkbox
+        [checked]="emailYearly()"
+        (change)="emailYearly.set($event.checked)"
+        [disabled]="!emailEnabled()"
+      >Yearly</mat-checkbox>
+    </div>
+
+    <div class="row test-row">
+      <button
+        mat-stroked-button
+        (click)="sendEmailTest()"
+        [disabled]="emailTesting() || saving() || !email()"
+      >
+        @if (emailTesting()) {
+          <mat-spinner diameter="18"></mat-spinner>
+        } @else {
+          <ng-container>
+            <mat-icon>send</mat-icon>
+            Send test report
+          </ng-container>
+        }
+      </button>
+      <span class="test-hint">Sends a real-shaped daily report against today's trades.</span>
+    </div>
+
+    @if (emailTestResult(); as res) {
+      <div class="result-row" [class.success]="res.ok" [class.failure]="!res.ok">
+        {{ res.message }}
+      </div>
+    }
 
     <mat-divider class="section-divider"></mat-divider>
     <h3 class="section-title">Change password</h3>
@@ -96,9 +306,6 @@
 
     @if (error()) {
       <div class="error-row">{{ error() }}</div>
-    }
-    @if (success()) {
-      <div class="success-row">{{ success() }}</div>
     }
   }
 </mat-dialog-content>

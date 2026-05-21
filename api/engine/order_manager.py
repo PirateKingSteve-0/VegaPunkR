@@ -82,6 +82,13 @@ class OrderManager:
     # Keyed by (user_id, symbol). Values are last submission timestamps (UTC).
     _last_order_at: Dict[Tuple[int, str], datetime] = {}
 
+    # Throttle-event dedupe: per (user_id, symbol), the _last_order_at value
+    # we've already emitted ORDER_RATE_LIMITED for. Workers retry every tick
+    # while the 5s window holds, which produced ~4 duplicate events per cycle
+    # in the system_events table. Resets implicitly when a new order stamps
+    # _last_order_at to a new timestamp.
+    _throttle_logged_for: Dict[Tuple[int, str], datetime] = {}
+
     # Class-level pending-buy ledger — in-memory, process-scoped. Survives
     # nothing across restarts (broker is the source of truth post-restart).
     # Maps reservation_id -> {user_id, amount, expires_at}.
@@ -105,6 +112,19 @@ class OrderManager:
     @classmethod
     def _stamp_order_submitted(cls, user_id: int, symbol: str) -> None:
         cls._last_order_at[(user_id, symbol)] = datetime.utcnow()
+
+    @classmethod
+    def _should_log_throttle(cls, user_id: int, symbol: str) -> bool:
+        """First throttle hit within a window → True (emit the event).
+        Subsequent hits referencing the same _last_order_at → False (suppress).
+        A new stamp advances _last_order_at, so the next window logs again."""
+        current = cls._last_order_at.get((user_id, symbol))
+        if current is None:
+            return True
+        if cls._throttle_logged_for.get((user_id, symbol)) == current:
+            return False
+        cls._throttle_logged_for[(user_id, symbol)] = current
+        return True
 
     @classmethod
     def _purge_expired_reservations(cls) -> None:
@@ -461,17 +481,18 @@ class OrderManager:
                     f"{MIN_ORDER_INTERVAL_SECONDS:.1f}s ({wait_s:.1f}s remaining)"
                 )
                 logger.warning(msg)
-                log_event(
-                    db=self.db,
-                    user_id=user.id,
-                    event_type="ORDER_RATE_LIMITED",
-                    title=f"Order throttled: {symbol}",
-                    detail=msg,
-                    symbol=symbol,
-                    strategy_id=strategy.id,
-                    severity="warning",
-                    event_data={"wait_seconds": round(wait_s, 2)},
-                )
+                if self._should_log_throttle(user.id, symbol):
+                    log_event(
+                        db=self.db,
+                        user_id=user.id,
+                        event_type="ORDER_RATE_LIMITED",
+                        title=f"Order throttled: {symbol}",
+                        detail=msg,
+                        symbol=symbol,
+                        strategy_id=strategy.id,
+                        severity="warning",
+                        event_data={"wait_seconds": round(wait_s, 2)},
+                    )
                 return OrderResult(success=False, message=msg)
 
             self._stamp_order_submitted(user.id, symbol)
@@ -1102,17 +1123,18 @@ class OrderManager:
                 f"{MIN_ORDER_INTERVAL_SECONDS:.1f}s ({wait_s:.1f}s remaining)"
             )
             logger.warning(msg)
-            log_event(
-                db=self.db,
-                user_id=user.id,
-                event_type="ORDER_RATE_LIMITED",
-                title=f"Close throttled: {position.symbol}",
-                detail=msg,
-                symbol=position.symbol,
-                strategy_id=strategy.id,
-                severity="warning",
-                event_data={"wait_seconds": round(wait_s, 2)},
-            )
+            if self._should_log_throttle(user.id, position.symbol):
+                log_event(
+                    db=self.db,
+                    user_id=user.id,
+                    event_type="ORDER_RATE_LIMITED",
+                    title=f"Close throttled: {position.symbol}",
+                    detail=msg,
+                    symbol=position.symbol,
+                    strategy_id=strategy.id,
+                    severity="warning",
+                    event_data={"wait_seconds": round(wait_s, 2)},
+                )
             return OrderResult(success=False, message=msg)
 
         self._stamp_order_submitted(user.id, position.symbol)
