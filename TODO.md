@@ -46,7 +46,7 @@ Observed 2026-05-07 — some SL exits realized at ~50% loss when the configured 
 
 We need to figure out if we need to preview orders before execution. Whether that would be for slippage or for possible reconsideration in executing a trade for true TP defined. Important clarification: previews already run for buying-power validation (see `_preview_or_abort`); this item is specifically about whether to ALSO use preview output to **cancel** a signal when the preview-vs-signal price drift means the trade no longer pencils out. Per-strategy equity curves now exist (DONE 2026-05-09 Part 5), so the cross-strategy realized-vs-modeled comparison the cancel-rule decision was waiting on is unblocked — pending only that a few weeks of `ORDER_PREVIEW_DRIFT` events accumulate.
 
-- **Data collection in flight:** entry-drift is now logged on every option buy as a structured `ORDER_PREVIEW_DRIFT` event in the system_events table. `event_data` carries `signal_price`, `preview_per_contract`, `drift_pct`, `drift_dollars`, `qty`, `option_symbol`, `order_cost`. Observation only — no cancel logic yet, no behavior change. After a few weeks of trading there will be a real drift distribution.
+- **Data collection in flight:** entry-drift is now logged on every option buy as a structured `ORDER_PREVIEW_DRIFT` event in the system_events table. `event_data` carries `signal_price`, `preview_per_contract`, `drift_pct`, `drift_dollars`, `qty`, `option_symbol`, `order_cost`. Observation only — no cancel logic yet, no behavior change. After a fewN weeks of trading there will be a real drift distribution.
 - **Threshold framing when the time comes:** arbitrary % drift is one option (easy, but the % is a guess). Economic break-even (`target_profit_at_new_price - 2 × fees - expected_exit_slippage ≤ 0`) is the right one once we have the inputs — the trade is no longer net-positive in expectation. Decide after the data lands.
 - **Exit-drift counterpart lives in B1** — once that logging is wired, the same analysis applies symmetrically.
 
@@ -57,6 +57,12 @@ We need to figure out if we need to preview orders before execution. Whether tha
 ### C1. Backtesting feature
 
 We need to add a feature for backtesting data. What im thinking is what if we were able to use an available api call from tradier or a different broker to be able to help us collect data and test strategies. We could make it so when backtesting we can give params or constraints such as account size or other things to see how it might behave based on different things? Equity curves landed 2026-05-09 (DONE) — backtest results can now share the chart shape and overlay against live performance.
+
+---
+
+## D. A standalone button so we can say hey we are finishing trading today. As opposed to just deactivating the strategy
+
+I would like to add a button/feature that allows us to pause trading for the day. As of now I would have to go through the strategies page and deactivate the strategy
 
 ---
 
@@ -75,6 +81,21 @@ We need to add a feature for backtesting data. What im thinking is what if we we
     - **Backend sketch:** new `GET /strategies/news-outlook` returning `[{strategy_id, outlook, score, top_headlines: [{title, url, ts}]}]`. Cache per (symbol, ET-date) so reload doesn't re-bill the news API; in-process refresh every ~15 min during market hours.
     - **UI sketch:** new "Outlook" column rendered as a colored chip themed via existing `--color-profit` / `--color-warning` / `--color-loss` tokens (no new palette work). Tooltip = top 2–3 headlines; click → drawer with all of today's articles + per-article sentiment so the chip is auditable.
     - **Open questions:** does "today" mean ET-calendar-day or last-24h-rolling? Should pre-market news flip the outlook before open, or only RTH?
+
+---
+
+## E. Broker routing — live trading mode connects to Schwab instead of Tradier
+
+**Tradier is the live broker; Schwab integration is dormant** (mounted but unused). But the client selector routes **live mode to Schwab**, so switching a user to live trading tries to open a Schwab connection.
+
+### E1. `live` trading mode must use Tradier live, not Schwab
+
+- **Symptom (observed 2026-07-08):** switching to live trading mode to view account info triggered a **Schwab** connection attempt. The user only wanted account info — no order intent — but even read-only account calls route through the same client selector.
+- **Root cause:** `TradingClientManager.get_client()` (`api/engine/trading_client_manager.py:61-70`) maps `user.selected_trading_mode == "paper"` → `_get_tradier_client()` (Tradier sandbox) and `"live"` → `_get_schwab_client()` (`:91-109`). There is **no Tradier-live path** — live is hardwired to Schwab. Meanwhile config already has the Tradier live credentials (`TRADIER_LIVE_API_KEY`, `TRADIER_LIVE_BASE_URL`, `TRADIER_ENV` in `api/config.py:68-70`), so the intended live broker is Tradier.
+- **Intended behavior:** `live` mode should return a Tradier client pointed at the **live** API (`api.tradier.com`), `paper` mode a Tradier client pointed at **sandbox**. Schwab should not be reachable from the normal client selector while it's dormant.
+- **Investigate first (before editing):** does `TradierClient()` (`api/tradier_integration/client.py`) already accept a sandbox-vs-live selector, or does `_get_tradier_client()` always build sandbox? Currently it's constructed with no args (`:83`). Determine whether live is `TradierClient(env="live")` / reads `TRADIER_ENV`, or needs a new arg. Also decide: should *read-only account info* even depend on trading mode, or should account/balance reads always use one broker regardless of paper/live?
+- **⚠️ Engine-integrity file.** `trading_client_manager` is in the protected engine set (see CLAUDE.md). This changes which broker **real orders** are placed against — behavioral change, reason stated, must preserve the `_preview_or_abort` path, role gates, and cash-reservation ledger. Do **not** silently repoint order routing; confirm the Tradier live client places/preview orders correctly (and that `order_manager` sell/exit paths still work) before considering it safe.
+- **Interim:** until fixed, keep `selected_trading_mode` on `paper` (Tradier sandbox) to avoid the Schwab path. If you only need live *account info*, that's currently coupled to the Schwab client — part of why the read/trade broker split above is worth deciding.
 
 ---
 

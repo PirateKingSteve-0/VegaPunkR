@@ -76,14 +76,14 @@ async def get_environment(
         - environment: Current database environment (dev/test/prod)
         - trading_mode: Current trading mode (paper/live)
         - database: Database name being used
-        - trading_api: Trading API being used (Alpaca Paper or Schwab Live)
+        - trading_api: Trading API being used (Tradier sandbox or live)
         - can_toggle_trading_mode: Whether user can toggle between paper and live
     """
     env = current_user.selected_environment or "dev"
     mode = current_user.selected_trading_mode or "paper"
 
     # Determine which trading API is active
-    trading_api = "Alpaca Paper" if mode == "paper" else "Schwab Live"
+    trading_api = "Tradier (sandbox)" if mode == "paper" else "Tradier (live)"
 
     # Determine database name
     db_name = f"vegapunk_{env}"
@@ -168,7 +168,7 @@ async def set_trading_mode(
     """
     Toggle trading mode between paper and live trading.
 
-    This switches between Alpaca Paper Trading and Schwab Live Trading APIs.
+    This switches between Tradier sandbox (paper) and Tradier live trading.
     No server restart required - switch happens instantly.
 
     Args:
@@ -199,8 +199,8 @@ async def set_trading_mode(
     db.refresh(current_user)
 
     # Determine which API will be used
-    old_api = "Alpaca Paper" if old_mode == "paper" else "Schwab Live"
-    new_api = "Alpaca Paper" if request.mode == "paper" else "Schwab Live"
+    old_api = "Tradier (sandbox)" if old_mode == "paper" else "Tradier (live)"
+    new_api = "Tradier (sandbox)" if request.mode == "paper" else "Tradier (live)"
 
     if request.mode == "live":
         logger.error(f"⚠️  TRADING MODE SWITCH TO LIVE - User {current_user.email}")

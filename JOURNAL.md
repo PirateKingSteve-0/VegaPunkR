@@ -6501,3 +6501,148 @@ Documenting so we don't re-debug this:
 - **Things deliberately not done.** No SVG flowchart (HTML/CSS boxes print just as well and are trivially editable). No regenerated artifact on the codebase (these are docs, not code). No Mermaid (renders inconsistently across browsers when printed). No `git add` — left untracked so the next person can decide whether to commit or keep them as throwaway working docs.
 
 ---
+
+## Session Date: July 8, 2026
+
+### Migrated the database from local Docker to AWS RDS (shared across laptop + PC)
+
+**Goal.** Run one database in the cloud so the same data is reachable from both the desktop (`Lulusia`, `192.168.1.7`) and the laptop, instead of each machine having its own local Postgres. Endpoint that resulted: `vegapunkr-db.c5ugmsk2a241.us-west-1.rds.amazonaws.com:5432`. Full runbook lives in [docs/aws_pg_setup.md](docs/aws_pg_setup.md) — this journal entry is the *why* and the play-by-play.
+
+#### Decision 1 — Which AWS option (and the TimescaleDB red herring)
+
+Starting assumption was "we use TimescaleDB, so RDS is out" (AWS RDS/Aurora don't support the TimescaleDB extension). That would have forced EC2-self-managed or Timescale Cloud. But inspecting the code showed TimescaleDB is **barely used**: the only Timescale feature in the repo is a single hypertable on `trades` (`api/setup_db.py:44`, `api/models.py:118`). No `time_bucket`, no continuous aggregates, no compression, no retention policies. And `setup_db.py:52` already prints *"This is OK if you're using regular PostgreSQL instead of TimescaleDB"* — the app is explicitly designed to run on plain Postgres.
+
+```bash
+# what proved Timescale is essentially unused
+grep -rniE "time_bucket|continuous_aggregate|add_compression|create_hypertable" api/ --include=*.py
+#   -> only setup_db.py + a comment in models.py
+```
+
+**Conclusion: dropping TimescaleDB costs nothing at our scale** (a personal cash account does dozens of trades/day; hypertable partitioning only pays off at millions of rows, and can be re-added later with `pg_partman`). That put **managed RDS PostgreSQL** back on the table, which is the right call for a real-money app — automatic backups + auto-recovery matter more than a partitioning feature we don't use. Chose RDS over EC2 (didn't want to own patching/backups) and over Timescale Cloud (no reason to keep Timescale).
+
+#### Decision 2 — RDS instance config (cost-minimal, on purpose)
+
+Created via **Full configuration** (not Express — Express hides Public Access, initial DB name, and the security group, and defaults Public Access to *No*). Key choices and why:
+
+- **Engine: PostgreSQL 16.14-R2** — matches local `pg_dump`/`psql` 16.14 exactly and the local `timescaledb:latest-pg16` major, so dump/restore is byte-compatible. Deliberately *not* 17/18 (client-version gap risk, zero benefit here).
+- **db.t4g.micro, Single-AZ ("Do not create a standby"), 20 GiB gp3, storage-autoscaling OFF** — ~$15/mo. Multi-AZ would double cost for HA we don't need; autoscaling-off prevents surprise bills.
+- **Provisioned IOPS gotcha:** the console tried to default gp3 to **12,000 IOPS** (~+$45/mo). Knocked back to the free **3,000** baseline. Watch for this.
+- **RDS Proxy: OFF** (~$10-15/mo pooler we don't need — SQLAlchemy already pools, `pool_size` 10/15 in `api/database.py`).
+- **Enhanced Monitoring / DevOps Guru / CloudWatch log exports: OFF** (all add cost for observability we won't read). Performance Insights left on free 7-day tier.
+- **Public access: Yes** — required so the two home machines can connect directly (no jump box). *Not* a security hole: the security group is the real gate.
+- **Deletion protection: ON**, encryption ON with the default `aws/rds` KMS key (free; a CMK is ~$1/mo for key policies we don't need), auto-minor-version-upgrade ON, backups 7-day.
+- **Auth: Password authentication** (not IAM DB auth — the app uses a static password in the URL; IAM would need 15-min token generation code we don't have). **Self-managed** master password (not Secrets Manager — the $0.40/mo option the app isn't wired to read).
+
+#### Decision 3 — Networking / access
+
+Security group `vegapunkr-db-sg`, one inbound rule: **PostgreSQL/5432 from the home public IP `/32`** (`68.5.183.199/32`). Laptop shares the same public IP on the home network, so it's covered by the same rule with no extra entry. **Pitfall:** this breaks whenever the ISP rotates the public IP, or when either machine connects from a *different* network — then you must re-add the new IP (or move to Tailscale, which gives a stable private IP and needs no exposed port). We explicitly chose the IP-allowlist over Tailscale for now because both machines live on the same home LAN; documented Tailscale as the fallback.
+
+#### The initial-DB-name miss, and creating the databases
+
+The RDS instance came up **without** an initial database (the "Initial database name" field under Additional configuration was left blank). First connect failed clean:
+
+```
+psql: FATAL: database "vegapunkr_dev" does not exist
+```
+
+This was actually *good news* — it meant network + SSL + auth all worked (we got past auth to the DB lookup). Connected to the always-present `postgres` maintenance DB and created both databases by hand. Named them **`vegapunkr_`** (with the `r`, matching the instance name), which later caused a laptop `.env` mix-up — the username is `vegapunk` (no `r`) but host and DB names are `vegapunkr...` (with `r`). Easy to fumble.
+
+```bash
+psql "postgresql://vegapunk@vegapunkr-db.c5ugmsk2a241.us-west-1.rds.amazonaws.com:5432/postgres?sslmode=require"
+#   at postgres=> prompt:
+CREATE DATABASE vegapunkr_dev;
+CREATE DATABASE vegapunkr_prod;
+```
+
+#### Decision 4 — Build schema with create_all, NOT Alembic (schema-drift discovery)
+
+Ran `alembic upgrade head` against `vegapunkr_dev` first (clean — verified no migration references TimescaleDB, so nothing would choke on plain Postgres):
+
+```bash
+read -rs -p "RDS password: " PGPASSWORD; export PGPASSWORD; echo   # keeps pw out of history + URL
+RDS="postgresql://vegapunk@vegapunkr-db.c5ugmsk2a241.us-west-1.rds.amazonaws.com:5432/vegapunkr_dev?sslmode=require"
+DATABASE_URL="$RDS" alembic upgrade head    # env.py:25 reads DATABASE_URL; inline wins b/c load_dotenv override=False
+```
+
+That produced **only 6 tables**. But `models.py` defines **7** — `grep __tablename__ api/models.py` shows `system_events` (line 198) which **no migration creates**, and local dev had **2,179 rows** in it (the engine's `event_logger` writes there). **Finding: Alembic is behind `models.py`; `create_all` is the de-facto source of truth in this repo.** A DB built purely from Alembic is missing a table the app writes to. Saved this as a standing project note. Fix later: autogenerate a catch-up migration.
+
+So we rebuilt the RDS dev schema the same way local was clearly built — `create_all` from `models.py` (drops the 6 empty Alembic tables, recreates all 7). Guarantees structural parity with local regardless of hidden column drift:
+
+```bash
+DATABASE_DEV_URL="$RDS" DATABASE_URL="$RDS" python -c "
+from database import engines
+from config import Environment
+from models import Base
+e = engines[Environment.DEV]
+Base.metadata.drop_all(e); Base.metadata.create_all(e)
+print('rebuilt:', sorted(Base.metadata.tables.keys()))
+"
+```
+
+#### Decision 5 — Data migration method (validated by a local dress-rehearsal first)
+
+Rather than run risky commands blind against RDS, we did the whole procedure locally into a throwaway plain-Postgres DB (`vegapunkr_rehearsal`) and verified every row count before touching RDS. Two problems surfaced and got solved in rehearsal:
+
+1. **The dump captured TimescaleDB internals.** Because local `trades` is a hypertable, `pg_dump --data-only` pulled in a pile of `_timescaledb_catalog.*` tables that don't exist on plain RDS. Fix: restore with `--schema=public` so only the app tables load.
+2. **FK circular-constraint warning** from pg_dump (about the timescale internal tables) — irrelevant once we filter to `public`.
+
+```bash
+# dump (data only; exclude alembic_version so RDS keeps its own; custom format)
+pg_dump "postgresql://user:pass@localhost:5435/vegapunk_dev" \
+  --data-only --exclude-table=alembic_version -Fc -f ~/vegapunkr_dev_data.dump
+
+# restore into RDS
+pg_restore --data-only --disable-triggers --schema=public -d "$RDS" ~/vegapunkr_dev_data.dump
+```
+
+**The RDS `--disable-triggers` gotcha (important).** On RDS the restore threw 14 errors:
+
+```
+ERROR: permission denied: "RI_ConstraintTrigger_a_16641" is a system trigger
+Command was: ALTER TABLE public.users DISABLE TRIGGER ALL;
+```
+
+RDS's master user is `rds_superuser`, **not** a true superuser, so it can't disable the internal FK constraint triggers that `--disable-triggers` toggles. **But the data still loaded correctly** — those 14 errors were only the trigger enable/disable statements; the `COPY`s ran fine because `pg_dump` orders data parent-before-child (users → strategies → positions → trades → system_events), so no FK was ever violated. Verified counts matched local exactly:
+
+```
+users 1 | strategies 2 | positions 2 | trades 610 | system_events 2179   ✅
+```
+
+Sequences carried over automatically (the dump's `SEQUENCE SET` entries aren't triggers, so they applied): `trades_id_seq`=1035, `system_events_id_seq`=2179, etc. Empty tables (`performance_metrics`, `risk_events`) correctly show a NULL / not-yet-advanced sequence → first insert gets id 1. **Future note:** if a schema ever has genuinely out-of-order FKs where parent-first ordering *doesn't* save you, use `psql` with `SET session_replication_role = replica;` (which `rds_superuser` *is* allowed to do) instead of `pg_restore --disable-triggers`.
+
+Local **prod** DB (`:5434`) was **empty** (no tables), so RDS `vegapunkr_prod` just got the schema built via `create_all` — no data to move.
+
+#### Wiring the app + cleanup
+
+Both machines' `.env` got three lines pointed at RDS (`DATABASE_DEV_URL`, `DATABASE_PROD_URL`, legacy `DATABASE_URL`), leaving `DATABASE_TEST_URL` local. Password lives inline in the URL (`.env` is gitignored + untracked — confirmed with `git check-ignore .env`). Kept the old localhost URLs as `# local rollback:` comments beneath each for a trivial revert. Verified via the app's own config path (`config.py:9` calls `load_dotenv()` on import, so a plain `python -c` reads the same `.env` the app does):
+
+```bash
+python -c "
+from config import settings, Environment
+from database import engines
+from sqlalchemy import text
+print('DEV host:', settings.DATABASE_DEV_URL.split('@')[-1])
+with engines[Environment.DEV].connect() as c:
+    print('trades:', c.execute(text('SELECT count(*) FROM trades')).scalar())
+"
+#   -> DEV host: vegapunkr-db...vegapunkr_dev?sslmode=require ; trades: 610
+```
+
+Also deleted 5 dead `TIMESCALE_HOST/PORT/DB/USER/PASSWORD` vars from `.env` — confirmed unused anywhere in code (`grep -rniE "TIMESCALE_" --include=*.py` returns nothing outside venv/tests). They were leftover config pointing at localhost and only invited confusion.
+
+#### Pitfalls / future suggestions (carry-over)
+
+- **⚠️ Trading engine on ONE machine only.** Both machines now share the same `positions`/`trades` rows. Two running `stream_driven_worker`s = double-fired real orders. The engine-integrity rule about `_pending_buy_reservations` being process-scoped (see prior journal entry) is now *worse* across machines — there is no shared reservation ledger between PC and laptop. Keep the live engine pinned to one host.
+- **IP allowlist is brittle.** Rotates with your ISP IP and breaks off-home-network. Tailscale is the documented upgrade path.
+- **Alembic tech debt.** Migrations don't create `system_events`. Generate a catch-up migration so `alembic upgrade head` and `create_all` agree; otherwise anyone provisioning "the Alembic way" gets a broken schema.
+- **Secrets in `.env`.** RDS password + `RESEND_API_KEY` are in `.env`. Fine while gitignored, but if the engine ever moves into AWS, switch to **SSM Parameter Store** (free, `SecureString`) rather than baking secrets into an image.
+- **Backups exist but test a restore someday.** 7-day automated backups are on; nobody has exercised a point-in-time restore yet.
+
+#### Deliberately not done
+- **No EC2 / no Timescale Cloud** — RDS chosen; reasons above.
+- **No Multi-AZ, no RDS Proxy, no IAM DB auth, no Secrets Manager** — all cost/complexity for guarantees a two-machine personal setup doesn't need yet.
+- **No Alembic fix in this session** — flagged as tech debt rather than silently stamping `head` over a create_all schema.
+- **No end-to-end browser test yet** — verified at the DB layer (Python → RDS) on both machines; the running-app path (browser → FastAPI → RDS) is still worth a click-through, especially since a long-running API server won't pick up the new `.env` until restarted.
+- **Local Docker DBs left running/untouched** — intentional rollback safety net.
+
+---
