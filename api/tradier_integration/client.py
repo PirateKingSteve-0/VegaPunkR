@@ -34,16 +34,25 @@ class TradierClient:
     All methods return parsed JSON or raise on HTTP errors.
     """
 
-    def __init__(self):
-        env = settings.TRADIER_ENV.lower()
+    def __init__(self, env: Optional[str] = None):
+        """
+        Initialize Tradier client.
+
+        Args:
+            env: Optional environment override ("sandbox" or "live").
+                 If None, reads from settings.TRADIER_ENV (defaults to "sandbox").
+        """
+        env = (env or settings.TRADIER_ENV).lower()
         if env == "sandbox":
             self._base_url = settings.TRADIER_SANDBOX_BASE_URL.rstrip("/")
             self._token = settings.TRADIER_SANDBOX_API_KEY
             self._account_id = settings.TRADIER_SANDBOX_ACCOUNT_NUMBER
+            self._env = "sandbox"
         else:
             self._base_url = settings.TRADIER_LIVE_BASE_URL.rstrip("/")
             self._token = settings.TRADIER_LIVE_API_KEY
             self._account_id: Optional[str] = None  # fetched from profile on first use
+            self._env = "live"
 
         self._session = requests.Session()
         self._session.headers.update({

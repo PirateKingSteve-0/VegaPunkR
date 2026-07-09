@@ -28,6 +28,8 @@ from typing import Dict, List, Optional, Tuple
 import pytz
 from sqlalchemy.orm import Session
 
+from utils.symbol_helpers import is_option_symbol
+
 from models import Strategy, Trade, User
 from notifications.email import is_enabled_for, send_report_async, send_test_report
 
@@ -114,8 +116,10 @@ class TradeRow:
     symbol: str
     strategy: str
     qty: int
-    entry: float
-    exit: float
+    entry: float     # Premium per share
+    exit: float      # Premium per share
+    cost: float      # Total entry cost (entry × qty × multiplier)
+    proceeds: float  # Total exit proceeds (exit × qty × multiplier)
     pnl: float
 
 
@@ -196,13 +200,24 @@ def aggregate(db: Session, user: User, period: str, anchor: date) -> ReportData:
         s.fees += fees
 
         if len(trade_rows) < _TRADES_TABLE_CAP:
+            qty = int(trade.filled_qty or trade.qty or 0)
+            entry = float(trade.price or 0.0)
+            exit_price = float(trade.exit_price or trade.price or 0.0)
+
+            # Calculate total cost and proceeds (options have 100x multiplier)
+            multiplier = 100 if is_option_symbol(trade.symbol) else 1
+            cost = entry * qty * multiplier
+            proceeds = exit_price * qty * multiplier
+
             trade_rows.append(TradeRow(
                 when=trade.exit_timestamp,
                 symbol=trade.symbol,
                 strategy=sname,
-                qty=int(trade.filled_qty or trade.qty or 0),
-                entry=float(trade.price or 0.0),
-                exit=float(trade.exit_price or trade.price or 0.0),
+                qty=qty,
+                entry=entry,
+                exit=exit_price,
+                cost=cost,
+                proceeds=proceeds,
                 pnl=pnl,
             ))
 
@@ -318,13 +333,15 @@ def render_html(data: ReportData) -> str:
     if data.trades:
         trade_rows = "".join(
             f"""<tr>
-              <td style="padding:6px 10px;border-bottom:1px solid #f0f0f0;color:#666;">{t.when.strftime('%m/%d %H:%M')}</td>
-              <td style="padding:6px 10px;border-bottom:1px solid #f0f0f0;font-family:monospace;">{t.symbol}</td>
-              <td style="padding:6px 10px;border-bottom:1px solid #f0f0f0;color:#666;">{t.strategy}</td>
-              <td style="padding:6px 10px;border-bottom:1px solid #f0f0f0;text-align:right;">{t.qty}</td>
-              <td style="padding:6px 10px;border-bottom:1px solid #f0f0f0;text-align:right;">{_money(t.entry)}</td>
-              <td style="padding:6px 10px;border-bottom:1px solid #f0f0f0;text-align:right;">{_money(t.exit)}</td>
-              <td style="padding:6px 10px;border-bottom:1px solid #f0f0f0;text-align:right;color:{'#1b5e20' if t.pnl >= 0 else '#b71c1c'};">{_signed(t.pnl)}</td>
+              <td style="padding:6px 8px;border-bottom:1px solid #f0f0f0;color:#666;">{t.when.strftime('%m/%d %H:%M')}</td>
+              <td style="padding:6px 8px;border-bottom:1px solid #f0f0f0;font-family:monospace;">{t.symbol}</td>
+              <td style="padding:6px 8px;border-bottom:1px solid #f0f0f0;color:#666;">{t.strategy}</td>
+              <td style="padding:6px 8px;border-bottom:1px solid #f0f0f0;text-align:right;">{t.qty}</td>
+              <td style="padding:6px 8px;border-bottom:1px solid #f0f0f0;text-align:right;">{_money(t.entry)}</td>
+              <td style="padding:6px 8px;border-bottom:1px solid #f0f0f0;text-align:right;">{_money(t.exit)}</td>
+              <td style="padding:6px 8px;border-bottom:1px solid #f0f0f0;text-align:right;">{_money(t.cost)}</td>
+              <td style="padding:6px 8px;border-bottom:1px solid #f0f0f0;text-align:right;">{_money(t.proceeds)}</td>
+              <td style="padding:6px 8px;border-bottom:1px solid #f0f0f0;text-align:right;color:{'#1b5e20' if t.pnl >= 0 else '#b71c1c'};">{_signed(t.pnl)}</td>
             </tr>"""
             for t in data.trades
         )
@@ -337,13 +354,15 @@ def render_html(data: ReportData) -> str:
                style="border-collapse:collapse;font-size:12px;">
           <thead>
             <tr style="background:#fafafa;">
-              <th style="padding:6px 10px;text-align:left;border-bottom:1px solid #ddd;">Time</th>
-              <th style="padding:6px 10px;text-align:left;border-bottom:1px solid #ddd;">Symbol</th>
-              <th style="padding:6px 10px;text-align:left;border-bottom:1px solid #ddd;">Strategy</th>
-              <th style="padding:6px 10px;text-align:right;border-bottom:1px solid #ddd;">Qty</th>
-              <th style="padding:6px 10px;text-align:right;border-bottom:1px solid #ddd;">Entry</th>
-              <th style="padding:6px 10px;text-align:right;border-bottom:1px solid #ddd;">Exit</th>
-              <th style="padding:6px 10px;text-align:right;border-bottom:1px solid #ddd;">P&amp;L</th>
+              <th style="padding:6px 8px;text-align:left;border-bottom:1px solid #ddd;">Time</th>
+              <th style="padding:6px 8px;text-align:left;border-bottom:1px solid #ddd;">Symbol</th>
+              <th style="padding:6px 8px;text-align:left;border-bottom:1px solid #ddd;">Strategy</th>
+              <th style="padding:6px 8px;text-align:right;border-bottom:1px solid #ddd;">Qty</th>
+              <th style="padding:6px 8px;text-align:right;border-bottom:1px solid #ddd;">Entry</th>
+              <th style="padding:6px 8px;text-align:right;border-bottom:1px solid #ddd;">Exit</th>
+              <th style="padding:6px 8px;text-align:right;border-bottom:1px solid #ddd;">Cost</th>
+              <th style="padding:6px 8px;text-align:right;border-bottom:1px solid #ddd;">Proceeds</th>
+              <th style="padding:6px 8px;text-align:right;border-bottom:1px solid #ddd;">P&amp;L</th>
             </tr>
           </thead>
           <tbody>{trade_rows}</tbody>
@@ -393,6 +412,7 @@ def render_text(data: ReportData) -> str:
             lines.append(
                 f"  {t.when.strftime('%m/%d %H:%M')}  {t.symbol:<24} "
                 f"{t.qty:>4}  entry {_money(t.entry):>10}  exit {_money(t.exit):>10}  "
+                f"cost {_money(t.cost):>10}  proceeds {_money(t.proceeds):>10}  "
                 f"P&L {_signed(t.pnl)}"
             )
     else:

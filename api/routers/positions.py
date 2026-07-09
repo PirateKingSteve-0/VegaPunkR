@@ -4,12 +4,12 @@ Position management endpoints.
 from typing import List, Optional
 from fastapi import APIRouter, Depends, HTTPException, status, Query
 from sqlalchemy.orm import Session
-from datetime import datetime
 
 from database import get_db
 from models import Position, User, Strategy
 from schemas import PositionCreate, PositionUpdate, PositionResponse
 from auth import get_current_user, require_can_write_own
+from utils.symbol_helpers import is_option_symbol
 
 router = APIRouter(prefix="/positions", tags=["Positions"])
 
@@ -150,7 +150,9 @@ def update_position(
 
     # Recalculate unrealized P&L if current price is updated
     if position_data.current_price is not None:
-        position.unrealized_pnl = (position.current_price - position.avg_entry_price) * position.qty
+        # Options contracts have a 100x multiplier (each contract = 100 shares)
+        multiplier = 100 if is_option_symbol(position.option_symbol or position.symbol) else 1
+        position.unrealized_pnl = (position.current_price - position.avg_entry_price) * position.qty * multiplier
 
     db.commit()
     db.refresh(position)

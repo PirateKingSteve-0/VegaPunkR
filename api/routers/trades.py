@@ -10,6 +10,7 @@ from database import get_db
 from models import Trade, User, Strategy, Position
 from schemas import TradeCreate, TradeResponse
 from auth import get_current_user, require_can_write_own
+from utils.symbol_helpers import is_option_symbol
 
 router = APIRouter(prefix="/trades", tags=["Trades"])
 
@@ -186,12 +187,15 @@ def close_trade(
     trade.exit_timestamp = datetime.utcnow()
 
     # Calculate P&L
+    # Options contracts have a 100x multiplier (each contract = 100 shares)
+    multiplier = 100 if is_option_symbol(trade.symbol) else 1
+
     if trade.side == 'buy':
-        # Long position: P&L = (exit_price - entry_price) * qty
-        trade.pnl = (exit_price - trade.price) * trade.filled_qty
+        # Long position: P&L = (exit_price - entry_price) * qty * multiplier
+        trade.pnl = (exit_price - trade.price) * trade.filled_qty * multiplier
     else:
-        # Short position: P&L = (entry_price - exit_price) * qty
-        trade.pnl = (trade.price - exit_price) * trade.filled_qty
+        # Short position: P&L = (entry_price - exit_price) * qty * multiplier
+        trade.pnl = (trade.price - exit_price) * trade.filled_qty * multiplier
 
     # Subtract commission from P&L
     trade.pnl -= trade.commission

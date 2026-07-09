@@ -1,7 +1,7 @@
 """
 Trading Client Manager for hot-swapping between paper and live trading APIs.
 
-This module manages the trading API clients (Alpaca Paper and Schwab Live)
+This module manages the trading API clients (Tradier Sandbox and Tradier Live)
 and provides seamless switching between them without server restart.
 
 The manager maintains client instances and routes order execution to the
@@ -26,7 +26,7 @@ class TradingClientManager:
     """
     Singleton manager for trading API clients.
 
-    Maintains instances of both Alpaca Paper and Schwab Live clients
+    Maintains instances of both Tradier Sandbox and Tradier Live clients
     and routes requests based on user's selected trading mode.
     """
 
@@ -53,7 +53,7 @@ class TradingClientManager:
             user: User object with selected_trading_mode
 
         Returns:
-            Trading client instance (Tradier or Schwab)
+            Trading client instance (Tradier sandbox for paper, Tradier live for live)
 
         Raises:
             ValueError: If trading mode is invalid
@@ -65,28 +65,34 @@ class TradingClientManager:
 
         # Get or create client for this mode
         if trading_mode == "paper":
-            return self._get_tradier_client()
+            return self._get_tradier_client(env="sandbox")
         else:
-            return self._get_schwab_client()
+            return self._get_tradier_client(env="live")
 
-    def _get_tradier_client(self):
+    def _get_tradier_client(self, env: str = "sandbox"):
         """
-        Get or create Tradier client (sandbox for paper mode, live for production).
+        Get or create Tradier client for the specified environment.
+
+        Args:
+            env: "sandbox" for paper trading, "live" for live trading
 
         Returns:
             TradierClient instance
         """
-        if TradingMode.PAPER not in self._clients:
+        # Use the env type to key the cache
+        cache_key = TradingMode.PAPER if env == "sandbox" else TradingMode.LIVE
+
+        if cache_key not in self._clients:
             try:
                 from tradier_integration.client import TradierClient
 
-                self._clients[TradingMode.PAPER] = TradierClient()
-                logger.info("✅ Tradier client initialized")
+                self._clients[cache_key] = TradierClient(env=env)
+                logger.info(f"✅ Tradier {env} client initialized")
             except Exception as e:
-                logger.error(f"Failed to initialize Tradier client: {e}")
+                logger.error(f"Failed to initialize Tradier {env} client: {e}")
                 raise
 
-        return self._clients[TradingMode.PAPER]
+        return self._clients[cache_key]
 
     def _get_schwab_client(self):
         """
@@ -137,62 +143,47 @@ class TradingClientManager:
         client = self.get_client(user)
         trading_mode = user.selected_trading_mode or "paper"
 
-        logger.info(f"Placing {side} order for {qty} {symbol} via {trading_mode} trading")
+        logger.info(f"Placing {side} order for {qty} {symbol} via {trading_mode} trading (Tradier)")
 
         try:
-            if trading_mode == "paper":
-                option_symbol = kwargs.get("option_symbol")
-                if not option_symbol:
-                    raise ValueError(
-                        f"option_symbol is required for paper option orders (underlying: {symbol}). "
-                        "Ensure the strategy has a valid option contract selected."
-                    )
-
-                # Map generic buy/sell to Tradier option sides
-                # Only long positions supported — buy_to_open on entry, sell_to_close on exit
-                side_map = {
-                    "buy":  "buy_to_open",
-                    "sell": "sell_to_close",
-                }
-                tradier_side = side_map.get(side)
-                if not tradier_side:
-                    raise ValueError(f"Unsupported option side: {side}")
-
-                # For limit orders pass the midpoint price; market is default
-                limit_price = kwargs.get("limit_price")
-
-                order = await asyncio.to_thread(
-                    client.place_option_order,
-                    symbol=symbol,
-                    option_symbol=option_symbol,
-                    side=tradier_side,
-                    quantity=qty,
-                    order_type=order_type,
-                    duration="day",
-                    price=limit_price,
+            # Both paper and live modes use Tradier (sandbox vs live)
+            option_symbol = kwargs.get("option_symbol")
+            if not option_symbol:
+                raise ValueError(
+                    f"option_symbol is required for option orders (underlying: {symbol}). "
+                    "Ensure the strategy has a valid option contract selected."
                 )
 
-                logger.info(
-                    f"Tradier option order placed: id={order.get('id')} "
-                    f"status={order.get('status')} "
-                    f"{tradier_side} {qty}x {option_symbol}"
-                )
-                return order
+            # Map generic buy/sell to Tradier option sides
+            # Only long positions supported — buy_to_open on entry, sell_to_close on exit
+            side_map = {
+                "buy":  "buy_to_open",
+                "sell": "sell_to_close",
+            }
+            tradier_side = side_map.get(side)
+            if not tradier_side:
+                raise ValueError(f"Unsupported option side: {side}")
 
-            else:
-                # Schwab Live API
-                order_payload = {
-                    "symbol": symbol,
-                    "quantity": qty,
-                    "side": side,
-                    "order_type": order_type,
-                }
-                if order_type == "limit":
-                    order_payload["limit_price"] = kwargs.get("limit_price")
+            # For limit orders pass the midpoint price; market is default
+            limit_price = kwargs.get("limit_price")
 
-                order = await client.place_order(**order_payload)
-                logger.info(f"✅ Schwab order placed: {order.get('orderId')}")
-                return order
+            order = await asyncio.to_thread(
+                client.place_option_order,
+                symbol=symbol,
+                option_symbol=option_symbol,
+                side=tradier_side,
+                quantity=qty,
+                order_type=order_type,
+                duration="day",
+                price=limit_price,
+            )
+
+            logger.info(
+                f"Tradier {trading_mode} order placed: id={order.get('id')} "
+                f"status={order.get('status')} "
+                f"{tradier_side} {qty}x {option_symbol}"
+            )
+            return order
 
         except Exception as e:
             logger.error(f"❌ Failed to place order: {e}")
@@ -205,17 +196,10 @@ class TradingClientManager:
         Returns the broker's preview dict (commission, fees, order_cost,
         margin_change, day_trades, etc.) on success. Raises on rejection.
 
-        Currently Tradier (paper) only — Schwab live preview support is a
-        follow-up.
+        Works for both Tradier sandbox (paper) and Tradier live modes.
         """
         client = self.get_client(user)
         trading_mode = user.selected_trading_mode or "paper"
-
-        if trading_mode != "paper":
-            # Schwab live preview not yet wired — return None so caller can
-            # decide whether to proceed without preview (currently: abort).
-            logger.info(f"Order preview skipped: not implemented for {trading_mode}")
-            return None
 
         option_symbol = kwargs.get("option_symbol")
         if not option_symbol:
@@ -241,7 +225,7 @@ class TradingClientManager:
             price=limit_price,
         )
         logger.info(
-            f"Tradier option preview: {tradier_side} {qty}x {option_symbol} "
+            f"Tradier {trading_mode} option preview: {tradier_side} {qty}x {option_symbol} "
             f"cost=${preview.get('order_cost')} commission=${preview.get('commission')} "
             f"fees=${preview.get('fees')}"
         )
@@ -261,39 +245,24 @@ class TradingClientManager:
         trading_mode = user.selected_trading_mode or "paper"
 
         try:
-            if trading_mode == "paper":
-                # Tradier Sandbox
-                balances = client.get_balances()
-                margin = balances.get("margin") or balances.get("cash") or {}
-                buying_power = (
-                    margin.get("stock_buying_power")
-                    or margin.get("cash_available_for_trading")
-                    or balances.get("total_cash", 0)
-                )
-                return {
-                    "account_number": balances.get("account_number", ""),
-                    "cash": float(balances.get("total_cash", 0)),
-                    "buying_power": float(buying_power),
-                    "portfolio_value": float(balances.get("total_equity", 0)),
-                    "equity": float(balances.get("total_equity", 0)),
-                    "open_pl": float(balances.get("open_pl", 0)),
-                    "api": "Tradier Sandbox"
-                }
-            else:
-                # Schwab Live
-                account = client.get_account_info()
-                if not account:
-                    raise Exception("Failed to get Schwab account info")
-                balances = account.get("securitiesAccount", {}).get("currentBalances", {})
-                return {
-                    "account_number": account.get("securitiesAccount", {}).get("accountNumber"),
-                    "cash": balances.get("cashBalance", 0),
-                    "buying_power": balances.get("buyingPower", 0),
-                    "portfolio_value": balances.get("liquidationValue", 0),
-                    "equity": balances.get("equity", 0),
-                    "open_pl": 0,
-                    "api": "Schwab Live"
-                }
+            # Both paper and live use Tradier (sandbox vs live)
+            balances = client.get_balances()
+            margin = balances.get("margin") or balances.get("cash") or {}
+            buying_power = (
+                margin.get("stock_buying_power")
+                or margin.get("cash_available_for_trading")
+                or balances.get("total_cash", 0)
+            )
+            api_label = f"Tradier {'Sandbox' if trading_mode == 'paper' else 'Live'}"
+            return {
+                "account_number": balances.get("account_number", ""),
+                "cash": float(balances.get("total_cash", 0)),
+                "buying_power": float(buying_power),
+                "portfolio_value": float(balances.get("total_equity", 0)),
+                "equity": float(balances.get("total_equity", 0)),
+                "open_pl": float(balances.get("open_pl", 0)),
+                "api": api_label
+            }
         except Exception as e:
             logger.error(f"❌ Failed to get account info: {e}")
             raise
@@ -315,33 +284,30 @@ class TradingClientManager:
         trading_mode = user.selected_trading_mode or "paper"
 
         try:
-            if trading_mode == "paper":
-                events = client.get_history(
-                    page=page,
-                    limit=limit,
-                    symbol=symbol,
-                    start=start,
-                    end=end,
-                )
-                result = []
-                for e in events:
-                    desc = (e.get("description") or "").lower()
-                    side = "BUY" if "bought" in desc else ("SELL" if "sold" in desc else "")
-                    result.append({
-                        "date": e.get("date"),
-                        "type": e.get("type"),
-                        "symbol": e.get("symbol"),
-                        "side": side,
-                        "quantity": e.get("quantity"),
-                        "price": e.get("price"),
-                        "amount": e.get("amount"),
-                        "description": e.get("description"),
-                        "commission": e.get("commission"),
-                    })
-                return result
-            else:
-                # Schwab Live: not yet implemented
-                return []
+            # Both paper and live use Tradier (sandbox vs live)
+            events = client.get_history(
+                page=page,
+                limit=limit,
+                symbol=symbol,
+                start=start,
+                end=end,
+            )
+            result = []
+            for e in events:
+                desc = (e.get("description") or "").lower()
+                side = "BUY" if "bought" in desc else ("SELL" if "sold" in desc else "")
+                result.append({
+                    "date": e.get("date"),
+                    "type": e.get("type"),
+                    "symbol": e.get("symbol"),
+                    "side": side,
+                    "quantity": e.get("quantity"),
+                    "price": e.get("price"),
+                    "amount": e.get("amount"),
+                    "description": e.get("description"),
+                    "commission": e.get("commission"),
+                })
+            return result
         except Exception as e:
             logger.error(f"❌ Failed to get history: {e}")
             raise
@@ -360,40 +326,23 @@ class TradingClientManager:
         trading_mode = user.selected_trading_mode or "paper"
 
         try:
-            if trading_mode == "paper":
-                # Tradier Sandbox
-                positions = client.get_positions()
-                return [
-                    {
-                        "symbol": pos.get("symbol", ""),
-                        "qty": float(pos.get("quantity", 0)),
-                        "avg_entry_price": float(pos.get("cost_basis", 0)) / max(float(pos.get("quantity", 1)), 1),
-                        "current_price": 0.0,  # Tradier positions endpoint doesn't include live price
-                        "unrealized_pl": 0.0,
-                        "unrealized_plpc": 0.0,
-                        "cost_basis": float(pos.get("cost_basis", 0)),
-                        "date_acquired": pos.get("date_acquired", ""),
-                        "api": "Tradier Sandbox"
-                    }
-                    for pos in positions
-                ]
-            else:
-                # Schwab Live
-                positions = client.get_positions()
-                if positions is None:
-                    raise Exception("Failed to get Schwab positions")
-                return [
-                    {
-                        "symbol": pos.get("symbol"),
-                        "qty": pos.get("quantity", 0),
-                        "avg_entry_price": pos.get("average_price", 0),
-                        "current_price": pos.get("current_price", 0),
-                        "unrealized_pl": pos.get("unrealized_pnl", 0),
-                        "unrealized_plpc": pos.get("day_pnl_percent", 0),
-                        "api": "Schwab Live"
-                    }
-                    for pos in positions
-                ]
+            # Both paper and live use Tradier (sandbox vs live)
+            positions = client.get_positions()
+            api_label = f"Tradier {'Sandbox' if trading_mode == 'paper' else 'Live'}"
+            return [
+                {
+                    "symbol": pos.get("symbol", ""),
+                    "qty": float(pos.get("quantity", 0)),
+                    "avg_entry_price": float(pos.get("cost_basis", 0)) / max(float(pos.get("quantity", 1)), 1),
+                    "current_price": 0.0,  # Tradier positions endpoint doesn't include live price
+                    "unrealized_pl": 0.0,
+                    "unrealized_plpc": 0.0,
+                    "cost_basis": float(pos.get("cost_basis", 0)),
+                    "date_acquired": pos.get("date_acquired", ""),
+                    "api": api_label
+                }
+                for pos in positions
+            ]
         except Exception as e:
             logger.error(f"❌ Failed to get positions: {e}")
             raise

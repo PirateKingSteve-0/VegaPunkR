@@ -22,6 +22,7 @@ from engine.tradier_stream_manager import get_stream_manager
 from engine.event_logger import log_event
 from notifications.discord import notify_position_closed
 from utils.market_hours import is_market_open
+from utils.symbol_helpers import is_option_symbol
 
 logger = logging.getLogger(__name__)
 
@@ -585,7 +586,9 @@ class StreamDrivenWorker:
                 # here, so we use the latest streamed price as the exit).
                 qty_closed = position.qty
                 exit_price = position.current_price or position.avg_entry_price
-                approx_pnl = (exit_price - position.avg_entry_price) * qty_closed
+                # Options contracts have a 100x multiplier (each contract = 100 shares)
+                multiplier = 100 if is_option_symbol(position.option_symbol or position.symbol) else 1
+                approx_pnl = (exit_price - position.avg_entry_price) * qty_closed * multiplier
 
                 position.qty = 0
                 position.unrealized_pnl = 0.0

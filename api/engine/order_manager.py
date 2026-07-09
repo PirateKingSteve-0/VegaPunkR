@@ -18,6 +18,7 @@ from engine.trading_client_manager import TradingClientManager
 from engine.signal_generator import Signal
 from engine.event_logger import log_event
 from notifications.discord import notify_position_opened, notify_position_closed
+from utils.symbol_helpers import is_option_symbol
 
 logger = logging.getLogger(__name__)
 
@@ -916,7 +917,9 @@ class OrderManager:
             position.qty = total_qty
             position.avg_entry_price = new_avg_price
             position.current_price = price
-            position.unrealized_pnl = (price - new_avg_price) * total_qty
+            # Options contracts have a 100x multiplier (each contract = 100 shares)
+            multiplier = 100 if is_option_symbol(option_symbol or position.option_symbol or symbol) else 1
+            position.unrealized_pnl = (price - new_avg_price) * total_qty * multiplier
             if option_symbol and not position.option_symbol:
                 position.option_symbol = option_symbol
 
@@ -1025,7 +1028,9 @@ class OrderManager:
 
         # Calculate P&L for this exit
         entry_price = position.avg_entry_price
-        exit_pnl = (price - entry_price) * qty
+        # Options contracts have a 100x multiplier (each contract = 100 shares)
+        multiplier = 100 if is_option_symbol(position.option_symbol or position.symbol) else 1
+        exit_pnl = (price - entry_price) * qty * multiplier
 
         # Update trade with exit details
         trade.exit_price = price
@@ -1046,7 +1051,9 @@ class OrderManager:
             logger.info(f"Position fully closed: {symbol}, P&L=${exit_pnl:.2f}")
         else:
             # Recalculate unrealized P&L for remaining position
-            position.unrealized_pnl = (price - position.avg_entry_price) * position.qty
+            # Options contracts have a 100x multiplier (each contract = 100 shares)
+            multiplier = 100 if is_option_symbol(position.option_symbol or position.symbol) else 1
+            position.unrealized_pnl = (price - position.avg_entry_price) * position.qty * multiplier
             logger.info(
                 f"Partial exit: {symbol}, closed {qty}, remaining {position.qty}, P&L=${exit_pnl:.2f}"
             )
@@ -1244,7 +1251,9 @@ class OrderManager:
             filled_qty = self._extract_filled_qty(terminal_order, position.qty)
 
             # Calculate final P&L
-            pnl = (filled_price - position.avg_entry_price) * filled_qty
+            # Options contracts have a 100x multiplier (each contract = 100 shares)
+            multiplier = 100 if is_option_symbol(position.option_symbol or position.symbol) else 1
+            pnl = (filled_price - position.avg_entry_price) * filled_qty * multiplier
 
             # Create trade record
             close_notes = {
@@ -1269,7 +1278,7 @@ class OrderManager:
                 order_type='market',
                 qty=filled_qty,
                 filled_qty=filled_qty,
-                price=filled_price,
+                price=position.avg_entry_price,  # Entry price for reporting
                 exit_price=filled_price,
                 exit_timestamp=datetime.utcnow(),
                 pnl=pnl,
@@ -1369,6 +1378,8 @@ class OrderManager:
         position.current_price = current_price
 
         # Recalculate unrealized P&L
-        position.unrealized_pnl = (current_price - position.avg_entry_price) * position.qty
+        # Options contracts have a 100x multiplier (each contract = 100 shares)
+        multiplier = 100 if is_option_symbol(position.option_symbol or position.symbol) else 1
+        position.unrealized_pnl = (current_price - position.avg_entry_price) * position.qty * multiplier
 
         self.db.commit()
