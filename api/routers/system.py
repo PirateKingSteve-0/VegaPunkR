@@ -14,7 +14,7 @@ from pydantic import BaseModel
 
 from database import get_db
 from models import User
-from auth import get_current_user, require_can_write_own
+from auth import get_current_user, require_can_write_own, create_access_token
 from config import Environment, TradingMode
 
 logger = logging.getLogger(__name__)
@@ -151,10 +151,19 @@ async def set_environment(
     logger.warning(f"   └─ TO:   {db_name} ({request.environment})")
     logger.warning(f"   └─ All subsequent queries will use {db_name}")
 
+    # Re-mint the token with the new `env` claim so subsequent requests route
+    # to the new database (get_db reads this claim). The client MUST replace its
+    # stored token with this one, or it will keep hitting the old environment.
+    new_token = create_access_token(
+        data={"sub": str(current_user.id), "env": request.environment}
+    )
+
     return {
         "success": True,
         "environment": request.environment,
         "database": f"vegapunk_{request.environment}",
+        "access_token": new_token,
+        "token_type": "bearer",
         "message": f"Environment switched to {request.environment} (no restart required)"
     }
 

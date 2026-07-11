@@ -27,6 +27,7 @@ from auth import (
 )
 from database import get_db
 from models import Position, Strategy, Trade, User
+from utils.market_hours import user_day_start_utc
 from schemas import (
     PerformanceMetricsResponse,  # noqa: F401 - kept for future per-user metrics endpoint
     PositionResponse,
@@ -71,13 +72,14 @@ def _get_user_or_404(user_id: int, db: Session) -> User:
     return user
 
 
-def _today_pnl_for(user_id: int, db: Session) -> float:
-    """Realized PnL today (UTC midnight) plus unrealized on open positions.
+def _today_pnl_for(user_id: int, db: Session, tz: Optional[str] = None) -> float:
+    """Realized PnL today plus unrealized on open positions.
 
     Mirrors `RiskManager.get_account_risk_status` so the admin Users page
     shows the same number an admin would see on the user's own session
-    tile."""
-    today_start = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+    tile — including bucketing "today" by that user's own timezone (falls
+    back to the ET market day when unset)."""
+    today_start = user_day_start_utc(tz)
     realized = db.query(func.sum(Trade.pnl)).filter(
         Trade.user_id == user_id,
         Trade.timestamp >= today_start,
@@ -125,7 +127,7 @@ def list_users(
             last_login=u.last_login,
             active_strategies=int(active_strategies),
             open_positions=int(open_positions),
-            today_pnl=_today_pnl_for(u.id, db),
+            today_pnl=_today_pnl_for(u.id, db, u.timezone),
             last_trade_at=last_trade_at,
         ))
     return summaries
@@ -190,7 +192,7 @@ def get_user_dashboard(
     can spot-check without leaving the admin UI."""
     user = _get_user_or_404(user_id, db)
 
-    today_pnl = _today_pnl_for(user.id, db)
+    today_pnl = _today_pnl_for(user.id, db, user.timezone)
     account_size = float(user.account_size_usd or 10000)
     daily_loss_limit_pct = float(user.daily_loss_limit_pct or 5.0)
     daily_loss_limit = account_size * (daily_loss_limit_pct / 100.0)

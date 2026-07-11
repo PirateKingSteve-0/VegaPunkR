@@ -10,6 +10,7 @@ from sqlalchemy import func
 
 from models import User, Strategy, Position, Trade, RiskEvent
 from config import TradingMode
+from utils.market_hours import market_day_start_utc, user_day_start_utc
 
 logger = logging.getLogger(__name__)
 
@@ -234,7 +235,8 @@ class RiskManager:
         if daily_loss_limit_pct <= 0:
             return RiskCheckResult(True)
 
-        today_start = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+        # Trading gate: anchor "today" to the market (ET) day, not UTC midnight.
+        today_start = market_day_start_utc()
 
         realized = self.db.query(func.sum(Trade.pnl)).filter(
             Trade.user_id == user.id,
@@ -302,8 +304,8 @@ class RiskManager:
 
     def _check_daily_loss_limit(self, user: User, strategy: Strategy) -> RiskCheckResult:
         """Check if daily loss limit has been exceeded"""
-        # Get today's trades for this strategy
-        today_start = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+        # Trading gate: anchor "today" to the market (ET) day, not UTC midnight.
+        today_start = market_day_start_utc()
 
         today_pnl = self.db.query(func.sum(Trade.pnl)).filter(
             Trade.user_id == user.id,
@@ -432,7 +434,9 @@ class RiskManager:
         `pct_consumed` is clamped to [0, 100+] so the UI progress bar
         can render a meaningful overflow if the cap is breached past
         100% (e.g. between checks)."""
-        today_start = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+        # Display surface: bucket "today" by the viewer's own timezone so the
+        # tile matches the day they perceive (falls back to ET when unset).
+        today_start = user_day_start_utc(user.timezone)
 
         realized = self.db.query(func.sum(Trade.pnl)).filter(
             Trade.user_id == user.id,
@@ -512,7 +516,8 @@ class RiskManager:
             Dict with current risk status
         """
         # Calculate current metrics
-        today_start = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+        # Monitoring readout: bucket "today" by the viewer's own timezone.
+        today_start = user_day_start_utc(user.timezone)
 
         # Today's P&L
         today_pnl = self.db.query(func.sum(Trade.pnl)).filter(

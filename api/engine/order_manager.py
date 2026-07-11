@@ -22,6 +22,21 @@ from utils.symbol_helpers import is_option_symbol
 
 logger = logging.getLogger(__name__)
 
+
+def _lt_emit_order(event: str, **fields):
+    """Live-test only: append one order-lifecycle record to orders.jsonl,
+    correlated by order_id. The `filled` event is the key datum — it captures
+    the estimated price vs the broker's real avg_fill_price so we can prove
+    whether live actually returns real fills. Never raises."""
+    try:
+        from live_test.logging_setup import is_enabled, get_jsonl_logger
+        if not is_enabled():
+            return
+        get_jsonl_logger("orders").emit({"event": event, **fields})
+    except Exception:
+        pass
+
+
 # Minimum interval between orders for the same (user, symbol). Belt-and-suspenders
 # against runaway loops; tuned for 0DTE scalping where a few seconds is plenty.
 MIN_ORDER_INTERVAL_SECONDS = 5.0
@@ -606,6 +621,22 @@ class OrderManager:
                 filled_price = self._extract_filled_price(terminal_order, estimated_price or signal.price)
                 filled_qty = self._extract_filled_qty(terminal_order, qty)
 
+                # Live-test: the decisive record — estimate vs. broker's real fill.
+                _lt_emit_order(
+                    "filled",
+                    order_id=order_id,
+                    side=side,
+                    symbol=symbol,
+                    option_symbol=option_symbol,
+                    signal_price=signal.price,
+                    estimated_price=estimated_price,
+                    broker_avg_fill_price=(terminal_order.get("avg_fill_price")
+                                           if isinstance(terminal_order, dict) else None),
+                    filled_price=filled_price,
+                    filled_qty=filled_qty,
+                    trading_mode=(user.selected_trading_mode or "paper"),
+                )
+
                 # Record trade in database
                 trade = self._create_trade_record(
                     user=user,
@@ -710,17 +741,27 @@ class OrderManager:
         if not order_id:
             return None
 
-        # Only Tradier is wired up for status polling today. Schwab path
-        # falls through and the caller treats the original response as the
-        # source of truth (existing behavior pre-change).
-        trading_mode = user.selected_trading_mode or "paper"
-        if trading_mode != "paper":
-            return None
-
+        # Poll for terminal status on Tradier — for BOTH paper (sandbox) and
+        # live. `get_client` returns a TradierClient in both modes, so both
+        # support get_order and both MUST be polled: a live market order returns
+        # no fill price on the submission response, so without polling we never
+        # capture the real avg_fill_price AND execute_signal treats every live
+        # order as unconfirmed (no fill recorded, no position update → the
+        # engine believes it is flat while holding a live position, risking a
+        # duplicate stacked entry on the next tick). If a client without
+        # get_order is ever returned (e.g. a future Schwab path) we fall through
+        # to None and the caller treats the order as unconfirmed.
         try:
             client = self.trading_client.get_client(user)
         except Exception as e:
             logger.warning(f"Cannot poll order status — client unavailable: {e}")
+            return None
+
+        if not hasattr(client, "get_order"):
+            logger.warning(
+                "Trading client has no get_order(); skipping terminal poll "
+                "(order will be treated as unconfirmed)"
+            )
             return None
 
         terminal = {"filled", "rejected", "canceled", "expired"}

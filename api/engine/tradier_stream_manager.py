@@ -16,6 +16,34 @@ logger = logging.getLogger(__name__)
 _WS_URL = "wss://ws.tradier.com/v1/markets/events"
 _RECONNECT_DELAY = 5  # seconds between reconnect attempts
 
+_lt_quote_last: dict = {}  # symbol -> last monotonic emit time (quote sampling)
+
+
+def _lt_emit_stream(event=None, decode_error=None, raw=None):
+    """Live-test only: append raw WS payloads to stream.jsonl. Keeps every
+    non-quote event (trades, summaries) and every decode error (currently
+    swallowed), but SAMPLES quotes to ~1/symbol/2s since they arrive 10+/s.
+    Never raises."""
+    try:
+        from live_test.logging_setup import is_enabled, get_jsonl_logger
+        if not is_enabled():
+            return
+        log = get_jsonl_logger("stream")
+        if decode_error is not None:
+            log.emit({"kind": "decode_error", "error": decode_error, "raw": (raw or "")[:500]})
+            return
+        etype = (event.get("type") or "").lower()
+        if etype == "quote":
+            import time
+            sym = event.get("symbol")
+            now = time.monotonic()
+            if now - _lt_quote_last.get(sym, 0.0) < 2.0:
+                return
+            _lt_quote_last[sym] = now
+        log.emit({"kind": etype or "event", "event": event})
+    except Exception:
+        pass
+
 
 class TradierStreamManager:
     """
@@ -95,9 +123,10 @@ class TradierStreamManager:
                                 continue
                             try:
                                 event = json.loads(line)
+                                _lt_emit_stream(event)
                                 await self._router.dispatch(event)
                             except json.JSONDecodeError:
-                                pass
+                                _lt_emit_stream(decode_error="JSONDecodeError", raw=line)
 
             except asyncio.CancelledError:
                 break

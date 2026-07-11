@@ -21,7 +21,7 @@
     </div>
   </ng-container>
 
-  <div class="page-body">
+  <div class="page-body" [class.detail-open]="selectedUserId() !== null">
     <div class="users-table-wrapper">
       <ng-container *ngIf="loading()">
         <div class="loading-row">

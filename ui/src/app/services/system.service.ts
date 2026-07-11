@@ -18,6 +18,10 @@ export interface EnvironmentUpdateResponse {
   environment: string;
   database: string;
   message: string;
+  // Re-minted token carrying the new `env` claim. The client must store this so
+  // subsequent requests route to the newly selected database.
+  access_token?: string;
+  token_type?: string;
 }
 
 export interface TradingModeUpdateResponse {
@@ -83,6 +87,11 @@ export class SystemService {
           database: response.database,
           message: response.message
         });
+        // Store the re-minted token FIRST so every subsequent request (starting
+        // with the settings refresh below) routes to the newly selected DB.
+        if (response.access_token) {
+          localStorage.setItem('access_token', response.access_token);
+        }
         // Refresh settings after update
         this.getEnvironmentSettings().subscribe();
       })

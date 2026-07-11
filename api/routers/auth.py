@@ -90,7 +90,7 @@ def login(
     # so a future email change won't invalidate the in-flight session.
     access_token_expires = timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
     access_token = create_access_token(
-        data={"sub": str(user.id)},
+        data={"sub": str(user.id), "env": user.selected_environment or "dev"},
         expires_delta=access_token_expires
     )
 

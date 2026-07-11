@@ -26,6 +26,30 @@ _RETRY_MAX_ATTEMPTS = 3
 _RETRY_BACKOFF_BASE = 0.5  # seconds; doubles each attempt
 
 
+def _lt_emit_http(method, path, params, data, response, latency_ms, error=None):
+    """Live-test only: append one raw broker request/response to
+    broker_http.jsonl. Request HEADERS are deliberately NOT logged — they carry
+    the bearer token. Never raises; logging must not break a broker call."""
+    try:
+        from live_test.logging_setup import is_enabled, get_jsonl_logger
+        if not is_enabled():
+            return
+        status = body = None
+        if response is not None:
+            status = response.status_code
+            try:
+                body = response.json()
+            except Exception:
+                body = (response.text or "")[:2000]
+        get_jsonl_logger("broker_http").emit({
+            "method": method, "path": path, "params": params, "body_sent": data,
+            "status": status, "latency_ms": round(latency_ms, 1),
+            "response": body, "error": error,
+        })
+    except Exception:
+        pass
+
+
 class TradierClient:
     """
     HTTP client for Tradier Brokerage Account API.
@@ -115,17 +139,35 @@ class TradierClient:
 
     def _get(self, path: str, params: Optional[Dict] = None) -> Any:
         url = f"{self._base_url}{path}"
-        response = self._request_with_retry(
-            "GET", path,
-            lambda: self._session.get(url, params=params, timeout=_HTTP_TIMEOUT),
-        )
+        t0 = time.monotonic()
+        response = None
+        err = None
+        try:
+            response = self._request_with_retry(
+                "GET", path,
+                lambda: self._session.get(url, params=params, timeout=_HTTP_TIMEOUT),
+            )
+        except Exception as e:
+            err = str(e)
+            raise
+        finally:
+            _lt_emit_http("GET", path, params, None, response, (time.monotonic() - t0) * 1000, err)
         self._raise_for_status(response, "GET", path)
         return response.json()
 
     def _post(self, path: str, data: Optional[Dict] = None) -> Any:
         url = f"{self._base_url}{path}"
         # No retry on POST: order placement is not idempotent — retrying could double-submit.
-        response = self._session.post(url, data=data, timeout=_HTTP_TIMEOUT)
+        t0 = time.monotonic()
+        response = None
+        err = None
+        try:
+            response = self._session.post(url, data=data, timeout=_HTTP_TIMEOUT)
+        except Exception as e:
+            err = str(e)
+            raise
+        finally:
+            _lt_emit_http("POST", path, None, data, response, (time.monotonic() - t0) * 1000, err)
         self._raise_for_status(response, "POST", path)
         return response.json()
 

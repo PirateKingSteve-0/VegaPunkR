@@ -13,7 +13,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Optional
 
-from database import SessionLocals
+from database import SessionLocals, default_environment
 from config import Environment
 from models import User, Strategy, Position
 from engine.strategy_executor import StrategyExecutor
@@ -140,7 +140,7 @@ class StreamDrivenWorker:
     async def start(self):
         self._running = True
         try:
-            db = SessionLocals[Environment.DEV]()
+            db = SessionLocals[default_environment()]()
             try:
                 active = db.query(Strategy).filter(Strategy.is_active == True).all()
                 for strategy in active:
@@ -179,7 +179,7 @@ class StreamDrivenWorker:
 
     async def _auto_restart(self, strategy_id: int):
         await asyncio.sleep(5)
-        db = SessionLocals[Environment.DEV]()
+        db = SessionLocals[default_environment()]()
         try:
             strategy = db.query(Strategy).filter(Strategy.id == strategy_id).first()
             if strategy and strategy.is_active:
@@ -201,7 +201,7 @@ class StreamDrivenWorker:
 
     async def _run_strategy(self, strategy_id: int):
         async with self._semaphore:
-            db = SessionLocals[Environment.DEV]()
+            db = SessionLocals[default_environment()]()
             try:
                 strategy = db.query(Strategy).filter(Strategy.id == strategy_id).first()
                 if not strategy:
@@ -397,6 +397,25 @@ class StreamDrivenWorker:
             finally:
                 db.close()
 
+    def _tradier_client_for(self, strategy_id: int, db):
+        """Per-user Tradier client (live for live mode, sandbox for paper) for
+        ACCOUNT-specific reads — so position reconcile queries the SAME account
+        the engine places orders on, not the global sandbox singleton.
+
+        Raises if the strategy's user can't be resolved; every caller already
+        wraps the reconcile in try/except and safely skips the tick on error.
+        (Market-data reads — quotes, option chain, market clock — are
+        env-independent and intentionally keep using the shared client.)"""
+        from engine.trading_client_manager import trading_manager
+
+        strat = db.query(Strategy).filter(Strategy.id == strategy_id).first()
+        if strat is None:
+            raise RuntimeError(f"reconcile: strategy {strategy_id} not found")
+        user = db.query(User).filter(User.id == strat.user_id).first()
+        if user is None:
+            raise RuntimeError(f"reconcile: user for strategy {strategy_id} not found")
+        return trading_manager.get_client(user)
+
     async def _startup_sync(
         self,
         strategy_id: int,
@@ -414,8 +433,7 @@ class StreamDrivenWorker:
           C) Tradier has no position, DB shows one → zero out DB (was manually closed)
         """
         try:
-            from tradier_integration.client import get_tradier_client
-            client = get_tradier_client()
+            client = self._tradier_client_for(strategy_id, db)
             tradier_positions = await asyncio.to_thread(client.get_positions)
 
             # Find any option contract for our underlying held in Tradier
@@ -519,8 +537,7 @@ class StreamDrivenWorker:
         # for this underlying, adopt it so the executor stops missing exits.
         if position.qty <= 0:
             try:
-                from tradier_integration.client import get_tradier_client
-                client = get_tradier_client()
+                client = self._tradier_client_for(strategy_id, db)
                 tradier_positions = await asyncio.to_thread(client.get_positions)
                 underlying = state.underlying_symbol
                 held = [
@@ -566,8 +583,7 @@ class StreamDrivenWorker:
             return  # can't identify the contract
 
         try:
-            from tradier_integration.client import get_tradier_client
-            client = get_tradier_client()
+            client = self._tradier_client_for(strategy_id, db)
             tradier_positions = await asyncio.to_thread(client.get_positions)
 
             held = {

@@ -21,12 +21,19 @@ from config import Environment
 from models import User
 from services.tradier_reconcile import reconcile_user_history
 from tradier_integration.client import get_tradier_client
+from engine.trading_client_manager import trading_manager
 
 router = APIRouter(prefix="/tradier", tags=["Tradier Brokerage"])
 
 
-def _client():
-    return get_tradier_client()
+def _client(user: User):
+    """Per-user Tradier client — sandbox for paper mode, live for live mode.
+
+    Routes by the caller's `selected_trading_mode` so the performance page and
+    every Tradier read follow the same account the engine trades against,
+    instead of the global sandbox singleton (which always hit sandbox
+    regardless of the user's live/paper selection)."""
+    return trading_manager.get_client(user)
 
 
 @router.get("/stream/events")
@@ -101,7 +108,7 @@ async def stream_events(
 def get_profile(current_user: User = Depends(get_current_user)):
     """GET /v1/user/profile — Tradier user info and account numbers."""
     try:
-        return _client().get_profile()
+        return _client(current_user).get_profile()
     except Exception as e:
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(e))
 
@@ -118,7 +125,7 @@ def get_balances(
     option_buying_power, and the full margin or cash sub-object.
     """
     try:
-        return _client().get_balances(account_id)
+        return _client(current_user).get_balances(account_id)
     except Exception as e:
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(e))
 
@@ -134,7 +141,7 @@ def get_positions(
     Returns open positions with symbol, quantity, cost_basis, date_acquired.
     """
     try:
-        return _client().get_positions(account_id)
+        return _client(current_user).get_positions(account_id)
     except Exception as e:
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(e))
 
@@ -150,7 +157,7 @@ def get_orders(
     Returns today's orders (id, symbol, side, qty, price, type, status).
     """
     try:
-        return _client().get_orders(account_id)
+        return _client(current_user).get_orders(account_id)
     except Exception as e:
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(e))
 
@@ -176,7 +183,7 @@ def get_history(
     Note: detailed history is not available for sandbox accounts.
     """
     try:
-        return _client().get_history(
+        return _client(current_user).get_history(
             account_id=account_id,
             period=period,
             page=page,
@@ -204,7 +211,7 @@ def get_historical_balances(
     chosen period. Returns {balances:[{date,value}...], delta, deltaPercent}.
     """
     try:
-        return _client().get_historical_balances(account_id, period=period)
+        return _client(current_user).get_historical_balances(account_id, period=period)
     except Exception as e:
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(e))
 
@@ -221,7 +228,7 @@ def get_market_history(
     GET /v1/markets/history — historical OHLCV bars for charting a position.
     """
     try:
-        return _client().get_history_pricing(symbol=symbol, interval=interval, start=start, end=end)
+        return _client(current_user).get_history_pricing(symbol=symbol, interval=interval, start=start, end=end)
     except Exception as e:
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(e))
 
@@ -237,7 +244,7 @@ def get_market_timesales(
 ):
     """GET /v1/markets/timesales — intraday OHLCV bars."""
     try:
-        return _client().get_timesales(
+        return _client(current_user).get_timesales(
             symbol=symbol,
             interval=interval,
             start=start,
@@ -270,7 +277,7 @@ def get_market_quotes(
     """GET /v1/markets/quotes — last/change quotes for one or more symbols."""
     symbol_list = [s.strip() for s in symbols.split(",") if s.strip()]
     try:
-        return _client().get_quotes(symbol_list)
+        return _client(current_user).get_quotes(symbol_list)
     except Exception as e:
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(e))
 
@@ -279,7 +286,7 @@ def get_market_quotes(
 def list_watchlists(current_user: User = Depends(get_current_user)):
     """GET /v1/watchlists — list all of the user's watchlists."""
     try:
-        return _client().get_watchlists()
+        return _client(current_user).get_watchlists()
     except Exception as e:
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(e))
 
@@ -288,7 +295,7 @@ def list_watchlists(current_user: User = Depends(get_current_user)):
 def get_watchlist(watchlist_id: str, current_user: User = Depends(get_current_user)):
     """GET /v1/watchlists/{watchlist_id} — fetch a specific watchlist with its symbols."""
     try:
-        return _client().get_watchlist(watchlist_id)
+        return _client(current_user).get_watchlist(watchlist_id)
     except Exception as e:
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(e))
 
@@ -300,7 +307,7 @@ def create_watchlist(
 ):
     """POST /v1/watchlists — create a new watchlist."""
     try:
-        return _client().create_watchlist(payload.name, payload.symbols)
+        return _client(current_user).create_watchlist(payload.name, payload.symbols)
     except Exception as e:
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(e))
 
@@ -313,7 +320,7 @@ def update_watchlist(
 ):
     """PUT /v1/watchlists/{watchlist_id} — rename a watchlist or replace its symbols."""
     try:
-        return _client().update_watchlist(watchlist_id, payload.name, payload.symbols)
+        return _client(current_user).update_watchlist(watchlist_id, payload.name, payload.symbols)
     except Exception as e:
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(e))
 
@@ -322,7 +329,7 @@ def update_watchlist(
 def delete_watchlist(watchlist_id: str, current_user: User = Depends(get_current_user)):
     """DELETE /v1/watchlists/{watchlist_id}"""
     try:
-        return _client().delete_watchlist(watchlist_id)
+        return _client(current_user).delete_watchlist(watchlist_id)
     except Exception as e:
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(e))
 
@@ -335,7 +342,7 @@ def add_watchlist_symbols(
 ):
     """POST /v1/watchlists/{watchlist_id}/symbols — add symbols to a watchlist."""
     try:
-        return _client().add_watchlist_symbols(watchlist_id, payload.symbols)
+        return _client(current_user).add_watchlist_symbols(watchlist_id, payload.symbols)
     except Exception as e:
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(e))
 
@@ -348,7 +355,7 @@ def remove_watchlist_symbol(
 ):
     """DELETE /v1/watchlists/{watchlist_id}/symbols/{symbol}"""
     try:
-        return _client().remove_watchlist_symbol(watchlist_id, symbol)
+        return _client(current_user).remove_watchlist_symbol(watchlist_id, symbol)
     except Exception as e:
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(e))
 
@@ -367,7 +374,7 @@ def get_gainloss(
     Returns cost_basis, proceeds, and realized P&L per closed position.
     """
     try:
-        return _client().get_gainloss(account_id, page=page, limit=limit)
+        return _client(current_user).get_gainloss(account_id, page=page, limit=limit)
     except Exception as e:
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(e))
 

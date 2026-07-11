@@ -2,6 +2,7 @@
 VegaPunkR Trading API - Main application entry point.
 """
 import logging
+import os
 from contextlib import asynccontextmanager
 
 logging.basicConfig(
@@ -23,6 +24,21 @@ logger = logging.getLogger(__name__)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # --------------- startup ---------------
+    from database import default_environment
+
+    # Always make it obvious which database this process (API + engine worker)
+    # is pinned to — critical since background trading is not per-request.
+    logger.warning(
+        "🗄️  Process DB environment: APP_ENV=%s → %s",
+        os.getenv("APP_ENV", "dev"), default_environment().value,
+    )
+
+    # Live-test: route the human-readable engine log to a dated file too.
+    from live_test.logging_setup import is_enabled, install_root_file_handler
+    if is_enabled():
+        path = install_root_file_handler()
+        logger.warning("🧪 LIVE_TEST_LOGGING on — engine log → %s", path)
+
     from engine.tradier_stream_manager import get_stream_manager
     from engine.stream_driven_worker import get_stream_driven_worker
     from services.email_report_scheduler import get_email_report_scheduler

@@ -6888,3 +6888,110 @@ Reports filter on `exit_timestamp IS NOT NULL`, so they only display the exit tr
 This dual-pattern architecture is intentional (allows different workflows) and both patterns now produce correct P&L values.
 
 ---
+
+## Session Date: July 10–11, 2026
+
+### Overview
+
+Investigated a dashboard P&L discrepancy and, in the process, uncovered and fixed several
+"split-brain" bugs that made **live** trading unsafe. Built the infrastructure for a controlled
+live-trading test on **Monday 2026-07-13** (see `docs/live-test-plan-2026-07-13.md` and
+`docs/monday-runbook.md`). No live orders were placed; all broker calls this session were
+read-only sandbox/live balance checks.
+
+### 1. The P&L discrepancy (diagnosis)
+
+- **Symptom:** the overview session tile showed ≈ **−$75 today** while Tradier's gainloss report
+  showed **+$1,531** realized for Jul 9.
+- **Root:** the app keeps **two P&L ledgers** — the local `Trade.pnl` table (the engine's own) vs
+  Tradier's gainloss. The dashboard tile reads the local ledger; the performance page reads Tradier.
+- **Why the local ledger is wrong:** `order_manager._extract_filled_price` falls back to the
+  **estimated mid quote** when the broker returns no `avg_fill_price` (the sandbox case). Booking
+  P&L on guessed prices shredded a real TSLA run (6.55→8.55) into flat scalps. Fingerprint: on quiet
+  **SPY** the ledger was ≈right (engine +$118 vs Tradier +$126); on the **TSLA** that moved $2 it was
+  catastrophic (engine **−$190** vs Tradier **+$1,405**).
+- **Unresolvable in sandbox:** Tradier's OWN numbers contradict — `balances.close_pl = −72` (agrees
+  with the engine) vs `gainloss = +1,531`, and the per-fill `history` endpoint is **empty in
+  sandbox**. Only a live fill can settle which is real → hence the live test.
+
+### 2. Timezone / day-boundary fix
+
+- Added `utils/market_hours.py`: `market_day_start_utc()` (ET market day) and
+  `user_day_start_utc(tz)` (viewer's local day, ET fallback).
+- **Trading gates** (`risk_manager._check_user_daily_loss_limit`, `_check_daily_loss_limit`) → ET
+  market day. **Display** (`get_account_risk_status`, `get_risk_metrics_summary`, `admin._today_pnl_for`)
+  → viewer's timezone. Fixes the tile reading **$0 at 11pm PT** (UTC/ET had already rolled over).
+
+### 3. Live-mode fill confirmation (critical safety fix)
+
+- `order_manager._await_terminal_order` returned `None` for any non-paper mode, so **every live
+  order was treated as unconfirmed** — no fill captured, no position update, and a ~60s window where
+  the engine believed it was flat while holding a live position (**stacking risk**). Now it polls
+  Tradier `get_order` in **both** paper and live (both use a TradierClient). `close_position` inherits
+  the fix via the same method.
+
+### 4. Database routing — the DB never actually switched
+
+- `database.get_db(environment=Environment.DEV)` hardcoded DEV and nothing overrode it; the engine
+  worker (`stream_driven_worker`) and email scheduler hardcoded `SessionLocals[Environment.DEV]`.
+  Only the broker client honored the live/paper toggle → **live orders against the dev DB.**
+- **Process-level fix:** `database.default_environment()` reads `APP_ENV` (default dev); `get_db`,
+  the worker, and the email scheduler route through it. Launch a live run with `APP_ENV=prod`.
+- **Per-request fix (UI toggle now works):** the JWT carries an `env` claim; `get_db` routes by it
+  (`_env_from_request`), login stamps it, `system.set_environment` re-mints the token and returns it,
+  and the Angular `system.service` stores it. Verified: prod-token → prod DB (1 SPY), dev-token → dev
+  (2). Background services stay on `APP_ENV` (trading can't be per-request).
+
+### 5. Tradier client was sandbox-pinned
+
+- The `/tradier/*` router used a global `get_tradier_client()` (always sandbox) → the performance
+  page always showed sandbox regardless of live mode. Fixed: `_client(user)` →
+  `trading_manager.get_client(current_user)`.
+- The engine's **position reconcile** (`stream_driven_worker._startup_sync` / `_reconcile_position`
+  `get_positions()`) also read sandbox → would reconcile live orders against sandbox holdings. Added
+  `_tradier_client_for(strategy_id, db)` (per-user). Verified prod→live, dev→sandbox. Env-independent
+  reads (quotes, option chain, market clock, WS session) intentionally left on the shared client.
+
+### 6. Live-test tooling + instrumentation
+
+- **`api/live_test/`**: `monitor.py` (read-only broker-vs-local monitor, `python -m live_test.monitor`,
+  never places/cancels), `logging_setup.py` (dated JSONL under `logs/livetest-<ET-date>/`).
+- **Instrumentation behind `LIVE_TEST_LOGGING`** (verified, **token never logged**):
+  `broker_http-*.jsonl` (raw req/resp at `client._get/_post`, headers excluded),
+  `orders-*.jsonl` (`filled` record: `estimated_price` vs `broker_avg_fill_price` vs `filled_price`),
+  `stream-*.jsonl` (WS payloads — all trades, quotes sampled 1/sym/2s, decode errors),
+  `engine-*.log` (root file handler), plus a startup line printing the process DB env.
+
+### 7. Prod environment setup
+
+- Seeded the (empty) prod DB: copied `user id=1` (same login) + `strategy id=3` "SPY 0DTE Scalping
+  Testing" set **inactive** and `is_paper_trading=False`. Live account funded is pending (was $70 —
+  TSLA 0DTE unaffordable, hence SPY). Set dev user → `dev+paper`, prod user → `prod+live` for coherence.
+
+### Files changed
+
+- `api/utils/market_hours.py` (new helpers), `api/engine/risk_manager.py`, `api/routers/admin.py`
+- `api/engine/order_manager.py` (live poll + order log hook), `api/engine/stream_driven_worker.py`
+  (`default_environment` + per-user reconcile client + order log)
+- `api/database.py` (`default_environment`, token-env routing), `api/routers/auth.py` (env claim),
+  `api/routers/system.py` (token re-mint), `ui/src/app/services/system.service.ts` (store token)
+- `api/tradier_integration/router.py` + `client.py` (per-user client, broker_http hook),
+  `api/engine/tradier_stream_manager.py` (stream hook), `api/services/email_report_scheduler.py`,
+  `api/app.py` (root file handler + env log)
+- New: `api/live_test/` (`__init__`, `__main__`, `logging_setup.py`, `monitor.py`),
+  `docs/live-test-plan-2026-07-13.md`, `docs/monday-runbook.md`
+
+### Open items / follow-ups
+
+- **Sandbox dry-run** still pending (one round-trip end-to-end with `LIVE_TEST_LOGGING=1`).
+- **Monday live test** per the runbook; then the **4-way reconcile** (local vs `close_pl` vs
+  `gainloss` vs order `avg_fill_price`) to decide the source of truth.
+- **Deferred until after live data:** reconcile→price/pnl auto-repair; sourcing the dashboard tile
+  from Tradier.
+- **Lower-priority still-sandbox:** `services/tradier_reconcile.py`, `email_report_scheduler.py`
+  (not in the intraday live order path).
+- **Dead code noted:** `services/strategy_worker.py` (broken `from database import SessionLocal`
+  import; only referenced by a test — superseded by `stream_driven_worker`).
+- Restart the API to load all of the above; none of it is committed yet (working tree on `dev`).
+
+---

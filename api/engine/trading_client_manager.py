@@ -261,6 +261,7 @@ class TradingClientManager:
                 "portfolio_value": float(balances.get("total_equity", 0)),
                 "equity": float(balances.get("total_equity", 0)),
                 "open_pl": float(balances.get("open_pl", 0)),
+                "close_pl": float(balances.get("close_pl", 0)),
                 "api": api_label
             }
         except Exception as e:

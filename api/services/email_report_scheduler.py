@@ -25,17 +25,17 @@ from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.date import DateTrigger
 
 from config import Environment
-from database import SessionLocals
+from database import SessionLocals, default_environment
 from models import User
 from notifications import reports
 from notifications.email import is_enabled_for
 
 
 def _new_session():
-    """Mirror the pattern in stream_driven_worker — DEV pool for the
-    background scheduler. Multi-DB switching happens at the request layer,
-    not in long-running background services."""
-    return SessionLocals[Environment.DEV]()
+    """Session for this process's environment (APP_ENV, default dev), matching
+    the engine worker. So a live-test process launched with APP_ENV=prod reports
+    on prod data rather than always dev."""
+    return SessionLocals[default_environment()]()
 
 logger = logging.getLogger(__name__)
 

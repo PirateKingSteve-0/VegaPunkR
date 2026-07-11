@@ -14,6 +14,57 @@ import pytz
 
 logger = logging.getLogger(__name__)
 
+ET = pytz.timezone('US/Eastern')
+
+
+def market_day_start_utc(now_utc: Optional[datetime] = None) -> datetime:
+    """Start of the current US/Eastern *trading day*, as a naive UTC datetime.
+
+    The engine's timestamp columns (e.g. ``Trade.timestamp``) are naive UTC
+    (written via ``datetime.utcnow()``), so any window compared against them
+    must also be naive UTC. We anchor "today" to the Eastern calendar day — the
+    market day — rather than UTC midnight, which in ET lands at ~8 PM the prior
+    evening and would roll the trading day over mid-evening.
+
+    Used by the daily-loss risk gates so the loss window tracks the market
+    session, not an arbitrary UTC cutoff. Changing only the window boundary:
+    during a normal session both cutoffs cover the same trades; the ET anchor
+    can only hold a loss/halt longer into the evening, never release it early.
+    """
+    now = now_utc or datetime.utcnow()
+    if now.tzinfo is None:
+        now = pytz.utc.localize(now)
+    now_et = now.astimezone(ET)
+    start_et = ET.localize(datetime(now_et.year, now_et.month, now_et.day, 0, 0, 0))
+    return start_et.astimezone(pytz.utc).replace(tzinfo=None)
+
+
+def user_day_start_utc(timezone_name: Optional[str], now_utc: Optional[datetime] = None) -> datetime:
+    """Start of the current calendar day in the *viewer's* timezone, as a naive
+    UTC datetime.
+
+    For display/monitoring surfaces ("today's P&L" on the dashboard tile) we
+    bucket by the user's own day so the number matches what they perceive as
+    today, rather than the market/ET day. Falls back to the Eastern market day
+    when no usable timezone is set — the model default is the literal string
+    ``'UTC'``, which for a US-market app we treat as "unset" and resolve to ET.
+    """
+    tz = None
+    if timezone_name and timezone_name != 'UTC':
+        try:
+            tz = pytz.timezone(timezone_name)
+        except Exception:
+            logger.warning("Unknown user timezone %r; falling back to ET", timezone_name)
+            tz = None
+    if tz is None:
+        return market_day_start_utc(now_utc)
+    now = now_utc or datetime.utcnow()
+    if now.tzinfo is None:
+        now = pytz.utc.localize(now)
+    now_local = now.astimezone(tz)
+    start_local = tz.localize(datetime(now_local.year, now_local.month, now_local.day, 0, 0, 0))
+    return start_local.astimezone(pytz.utc).replace(tzinfo=None)
+
 
 class MarketHours:
     """US Market hours detection with timezone awareness."""
