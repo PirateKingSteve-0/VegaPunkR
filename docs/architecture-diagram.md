@@ -33,10 +33,11 @@ graph TB
     end
 
     subgraph "Broker Integrations"
-        TCM[TradingClientManager<br/>Paper/Live Router]
-        TC[TradierClient<br/>REST + WebSocket]
-        SC[SchwabClient<br/>OAuth + SDK]
-        AC[AlpacaClient<br/>Legacy Paper]
+        TCM[TradingClientManager<br/>Paper OR Live Router<br/>BOTH return TradierClient]
+        TC[TradierClient<br/>REST + WebSocket<br/>THE ONLY LIVE BROKER]
+        ASM[TradierAccountStream<br/>order events - pushed fills]
+        SC[SchwabClient<br/>NOT a trading path -<br/>TCM never returns it.<br/>OAuth router still mounted]
+        AC[AlpacaClient<br/>DEAD - removed from<br/>the import graph 2026-07-13]
     end
 
     subgraph "Data Layer"
@@ -78,16 +79,19 @@ graph TB
     SE -->|3. Execute Order| OM
     OM -->|Route Order| TCM
 
-    %% Broker routing
-    TCM -->|Paper Mode| TC
-    TCM -->|Live Mode| TC
-    TCM -->|Schwab| SC
-    TCM -->|Legacy| AC
+    %% Broker routing — paper vs live is Tradier SANDBOX vs Tradier LIVE.
+    %% TradingClientManager is not a broker abstraction: both branches return TradierClient.
+    TCM -->|Paper Mode - sandbox| TC
+    TCM -->|Live Mode - live| TC
+    TCM -.->|dead branch| SC
+    TCM -.->|dead branch| AC
 
     %% External calls
-    TC <-->|REST and WS| TRADIER
-    SC <-->|REST| SCHWAB
-    TSM <-->|WebSocket| TRADIER
+    TC <-->|REST| TRADIER
+    OM -->|await fill| ASM
+    ASM <-->|WebSocket - account events| TRADIER
+    TSM <-->|WebSocket - market events| TRADIER
+    SC <-.->|REST - OAuth router only,<br/>no order placement| SCHWAB
 
     %% Database
     AUTH ---|Read Write Users| DB
@@ -454,8 +458,9 @@ graph LR
     end
 
     subgraph "Engine Core"
-        SDW[stream_driven_worker.py<br/>Singleton<br/>Task Manager]
-        TSM[tradier_stream_manager.py<br/>Single WebSocket]
+        SDW[stream_driven_worker.py<br/>Singleton Task Manager<br/>arm - drift check - reselect]
+        TSM[tradier_stream_manager.py<br/>MARKET WebSocket]
+        TAS[tradier_account_stream.py<br/>ACCOUNT WebSocket<br/>pushed order events]
         SR[stream_router.py<br/>Multiplexer]
         SE[strategy_executor.py<br/>Orchestrator]
     end
@@ -469,8 +474,8 @@ graph LR
 
     subgraph "Broker Clients"
         TC[tradier_integration/<br/>client.py<br/>router.py]
-        SC[schwab_integration/<br/>client.py<br/>auth.py]
-        AC[alpaca/<br/>broker_api.py]
+        SC[schwab_integration/<br/>router MOUNTED in app.py<br/>but NOT a trading path]
+        AC[alpaca/<br/>DEAD - vendored SDK,<br/>0 modules loaded at runtime]
     end
 
     subgraph "Services"
@@ -501,8 +506,10 @@ graph LR
     SDW --> SR
     SDW --> SE
     SDW --> M
+    SDW --> OM
 
     TSM --> TC
+    TAS --> TC
 
     SE --> RM
     SE --> SG
@@ -511,10 +518,11 @@ graph LR
     OM --> TCM
     OM --> M
     OM --> RPT
+    OM --> TAS
 
     TCM --> TC
-    TCM --> SC
-    TCM --> AC
+    TCM -.-> SC
+    TCM -.-> AC
 
     TC --> CFG
     SC --> CFG
@@ -592,7 +600,10 @@ stateDiagram-v2
     SignalCheck --> RiskValidation: Entry Signal<br/>Detected
 
     RiskValidation --> Idle: Risk Check<br/>Failed
-    RiskValidation --> EntryLockout: Risk Check<br/>Passed
+    RiskValidation --> UnconfirmedGate: Risk Check<br/>Passed
+
+    UnconfirmedGate --> Idle: BUY blocked —<br/>an earlier order is<br/>unconfirmed at broker
+    UnconfirmedGate --> EntryLockout: No unconfirmed<br/>orders (SELLS always pass)
 
     EntryLockout --> Idle: Position Already<br/>Exists (race)
     EntryLockout --> RateLimit: Lockout<br/>Acquired
@@ -608,12 +619,18 @@ stateDiagram-v2
     PlaceOrder --> PollStatus: Order ID<br/>Returned
     PlaceOrder --> ReleaseCash: Order<br/>Rejected
 
-    PollStatus --> PollStatus: Status<br/>pending or open
+    PollStatus --> PollStatus: Status pending or open<br/>(sleeps on account stream,<br/>wakes early on push)
     PollStatus --> Filled: Status<br/>filled
-    PollStatus --> Timeout: 30s<br/>Elapsed
+    PollStatus --> Unconfirmed: 30s Elapsed —<br/>broker never answered
 
     Filled --> UpdateDB: Write Trade<br/>+ Position
-    Timeout --> ReleaseCash: Cancel<br/>Order
+
+    Unconfirmed --> Idle: Record order id.<br/>BLOCK further BUYS.<br/>Local state UNTOUCHED —<br/>the order may still fill!
+
+    Unconfirmed --> Resolve: Reconcile tick (60s)<br/>re-polls the order
+    Resolve --> Backfill: Broker says FILLED
+    Resolve --> Idle: rejected canceled expired<br/>→ unblock, nothing taken
+    Backfill --> Idle: Write Trade at the broker's<br/>real avg_fill_price → unblock
 
     UpdateDB --> Notify: DB<br/>Committed
     Notify --> OpenPosition: Discord<br/>+ Email
@@ -655,6 +672,22 @@ stateDiagram-v2
         - Get commission/fees
     end note
 
+    note right of Unconfirmed
+        "Unconfirmed" is NOT "didn't happen".
+        We do NOT cancel and do NOT assume failure —
+        the broker may still fill it.
+
+        2026-07-13: two orders timed out at 30s and
+        FILLED anyway. The engine wrote no Position,
+        so it believed it was flat while holding 6
+        TSLA contracts: no stop, no take-profit, and
+        free to stack a second entry on top.
+
+        Hence: block further BUYS (never SELLS — an
+        exit must always run), and re-poll on the
+        reconcile tick to backfill the Trade row.
+    end note
+
     note right of ExitSignalCheck
         Exit Triggers:
         - Take profit %
@@ -668,11 +701,42 @@ stateDiagram-v2
 
 ## 8. WebSocket Stream Architecture
 
+**Two independent streams run concurrently.** Tradier's "one session at a time" limit is
+stated per stream-*type* — market and account each have their own session endpoint and
+socket — so both coexist. Verified against sandbox 2026-07-13.
+
+- **Market stream** (`tradier_stream_manager.py`) — price/quote ticks. Always LIVE endpoint;
+  sandbox has no market-data WS host.
+- **Account stream** (`tradier_account_stream.py`) — order lifecycle events. Uses the
+  *trading* env, so paper mode connects to `sandbox-ws.tradier.com`. Exists so fills are
+  **pushed** rather than polled: on 2026-07-13 two orders filled while the engine's 30s
+  `get_order` poll expired, leaving it holding 6 contracts it had no record of.
+
+The account stream is an **accelerator, not a replacement** — REST polling remains the
+fallback, so if it drops the engine behaves exactly as it did before.
+
 ```mermaid
 graph TB
-    subgraph "Tradier WebSocket"
-        WS[wss://ws.tradier.com<br/>/v1/markets/events]
+    subgraph "Tradier WebSockets (two sessions, one per type)"
+        WS[wss://ws.tradier.com<br/>/v1/markets/events<br/>MARKET DATA - always live]
+        WSA[wss://sandbox-ws OR ws.tradier.com<br/>/v1/accounts/events<br/>ORDER EVENTS - follows trading env]
     end
+
+    subgraph "TradierAccountStreamManager (Singleton)"
+        ASM[Account Stream Manager<br/>events: order]
+        ALATEST[latest event per order_id]
+        AWAIT[wait_for_terminal<br/>wakes the fill poll instantly]
+    end
+
+    subgraph "OrderManager"
+        OM[_await_terminal_order<br/>REST poll 1.5s / 30s deadline<br/>sleeps ON the stream]
+    end
+
+    WSA -->|order pending open filled| ASM
+    ASM --> ALATEST
+    ALATEST --> AWAIT
+    AWAIT -.->|terminal - wake early| OM
+    OM -.->|no stream? fall back to REST| OM
 
     subgraph "TradierStreamManager (Singleton)"
         SM[Stream Manager<br/>Single Persistent Connection]
@@ -727,17 +791,22 @@ graph TB
     T2 -.->|subscribe QQQ| REF
     T3 -.->|subscribe SPY IWM| REF
 
-    Note1[Reference Counting:<br/>SPY: 2 consumers → stays subscribed<br/>If Task 1 stops → SPY: 1 consumer<br/>If Task 3 stops → SPY: 0 → unsubscribe]
+    Note1[Reference Counting is GLOBAL across strategies:<br/>SPY: 2 consumers → stays subscribed<br/>If Task 1 stops → SPY: 1 consumer<br/>If Task 3 stops → SPY: 0 → unsubscribe<br/><br/>Each strategy tracks its OWN streamed_symbols:<br/>unsubscribing a symbol it never subscribed would<br/>decrement another strategy's count and kill its feed]
+
+    Note2[Account stream carries NO symbol and NO side.<br/>Fields: id, status, avg_fill_price, executed_quantity.<br/>It is a NOTIFICATION keyed on order id —<br/>the canonical order still comes from REST get_order.]
 
     style Note1 fill:#fff3e0,stroke:#e65100
+    style Note2 fill:#fff3e0,stroke:#e65100
 
     classDef ws fill:#e1f5ff,stroke:#01579b,stroke-width:2px
     classDef router fill:#f3e5f5,stroke:#4a148c,stroke-width:2px
     classDef worker fill:#e8f5e9,stroke:#1b5e20,stroke-width:2px
+    classDef acct fill:#fce4ec,stroke:#880e4f,stroke-width:2px
 
     class WS,SM,RECONN,PARSER ws
     class REF,Q1,Q2,Q3 router
     class T1,T2,T3,MS1,MS2,MS3 worker
+    class WSA,ASM,ALATEST,AWAIT,OM acct
 ```
 
 ## 9. Risk Management Hierarchy
@@ -802,6 +871,17 @@ graph TB
 
 ## 10. Frontend Angular Architecture
 
+> **Performance page P&L comes from `StrategyService.getClosedTrades()`
+> (`GET /performance/closed-trades`), NOT from Tradier's `/gainloss`.**
+> That report's FIFO lot matcher does not retire closed buy lots when a contract is
+> round-tripped repeatedly, so on 2026-07-13 it reported **−$21,057** for a day that
+> actually lost **−$1,851**. It is also paginated, so a busy day was truncated on top of
+> being wrong. The engine's own `Trade` rows pair each exit with the entry that opened
+> it, at fill time — correct by construction, no lot matching required.
+> Period selector now includes **1D** (`DAY`); Tradier has no DAY bucket for historical
+> balances, so `getHistoricalBalances()` sends `WEEK` and the day filtering happens on
+> the closed positions.
+
 ```mermaid
 graph TB
     subgraph "Angular 20 UI"
@@ -816,7 +896,7 @@ graph TB
 
         subgraph "Services"
             AUTHS[AuthService<br/>Login/Register<br/>JWT Token Manager<br/>Role Guards]
-            STRATS[StrategyService<br/>CRUD Strategies<br/>Fetch Templates<br/>Toggle Active]
+            STRATS[StrategyService<br/>CRUD Strategies<br/>Equity Curves<br/>getClosedTrades - P&amp;L SOURCE]
             ACCTS[AccountService<br/>Fetch Balance<br/>Positions<br/>Trades]
             TRAD[TradierService<br/>Proxy to Tradier<br/>Quotes<br/>Option Chains]
             SCH[SchwabService<br/>OAuth Redirect<br/>Account Info]
