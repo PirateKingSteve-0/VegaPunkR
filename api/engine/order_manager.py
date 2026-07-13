@@ -41,6 +41,11 @@ def _lt_emit_order(event: str, **fields):
 # against runaway loops; tuned for 0DTE scalping where a few seconds is plenty.
 MIN_ORDER_INTERVAL_SECONDS = 5.0
 
+# Broker order states that will never change again (docs/tradier/accounts/order.md).
+# Anything else — pending, open, partially_filled — means the order is still live and
+# we must keep waiting rather than assume it died.
+_TERMINAL_ORDER_STATUSES = {"filled", "rejected", "canceled", "expired"}
+
 # Pre-flight order preview — call Tradier's preview endpoint before each
 # place_order to validate buying power, contract validity, and surface
 # commission/fees for the audit trail. Disable to fall back to direct placement.
@@ -109,6 +114,145 @@ class OrderManager:
     # nothing across restarts (broker is the source of truth post-restart).
     # Maps reservation_id -> {user_id, amount, expires_at}.
     _pending_buy_reservations: Dict[str, Dict] = {}
+
+    # Orders we placed but could not confirm within the terminal-status poll window.
+    # "Unconfirmed" is NOT "didn't happen" — the broker may still fill it, and on
+    # 2026-07-13 two of these filled while the engine had written no Position row.
+    # While one is outstanding we must not BUY again for that strategy: a second
+    # entry would stack on top of an invisible first one, and max_positions cannot
+    # catch it because there is no Position row to count. Sells are never blocked —
+    # an exit must always be able to run.
+    # Keyed by (user_id, strategy_id) -> {order_id: meta}
+    _unconfirmed_orders: Dict[Tuple[int, int], Dict[str, Dict]] = {}
+
+    @classmethod
+    def _mark_unconfirmed(cls, user_id: int, strategy_id: int, order_id: str, meta: Dict) -> None:
+        cls._unconfirmed_orders.setdefault((user_id, strategy_id), {})[str(order_id)] = meta
+
+    @classmethod
+    def _clear_unconfirmed(cls, user_id: int, strategy_id: int, order_id: str) -> None:
+        bucket = cls._unconfirmed_orders.get((user_id, strategy_id))
+        if not bucket:
+            return
+        bucket.pop(str(order_id), None)
+        if not bucket:
+            cls._unconfirmed_orders.pop((user_id, strategy_id), None)
+
+    @classmethod
+    def has_unconfirmed_orders(cls, user_id: int, strategy_id: int) -> bool:
+        return bool(cls._unconfirmed_orders.get((user_id, strategy_id)))
+
+    async def resolve_unconfirmed_orders(self, user: User, strategy: Strategy) -> int:
+        """Re-poll orders the terminal-status wait gave up on, and settle them.
+
+        Called from the reconcile tick. For an order the broker has since FILLED, this
+        backfills the Trade row that the timeout path skipped — with the broker's real
+        avg_fill_price, not our estimate — so P&L history matches the account. Position
+        state is NOT touched here: _reconcile_position already adopts broker holdings,
+        and doing it in both places would double-count.
+
+        Clearing the order also lifts the entry block. Returns how many were settled.
+        """
+        key = (user.id, strategy.id)
+        pending = dict(self._unconfirmed_orders.get(key, {}))
+        if not pending:
+            return 0
+
+        try:
+            client = self.trading_client.get_client(user)
+        except Exception as e:
+            logger.warning(f"Cannot resolve unconfirmed orders — client unavailable: {e}")
+            return 0
+
+        resolved = 0
+        for order_id, meta in pending.items():
+            try:
+                order = await asyncio.to_thread(client.get_order, order_id)
+            except Exception as e:
+                logger.warning(f"resolve_unconfirmed: get_order({order_id}) failed: {e}")
+                continue
+
+            status = (order.get("status") or "").lower()
+            if status not in _TERMINAL_ORDER_STATUSES:
+                continue  # still working at the broker — keep the entry block on
+
+            if status == "filled":
+                self._backfill_filled_order(user, strategy, order_id, order, meta)
+            else:
+                logger.info(
+                    f"Unconfirmed order {order_id} settled as '{status}' — no contracts taken"
+                )
+
+            self._clear_unconfirmed(user.id, strategy.id, order_id)
+            resolved += 1
+
+        return resolved
+
+    def _backfill_filled_order(
+        self, user: User, strategy: Strategy, order_id: str, order: Dict, meta: Dict
+    ) -> None:
+        """Write the Trade row for an order that filled after we stopped waiting."""
+        filled_price = self._extract_filled_price(order, meta.get("signal_price") or 0.0)
+        filled_qty = self._extract_filled_qty(order, meta.get("qty") or 0)
+        if filled_qty <= 0:
+            return
+
+        # Idempotence: the row may already exist if a previous tick backfilled it.
+        # (The in-process dict is cleared on success, but a restart could re-enter here.)
+        cutoff = datetime.utcnow() - timedelta(hours=24)
+        already = self.db.query(Trade).filter(
+            Trade.strategy_id == strategy.id,
+            Trade.timestamp >= cutoff,
+        ).all()
+        if any(str((t.notes or {}).get("order_id")) == str(order_id) for t in already):
+            logger.info(f"Order {order_id} already recorded — skipping backfill")
+            return
+
+        trade = Trade(
+            user_id=user.id,
+            strategy_id=strategy.id,
+            symbol=meta.get("symbol"),
+            side=meta.get("side"),
+            order_type='market',
+            qty=filled_qty,
+            filled_qty=filled_qty,
+            price=filled_price,
+            status='executed',
+            timestamp=datetime.utcnow(),
+            notes={
+                'signal_type': meta.get('signal_type'),
+                'signal_reason': meta.get('signal_reason'),
+                'order_id': order_id,
+                'option_symbol': meta.get('option_symbol'),
+                'backfilled': True,
+                'backfill_reason': 'order confirmed filled after terminal-status timeout',
+            },
+        )
+        self.db.add(trade)
+        self.db.commit()
+
+        logger.warning(
+            f"Backfilled unconfirmed order {order_id}: {meta.get('side')} {filled_qty}x "
+            f"{meta.get('option_symbol') or meta.get('symbol')} @ {filled_price}"
+        )
+        log_event(
+            db=self.db,
+            user_id=user.id,
+            event_type="ORDER_BACKFILLED",
+            title=f"Backfilled late fill: {meta.get('symbol')}",
+            detail=(
+                f"Order {order_id} was unconfirmed at placement but the broker "
+                f"filled it ({filled_qty} @ {filled_price}). Trade row written."
+            ),
+            symbol=meta.get("symbol"),
+            strategy_id=strategy.id,
+            severity="warning",
+            event_data={
+                "order_id": order_id,
+                "filled_qty": filled_qty,
+                "filled_price": filled_price,
+            },
+        )
 
     def __init__(self, db: Session):
         self.db = db
@@ -487,6 +631,32 @@ class OrderManager:
                     return OrderResult(success=False, message=msg)
                 self.db.rollback()  # release the lock before the broker call
 
+            # An unconfirmed order means we may ALREADY be holding contracts the DB
+            # cannot see. Buying again stacks a second position on an invisible first
+            # one — and max_positions can't stop it, because there is no Position row
+            # to count. Block entries until the reconcile tick resolves the order.
+            # Sells fall through deliberately: an exit must never be blocked.
+            if side == 'buy' and self.has_unconfirmed_orders(user.id, strategy.id):
+                pending = sorted(self._unconfirmed_orders.get((user.id, strategy.id), {}))
+                msg = (
+                    f"Entry blocked for {symbol}: broker order(s) {', '.join(pending)} "
+                    "unconfirmed — we may already hold contracts. Waiting for reconcile."
+                )
+                logger.warning(msg)
+                if self._should_log_throttle(user.id, f"unconfirmed:{symbol}"):
+                    log_event(
+                        db=self.db,
+                        user_id=user.id,
+                        event_type="ENTRY_BLOCKED_UNCONFIRMED",
+                        title=f"Entry blocked (unconfirmed order): {symbol}",
+                        detail=msg,
+                        symbol=symbol,
+                        strategy_id=strategy.id,
+                        severity="warning",
+                        event_data={"unconfirmed_order_ids": pending},
+                    )
+                return OrderResult(success=False, message=msg)
+
             # Per-(user, symbol) order rate limit. Stops a runaway loop from
             # hammering the broker even if the strategy logic flips state every
             # tick. Independent of the broker rate limit.
@@ -558,9 +728,26 @@ class OrderManager:
                 # contracts (see incident 2026-05-04: 6 TSLA contracts unaccounted for).
                 terminal_order = await self._await_terminal_order(order_id, user)
                 if terminal_order is None:
+                    # Remember it: the broker may still fill this. Until we know, block
+                    # further entries for this strategy and re-poll on the reconcile tick
+                    # so the Trade row gets backfilled with the real fill price.
+                    self._mark_unconfirmed(
+                        user.id, strategy.id, order_id,
+                        {
+                            "side": side,
+                            "qty": qty,
+                            "symbol": symbol,
+                            "option_symbol": option_symbol,
+                            "signal_price": estimated_price or signal.price,
+                            "signal_type": signal.signal_type,
+                            "signal_reason": signal.reason,
+                            "placed_at": datetime.utcnow().isoformat(),
+                        },
+                    )
                     msg = (
                         f"Order {order_id} status not confirmed within timeout — "
-                        "leaving local state untouched (next reconcile tick will sync)"
+                        "leaving local state untouched (next reconcile tick will sync). "
+                        "Entries blocked for this strategy until it resolves."
                     )
                     logger.warning(msg)
                     log_event(
@@ -764,8 +951,17 @@ class OrderManager:
             )
             return None
 
-        terminal = {"filled", "rejected", "canceled", "expired"}
+        terminal = _TERMINAL_ORDER_STATUSES
         deadline = asyncio.get_event_loop().time() + timeout_s
+
+        # The account event stream pushes order state changes, so a fill is usually
+        # known within milliseconds. We sleep on IT rather than on a blind timer: if it
+        # reports terminal we wake immediately, and if it says nothing we fall through
+        # to the REST poll exactly as before. The stream carries no side/symbol and
+        # names its quantity field differently, so it is only a NOTIFICATION — the
+        # canonical order still comes from REST below.
+        from engine.tradier_account_stream import get_account_stream_manager
+        stream = get_account_stream_manager()
 
         while asyncio.get_event_loop().time() < deadline:
             try:
@@ -777,10 +973,14 @@ class OrderManager:
 
             status = (order.get("status") or "").lower()
             if status in terminal:
+                stream.forget(order_id)
                 return order
 
-            await asyncio.sleep(poll_interval_s)
+            # Wake early if the stream reports terminal; otherwise this behaves as the
+            # old fixed sleep. A False return means "don't know", never "it died".
+            await stream.wait_for_terminal(order_id, timeout=poll_interval_s)
 
+        stream.forget(order_id)
         return None
 
     def _extract_order_id(self, order_response: Dict) -> Optional[str]:

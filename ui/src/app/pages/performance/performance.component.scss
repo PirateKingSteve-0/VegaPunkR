@@ -70,11 +70,31 @@
           min-width: 0;
 
           .metric-label {
+            display: flex;
+            align-items: center;
+            gap: 4px;
             font-size: 13px;
             color: var(--text-muted);
             margin-bottom: 6px;
             text-transform: uppercase;
             letter-spacing: 0.4px;
+
+            .metric-help {
+              font-size: 15px;
+              width: 15px;
+              height: 15px;
+              line-height: 15px;
+              color: var(--text-muted);
+              opacity: 0.6;
+              cursor: help;
+              transition: opacity 0.15s ease;
+
+              &:hover,
+              &:focus {
+                opacity: 1;
+                outline: none;
+              }
+            }
           }
 
           .metric-value {

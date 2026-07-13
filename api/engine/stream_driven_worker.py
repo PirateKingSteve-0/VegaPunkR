@@ -15,7 +15,7 @@ from typing import Optional
 
 from database import SessionLocals, default_environment
 from config import Environment
-from models import User, Strategy, Position
+from models import User, Strategy, Position, Trade
 from engine.strategy_executor import StrategyExecutor
 from engine.stream_router import get_stream_router
 from engine.tradier_stream_manager import get_stream_manager
@@ -26,9 +26,14 @@ from utils.symbol_helpers import is_option_symbol
 
 logger = logging.getLogger(__name__)
 
-_GREEKS_REFRESH_INTERVAL = timedelta(minutes=5)
 _MARKET_CLOSED_LOG_INTERVAL = timedelta(minutes=1)
 _RECONCILE_INTERVAL = timedelta(seconds=60)
+# How often to re-price the armed (not yet bought) contract against Tradier while
+# we wait for an entry signal. The contract is chosen once, but the wait can run
+# for hours — and on 0DTE, gamma walks delta out of the strategy's band in
+# minutes. Without this the engine buys, at entry time, a strike that only met
+# the delta/OI criteria back when it was picked.
+_DRIFT_CHECK_INTERVAL = timedelta(seconds=30)
 # Per-strategy "still alive" heartbeat at INFO. Without this, an open
 # position evaluating cleanly (no exit signal) produces zero output, since
 # the no-exit log in strategy_executor is DEBUG. Heartbeat surfaces loop
@@ -43,6 +48,15 @@ _EVAL_INTERVAL = timedelta(seconds=1)
 # 60s queue-idle timeout; a busy WS queue (or runaway loop) can prevent that
 # timeout from ever firing, leaving local DB and broker out of sync for hours.
 _FORCED_RECONCILE_INTERVAL = timedelta(seconds=60)
+
+
+@dataclass
+class SelectedContract:
+    """A contract that passed the delta / OI / spread filters, with the greeks it
+    passed on — so the caller doesn't have to re-fetch what selection already read."""
+    symbol: str
+    delta: float
+    open_interest: int
 
 
 @dataclass
@@ -67,10 +81,20 @@ class StrategyMarketState:
     option_ask: float = 0.0
     option_last: float = 0.0
 
-    # Greeks — populated by periodic REST refresh
+    # Greeks of the armed contract, sourced from the Tradier chain at selection and
+    # re-priced on _DRIFT_CHECK_INTERVAL while we wait to enter. These feed the
+    # delta / min_open_interest gates in SignalGenerator, which only fire when the
+    # value is not None — so leaving them unset silently disables those gates.
     delta: Optional[float] = None
     open_interest: Optional[int] = None
-    greeks_last_fetched: Optional[datetime] = None
+    drift_checked_at: Optional[datetime] = None
+
+    # Exactly what THIS strategy has subscribed on the shared WS session. The
+    # refcount in TradierStreamManager is global, so unsubscribing a symbol we
+    # never subscribed decrements someone else's count and can rip the stream out
+    # from under another strategy holding the same strike. Reselection makes the
+    # armed contract a moving target, so we can't rely on a startup snapshot.
+    streamed_symbols: set = field(default_factory=set)
 
     def apply(self, event: dict):
         symbol = event.get("symbol", "")
@@ -103,10 +127,31 @@ class StrategyMarketState:
                 self.option_bid = bid
                 self.option_ask = ask
 
-    def needs_greeks_refresh(self) -> bool:
-        if self.greeks_last_fetched is None:
+    def arm(self, sel: "SelectedContract"):
+        """Adopt a freshly selected contract as the one we'd buy on the next entry
+        signal. Quotes are zeroed so the previous contract's bid/ask can't price
+        this one; drift_checked_at is stamped because sel's greeks ARE the check."""
+        self.option_symbol = sel.symbol
+        self.delta = sel.delta
+        self.open_interest = sel.open_interest
+        self.option_bid = 0.0
+        self.option_ask = 0.0
+        self.drift_checked_at = datetime.utcnow()
+
+    def disarm(self):
+        """Drop the armed contract. Greeks go with it — a stale delta from the old
+        strike must never be what the entry gate sees for the next one."""
+        self.option_symbol = None
+        self.delta = None
+        self.open_interest = None
+        self.option_bid = 0.0
+        self.option_ask = 0.0
+        self.drift_checked_at = None
+
+    def needs_drift_check(self) -> bool:
+        if self.drift_checked_at is None:
             return True
-        return datetime.utcnow() - self.greeks_last_fetched > _GREEKS_REFRESH_INTERVAL
+        return datetime.utcnow() - self.drift_checked_at > _DRIFT_CHECK_INTERVAL
 
     def to_market_data(self) -> dict:
         return {
@@ -225,7 +270,9 @@ class StreamDrivenWorker:
                 # state.option_symbol is now set by _startup_sync if a position
                 # exists in Tradier; otherwise select the best available contract.
                 if not state.option_symbol:
-                    state.option_symbol = await self._select_option_contract(strategy, underlying)
+                    sel = await self._select_option_contract(strategy, underlying)
+                    if sel:
+                        state.arm(sel)
 
                 symbols_to_stream = [underlying]
                 if state.option_symbol:
@@ -236,6 +283,7 @@ class StreamDrivenWorker:
 
                 q = router.register_strategy(strategy_id, symbols_to_stream)
                 await stream_mgr.subscribe(symbols_to_stream)
+                state.streamed_symbols.update(symbols_to_stream)
 
                 executor = StrategyExecutor(db)
                 strategy_refreshed_at = datetime.utcnow()
@@ -339,9 +387,6 @@ class StreamDrivenWorker:
                                 db.refresh(strategy)
                                 strategy_refreshed_at = datetime.utcnow()
 
-                            if state.needs_greeks_refresh():
-                                await self._refresh_greeks(state)
-
                             # Re-read position state from DB on every tick.
                             # This is the single source of truth — once a position
                             # is open we ONLY look for exits; once it's gone we
@@ -355,40 +400,48 @@ class StreamDrivenWorker:
                                 result = await executor.execute_exit_tick(
                                     user, strategy, state.to_market_data()
                                 )
-                                # If the position was just closed, clear the contract
-                                # and reset option bid/ask so stale quotes from the old
-                                # contract don't pollute the next entry's sizing/P&L calc
+                                # Position just closed — release the contract so the
+                                # next entry re-selects against a current chain rather
+                                # than reusing the strike (and greeks) we just exited.
                                 if result and result.get('positions_closed'):
-                                    state.option_symbol = None
-                                    state.option_bid = 0.0
-                                    state.option_ask = 0.0
+                                    await self._disarm_contract(
+                                        strategy_id, state, stream_mgr, router
+                                    )
                             else:
-                                # No position open — select a contract if we don't
-                                # have one yet (happens once after exit or on cold start)
+                                # No position open — arm a contract if we don't have one
+                                # (cold start, or we just exited / drifted out of band)
                                 if not state.option_symbol:
                                     now = datetime.utcnow()
                                     # Only retry contract selection every 30s to avoid
                                     # hammering the options chain API on every tick when
                                     # no suitable contract is available yet
                                     if contract_retry_at is None or now >= contract_retry_at:
-                                        state.option_symbol = await self._select_option_contract(
+                                        sel = await self._select_option_contract(
                                             strategy, underlying
                                         )
                                         contract_retry_at = now + timedelta(seconds=30)
-                                        if state.option_symbol:
-                                            # Reset stale quotes from previous contract
-                                            state.option_bid = 0.0
-                                            state.option_ask = 0.0
-                                            await stream_mgr.subscribe([state.option_symbol])
-                                            router.add_symbol_to_strategy(strategy_id, state.option_symbol)
+                                        if sel:
+                                            await self._arm_contract(
+                                                strategy_id, state, sel, stream_mgr, router
+                                            )
+                                elif state.needs_drift_check():
+                                    # Armed but not yet bought. Re-price it: the entry
+                                    # signal may still be minutes or hours away.
+                                    await self._check_contract_drift(
+                                        strategy, strategy_id, state, stream_mgr, router
+                                    )
 
                                 await executor.execute_strategy_tick(
                                     user, strategy, state.to_market_data()
                                 )
 
                 finally:
-                    router.unregister_strategy(strategy_id, symbols_to_stream)
-                    await stream_mgr.unsubscribe(symbols_to_stream)
+                    # Release what we actually hold NOW, not the startup snapshot —
+                    # reselection means the armed contract has likely changed since.
+                    held = list(state.streamed_symbols)
+                    router.unregister_strategy(strategy_id, held)
+                    await stream_mgr.unsubscribe(held)
+                    state.streamed_symbols.clear()
 
             except asyncio.CancelledError:
                 raise
@@ -524,6 +577,11 @@ class StreamDrivenWorker:
         the executor can manage the position rather than silently leaving it
         unmanaged (this was the 2026-05-04 incident).
         """
+        # Settle anything we stopped waiting on BEFORE comparing local state to the
+        # broker. A late fill has to be recorded (and the entry block lifted) first,
+        # otherwise this tick reconciles against a position we haven't written down yet.
+        await self._resolve_unconfirmed_orders(strategy_id, db)
+
         # Pick up any row for this strategy regardless of qty so we can detect
         # the inverse-drift case (broker has contracts, DB shows flat).
         position = db.query(Position).filter(
@@ -597,16 +655,56 @@ class StreamDrivenWorker:
                     f"Strategy {strategy_id}: {contract} not found in Tradier — "
                     "position was manually closed externally"
                 )
-                # Snapshot pre-close state so we can send an approximate
-                # manual-close notification (broker-side fill price is unknown
-                # here, so we use the latest streamed price as the exit).
                 qty_closed = position.qty
-                exit_price = position.current_price or position.avg_entry_price
-                # Options contracts have a 100x multiplier (each contract = 100 shares)
                 multiplier = 100 if is_option_symbol(position.option_symbol or position.symbol) else 1
-                approx_pnl = (exit_price - position.avg_entry_price) * qty_closed * multiplier
+
+                # Ask the broker what it actually filled the close at. Without this we
+                # fall back to the last streamed quote, which is a guess — and on
+                # 2026-07-13 a hand-close in the Tradier portal left NO Trade row at all,
+                # silently dropping its -$104 from P&L history.
+                fill = await self._broker_close_fill(client, contract)
+                if fill:
+                    exit_price, filled_qty, price_source = fill[0], fill[1], "broker_fill"
+                else:
+                    exit_price = position.current_price or position.avg_entry_price
+                    filled_qty = qty_closed
+                    price_source = "approx_streamed_quote"
+                    logger.warning(
+                        f"No broker close-fill found for {contract} — recording exit at "
+                        f"last streamed price {exit_price} (approximate)"
+                    )
+
+                approx_pnl = (exit_price - position.avg_entry_price) * filled_qty * multiplier
+
+                # Record the closing leg. Zeroing the position keeps the engine honest
+                # about what it holds, but without this row the trade never happened as
+                # far as P&L, win-rate, and every downstream metric are concerned.
+                db.add(Trade(
+                    user_id=position.user_id,
+                    strategy_id=strategy_id,
+                    position_id=position.id,
+                    symbol=position.symbol,
+                    side='sell',
+                    order_type='market',
+                    qty=filled_qty,
+                    filled_qty=filled_qty,
+                    price=position.avg_entry_price,
+                    exit_price=exit_price,
+                    exit_timestamp=datetime.utcnow(),
+                    pnl=approx_pnl,
+                    status='executed',
+                    timestamp=datetime.utcnow(),
+                    notes={
+                        'signal_type': 'exit',
+                        'signal_reason': 'Closed externally (broker UI / outside the engine)',
+                        'option_symbol': contract,
+                        'reconciled': True,
+                        'exit_price_source': price_source,
+                    },
+                ))
 
                 position.qty = 0
+                position.current_price = exit_price
                 position.unrealized_pnl = 0.0
                 db.commit()
 
@@ -674,7 +772,7 @@ class StreamDrivenWorker:
 
     async def _select_option_contract(
         self, strategy: Strategy, underlying: str
-    ) -> Optional[str]:
+    ) -> Optional[SelectedContract]:
         """Select best 0DTE option contract via Tradier options chain API."""
         try:
             from datetime import date
@@ -750,10 +848,14 @@ class StreamDrivenWorker:
                     )
                     continue
 
-                # Score: closest delta to midpoint wins
+                # Score: closest delta to midpoint wins. Picking mid-band (rather
+                # than the first passing strike) is also what keeps drift-driven
+                # reselection from thrashing — a fresh pick starts far from both edges.
                 target_delta = (delta_min + delta_max) / 2
                 score = -abs(delta - target_delta)
-                candidates.append((score, contract["symbol"]))
+                candidates.append(
+                    (score, SelectedContract(symbol=contract["symbol"], delta=delta, open_interest=oi))
+                )
 
             if not candidates:
                 # Compute delta range across all calls for diagnostics
@@ -792,27 +894,144 @@ class StreamDrivenWorker:
 
             candidates.sort(key=lambda x: x[0], reverse=True)
             best = candidates[0][1]
-            logger.info(f"Selected contract for {underlying}: {best}")
+            logger.info(
+                f"Selected contract for {underlying}: {best.symbol} "
+                f"delta={best.delta:.3f} OI={best.open_interest}"
+            )
             return best
 
         except Exception as e:
             logger.warning(f"Could not select option contract for {underlying}: {e}")
             return None
 
-    async def _refresh_greeks(self, state: StrategyMarketState):
+    async def _resolve_unconfirmed_orders(self, strategy_id: int, db):
+        """Re-poll orders whose fill we never confirmed. Cheap no-op when there are none."""
+        from engine.order_manager import OrderManager
+
+        strat = db.query(Strategy).filter(Strategy.id == strategy_id).first()
+        if strat is None:
+            return
+        if not OrderManager.has_unconfirmed_orders(strat.user_id, strategy_id):
+            return
+        user = db.query(User).filter(User.id == strat.user_id).first()
+        if user is None:
+            return
         try:
-            from services.market_data.options.enhanced_service import get_enhanced_options_service
-            svc = get_enhanced_options_service(enable_realtime=False)
-            if state.option_symbol:
-                data = await svc._get_rest_data(state.option_symbol)
-                if data:
-                    state.delta = data.get("delta")
-                    state.open_interest = data.get("open_interest")
-            state.greeks_last_fetched = datetime.utcnow()
+            n = await OrderManager(db).resolve_unconfirmed_orders(user, strat)
+            if n:
+                logger.warning(
+                    f"Strategy {strategy_id}: settled {n} previously-unconfirmed order(s); "
+                    "entries unblocked"
+                )
         except Exception as e:
-            logger.warning(
-                f"Greeks refresh failed for {state.underlying_symbol}: {e}"
+            logger.warning(f"Resolving unconfirmed orders failed for {strategy_id}: {e}")
+
+    async def _broker_close_fill(self, client, contract: str) -> Optional[tuple]:
+        """The broker's actual closing fill for `contract`: (price, qty), or None.
+
+        Used when a position is closed outside the engine, so the Trade row carries the
+        real avg_fill_price instead of whatever the stream last quoted. Tradier's /orders
+        only covers the current session — an external close from a previous day won't be
+        found here, and the caller falls back to the streamed price."""
+        try:
+            orders = await asyncio.to_thread(client.get_orders)
+        except Exception as e:
+            logger.warning(f"Close-fill lookup failed for {contract}: {e}")
+            return None
+
+        fills = [
+            o for o in orders
+            if o.get("option_symbol") == contract
+            and (o.get("status") or "").lower() == "filled"
+            and str(o.get("side", "")).startswith("sell")
+        ]
+        if not fills:
+            return None
+
+        fills.sort(key=lambda o: str(o.get("transaction_date") or o.get("create_date") or ""))
+        last = fills[-1]
+        price = float(last.get("avg_fill_price") or 0)
+        qty = int(float(last.get("exec_quantity") or 0))
+        return (price, qty) if price > 0 and qty > 0 else None
+
+    async def _arm_contract(
+        self, strategy_id: int, state: StrategyMarketState, sel: SelectedContract, stream_mgr, router
+    ):
+        """Adopt a contract and start streaming its quotes."""
+        state.arm(sel)
+        await stream_mgr.subscribe([sel.symbol])
+        state.streamed_symbols.add(sel.symbol)
+        router.add_symbol_to_strategy(strategy_id, sel.symbol)
+
+    async def _disarm_contract(self, strategy_id: int, state: StrategyMarketState, stream_mgr, router):
+        """Release the armed contract and stop streaming it. Must be paired with every
+        clear of option_symbol — dropping the symbol without unsubscribing leaks both a
+        refcount on the shared WS session and a route entry pointing at our queue.
+
+        Only releases symbols WE subscribed: _reconcile_position can adopt a contract
+        straight off the broker without ever streaming it, and unsubscribing that would
+        decrement a refcount we never incremented."""
+        sym = state.option_symbol
+        state.disarm()
+        if sym and sym in state.streamed_symbols:
+            await stream_mgr.unsubscribe([sym])
+            state.streamed_symbols.discard(sym)
+            router.remove_symbol_from_strategy(strategy_id, sym)
+
+    async def _check_contract_drift(
+        self, strategy: Strategy, strategy_id: int, state: StrategyMarketState, stream_mgr, router
+    ):
+        """Re-price the armed contract off Tradier and disarm it if it no longer meets
+        the strategy's criteria, so the next tick selects a fresh strike.
+
+        Disarming (rather than just letting SignalGenerator reject the entry) is what
+        avoids a deadlock: selection only runs when option_symbol is None, so a contract
+        that drifts out of band while still armed would fail the entry gate on every
+        tick, forever, with nothing able to replace it."""
+        sym = state.option_symbol
+        if not sym:
+            return
+
+        # Stamp up front so a failing quote endpoint retries on the interval rather
+        # than on every tick.
+        state.drift_checked_at = datetime.utcnow()
+
+        params = strategy.params_json
+        delta_min = params.get("delta_min", 0.40)
+        delta_max = params.get("delta_max", 0.90)
+        min_oi = params.get("min_open_interest", 0)
+
+        try:
+            from tradier_integration.client import get_tradier_client
+
+            quotes = await asyncio.to_thread(get_tradier_client().get_quotes, [sym], True)
+        except Exception as e:
+            logger.warning(f"Drift check failed for {sym}: {e} — keeping contract armed")
+            return
+
+        if not quotes:
+            return
+
+        greeks = quotes[0].get("greeks") or {}
+        raw_delta = greeks.get("delta")
+        if raw_delta is None:
+            # No greeks back — hold the contract rather than disarming. Treating a
+            # missing value as a failed check would churn strikes on a data hiccup.
+            logger.debug(f"Drift check for {sym}: no greeks in quote, keeping armed")
+            return
+
+        delta = abs(float(raw_delta))
+        oi = int(quotes[0].get("open_interest") or 0)
+        state.delta = delta
+        state.open_interest = oi
+
+        if not (delta_min <= delta <= delta_max) or oi < min_oi:
+            logger.info(
+                f"Contract {sym} drifted out of criteria "
+                f"(delta={delta:.3f} need {delta_min}–{delta_max}, "
+                f"OI={oi} need >={min_oi}) — disarming and reselecting"
             )
+            await self._disarm_contract(strategy_id, state, stream_mgr, router)
 
 
 _worker: "StreamDrivenWorker | None" = None

@@ -27,6 +27,7 @@ import {
 } from '../../services/tradier.service';
 import { SystemService } from '../../services/system.service';
 import { ThemeService } from '../../services/theme.service';
+import { StrategyService } from '../../services/strategy.service';
 
 interface MetricCard {
   label: string;
@@ -34,6 +35,8 @@ interface MetricCard {
   sub?: string;
   icon: string;
   tone: 'neutral' | 'positive' | 'negative';
+  /** Plain-language explanation shown on hover via the card's help icon. */
+  tooltip?: string;
 }
 
 interface CalendarCell {
@@ -67,6 +70,7 @@ interface CalendarCell {
 })
 export class PerformanceComponent implements OnInit, OnDestroy {
   private tradier = inject(TradierService);
+  private strategies = inject(StrategyService);
   private systemService = inject(SystemService);
   private dialog = inject(MatDialog);
   private themeService = inject(ThemeService);
@@ -76,6 +80,7 @@ export class PerformanceComponent implements OnInit, OnDestroy {
   @ViewChild(MatPaginator) paginator?: MatPaginator;
 
   readonly periods: { value: BalancePeriod; label: string }[] = [
+    { value: 'DAY', label: '1D' },
     { value: 'WEEK', label: '1W' },
     { value: 'MONTH', label: '1M' },
     { value: 'YTD', label: 'YTD' },
@@ -192,8 +197,50 @@ export class PerformanceComponent implements OnInit, OnDestroy {
     const totalTrades = inPeriodClosed.length;
     const winRate = totalTrades > 0 ? (wins / totalTrades) * 100 : 0;
 
+    // Calculate Sharpe Ratio (using per-trade percentage returns)
+    // For each trade: return% = (net_pnl / cost) * 100
+    const returns: number[] = [];
+    for (const p of inPeriodClosed) {
+      const cost = Math.abs(p.cost || 0);
+      // Skip trades with zero cost (data quality issues)
+      if (cost < 0.01) continue;
+
+      const pnl = p.net_pnl ?? p.gain_loss ?? 0;
+      const returnPct = (pnl / cost) * 100;
+      returns.push(returnPct);
+    }
+
+    let sharpeRatio: number | null = null;
+    let sharpeLabel = 'N/A';
+    let sharpeQuality = '';
+
+    if (returns.length > 1) {
+      const meanReturn = returns.reduce((sum, val) => sum + val, 0) / returns.length;
+      const variance = returns.reduce((sum, val) => sum + Math.pow(val - meanReturn, 2), 0) / returns.length;
+      const stdDevReturn = Math.sqrt(variance);
+
+      if (stdDevReturn > 0) {
+        sharpeRatio = meanReturn / stdDevReturn;
+        sharpeLabel = sharpeRatio.toFixed(2);
+
+        // Quality indicator
+        if (sharpeRatio >= 3.0) sharpeQuality = 'Excellent';
+        else if (sharpeRatio >= 2.0) sharpeQuality = 'Very Good';
+        else if (sharpeRatio >= 1.0) sharpeQuality = 'Good';
+        else if (sharpeRatio >= 0) sharpeQuality = 'Poor';
+        else sharpeQuality = 'Negative';
+      }
+    }
+
     const tone = (n: number): 'positive' | 'negative' | 'neutral' =>
       n > 0 ? 'positive' : n < 0 ? 'negative' : 'neutral';
+
+    const sharpeTone = (): 'positive' | 'negative' | 'neutral' => {
+      if (sharpeRatio === null) return 'neutral';
+      if (sharpeRatio >= 2.0) return 'positive';
+      if (sharpeRatio >= 1.0) return 'neutral';
+      return 'negative';
+    };
 
     return [
       {
@@ -202,6 +249,9 @@ export class PerformanceComponent implements OnInit, OnDestroy {
         sub: b ? `Cash ${this.fmtCurrency(b.total_cash ?? 0)}` : undefined,
         icon: 'account_balance_wallet',
         tone: 'neutral',
+        tooltip:
+          'Total account value right now: the market value of your open positions ' +
+          'plus available cash.',
       },
       {
         label: `${this.periodLabel()} Change`,
@@ -209,12 +259,18 @@ export class PerformanceComponent implements OnInit, OnDestroy {
         sub: `${deltaPct >= 0 ? '+' : ''}${deltaPct.toFixed(2)}%`,
         icon: delta >= 0 ? 'trending_up' : 'trending_down',
         tone: tone(delta),
+        tooltip:
+          'How much your total account value moved over the selected period, ' +
+          'in dollars and percent. Includes both realized and unrealized changes.',
       },
       {
         label: 'Open P&L',
         value: `${openPL >= 0 ? '+' : ''}${this.fmtCurrency(openPL)}`,
         icon: 'show_chart',
         tone: tone(openPL),
+        tooltip:
+          'Unrealized profit/loss on positions you still hold. It moves with the ' +
+          "market and isn't locked in until you close the position.",
       },
       {
         label: `Realized P&L (${this.periodLabel()})`,
@@ -222,6 +278,9 @@ export class PerformanceComponent implements OnInit, OnDestroy {
         sub: `${totalTrades} trade${totalTrades === 1 ? '' : 's'}`,
         icon: 'attach_money',
         tone: tone(realizedPL),
+        tooltip:
+          'Actual profit/loss from positions you closed during this period, ' +
+          'before commissions and fees are subtracted.',
       },
       {
         label: `Net P&L (${this.periodLabel()})`,
@@ -229,6 +288,9 @@ export class PerformanceComponent implements OnInit, OnDestroy {
         sub: `After ${this.fmtCurrency(periodCosts)} costs`,
         icon: 'request_quote',
         tone: tone(netPL),
+        tooltip:
+          'Realized P&L after subtracting commissions and fees — your true ' +
+          'take-home result for the period.',
       },
       {
         label: 'Costs (Commission + Fees)',
@@ -236,6 +298,9 @@ export class PerformanceComponent implements OnInit, OnDestroy {
         sub: `${this.fmtCurrency(periodCommission)} comm + ${this.fmtCurrency(periodFees)} fees`,
         icon: 'receipt_long',
         tone: 'neutral',
+        tooltip:
+          'Total trading costs for the period: broker commissions plus exchange ' +
+          'and regulatory fees. These are already deducted from Net P&L.',
       },
       {
         label: 'Win Rate',
@@ -243,6 +308,29 @@ export class PerformanceComponent implements OnInit, OnDestroy {
         sub: `${wins}W / ${losses}L`,
         icon: 'check_circle',
         tone: 'neutral',
+        tooltip:
+          'Percentage of closed trades that were profitable.\n\n' +
+          'Read it alongside average win vs. loss size — a high win rate can ' +
+          'still lose money if the occasional loss is large, and a low win rate ' +
+          'can still profit if wins are big.',
+      },
+      {
+        label: 'Sharpe Ratio',
+        value: sharpeLabel,
+        sub: sharpeQuality || `Risk-adjusted return`,
+        icon: 'insights',
+        tone: sharpeTone(),
+        tooltip:
+          'Risk-adjusted return: average trade return divided by how much your ' +
+          'returns vary (volatility). Higher means more consistent gains per unit ' +
+          'of risk taken.\n\n' +
+          'Below 0: Negative — losing on average\n' +
+          '0 to 1: Poor\n' +
+          '1 to 2: Good\n' +
+          '2 to 3: Very Good\n' +
+          '3+: Excellent\n\n' +
+          'Computed from this period’s per-trade returns (net P&L ÷ cost); ' +
+          'no risk-free rate assumed. Needs at least 2 closed trades.',
       },
     ];
   });
@@ -382,7 +470,11 @@ export class PerformanceComponent implements OnInit, OnDestroy {
     forkJoin({
       balances: this.tradier.getBalances(),
       history: this.tradier.getHistoricalBalances(this.period()),
-      gainloss: this.tradier.getGainLoss(1, 200),
+      // Closed trades come from the ENGINE, not Tradier's /gainloss. That report's
+      // cost basis is corrupt for repeatedly round-tripped contracts (it reported
+      // -21,057 on 2026-07-13 for a day that lost -1,851) and it truncates at its
+      // page limit. The engine pairs each exit with its own entry at fill time.
+      gainloss: this.strategies.getClosedTrades(this.period()),
       tradeHistory: this.tradier.getAccountHistory('trade', undefined, undefined, 500).pipe(
         catchError(() => of([] as TradeEvent[])),
       ),
@@ -452,12 +544,19 @@ export class PerformanceComponent implements OnInit, OnDestroy {
     return closed.map(p => {
       const openDay = (p.open_date || '').slice(0, 10);
       const closeDay = (p.close_date || '').slice(0, 10);
-      const commission = commByEvent
+      const derivedCommission = commByEvent
         .filter(c => c.symbol === p.symbol && (c.date === openDay || c.date === closeDay))
         .reduce((s, c) => s + c.commission, 0);
       const dayFees = feesByDay.get(closeDay) || 0;
       const share = closesPerDay.get(closeDay) || 1;
-      const fees = dayFees / share;
+      const derivedFees = dayFees / share;
+
+      // Rows now come from the engine, whose Trade records already carry commission and
+      // fees reconciled from Tradier's account history. Prefer those; only fall back to
+      // deriving from raw history events when the row has none, so a failed symbol match
+      // here can't silently zero out real costs.
+      const commission = (p.commission ?? 0) || derivedCommission;
+      const fees = (p.fees ?? 0) || derivedFees;
       const net = (p.gain_loss || 0) - commission - fees;
       return { ...p, commission, fees, net_pnl: net };
     });
@@ -516,6 +615,10 @@ export class PerformanceComponent implements OnInit, OnDestroy {
   private periodCutoff(): Date | null {
     const now = new Date();
     switch (this.period()) {
+      case 'DAY':
+        // Midnight local today — close_date is a date-only stamp from Tradier,
+        // so anything closed today lands at or after this.
+        return new Date(now.getFullYear(), now.getMonth(), now.getDate());
       case 'WEEK':
         return new Date(now.getFullYear(), now.getMonth(), now.getDate() - 7);
       case 'MONTH':
@@ -602,5 +705,25 @@ export class PerformanceComponent implements OnInit, OnDestroy {
     const date = new Date(y, m - 1, day);
     if (isNaN(date.getTime())) return d;
     return date.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+  }
+
+  /**
+   * Full open/close timestamp for the closed-positions table. Tradier's
+   * gain/loss timestamps are ISO-8601 UTC. When a real fill time is present
+   * (e.g. "2026-04-27T15:25:47.000Z") we show local date + time; when Tradier
+   * only reports the calendar date padded to midnight UTC ("…T00:00:00.000Z")
+   * we fall back to the timezone-safe date-only format so the day can't shift.
+   */
+  fmtDateTime(d: string): string {
+    if (!d) return '';
+    const time = d.slice(11, 19); // "HH:MM:SS"
+    const hasRealTime = d.includes('T') && time !== '' && time !== '00:00:00';
+    if (!hasRealTime) return this.fmtDate(d);
+    const date = new Date(d);
+    if (isNaN(date.getTime())) return this.fmtDate(d);
+    return date.toLocaleString('en-US', {
+      month: 'short', day: 'numeric', year: 'numeric',
+      hour: 'numeric', minute: '2-digit', second: '2-digit',
+    });
   }
 }

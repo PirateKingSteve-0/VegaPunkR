@@ -1,0 +1,38 @@
+# Pre-commit hooks for VegaPunkR
+# Install: pip install pre-commit
+# Setup: pre-commit install
+
+repos:
+  - repo: local
+    hooks:
+      # Mermaid Syntax Validator
+      - id: mermaid-validator
+        name: Mermaid Syntax Validator
+        entry: python3 scripts/validate_mermaid.py
+        language: system
+        files: \.md$
+        pass_filenames: true
+        stages: [commit]
+        verbose: true
+
+      # Architecture Diagram Updater
+      - id: diagram-updater
+        name: Architecture Diagram Updater
+        entry: python3 scripts/diagram_agent.py
+        language: system
+        pass_filenames: true
+        files: |
+          (?x)^(
+            api/models\.py|
+            api/database\.py|
+            api/config\.py|
+            api/routers/.*\.py|
+            api/engine/.*\.py|
+            api/tradier_integration/.*\.py|
+            api/schwab_integration/.*\.py|
+            api/services/.*\.py|
+            ui/src/app/pages/.*\.ts|
+            ui/src/app/services/.*\.ts
+          )$
+        stages: [commit]
+        verbose: true

@@ -316,6 +316,34 @@ class TradierClient:
             raw = [raw]
         return raw
 
+    def create_account_stream_session(self) -> Dict[str, str]:
+        """
+        POST /v1/accounts/events/session
+
+        Creates an ACCOUNT event streaming session (order lifecycle events).
+        Session is valid for 5 minutes before the WebSocket must be connected.
+
+        Unlike market data, this uses THIS CLIENT'S env — the account stream is
+        per-account, so a sandbox account must stream its own sandbox orders.
+        docs/tradier/streaming/ws_account_data.md documents a sandbox WS host
+        (wss://sandbox-ws.tradier.com), so paper mode is supported here even though
+        market-data streaming is live-only.
+
+        Tradier documents this endpoint as BETA.
+        """
+        resp = self._session.post(f"{self._base_url}/v1/accounts/events/session", timeout=10)
+        resp.raise_for_status()
+        stream = resp.json().get("stream", {})
+        default_ws = (
+            "wss://sandbox-ws.tradier.com/v1/accounts/events"
+            if self._env == "sandbox"
+            else "wss://ws.tradier.com/v1/accounts/events"
+        )
+        return {
+            "sessionid": stream.get("sessionid", ""),
+            "url": stream.get("url") or default_ws,
+        }
+
     def create_stream_session(self) -> Dict[str, str]:
         """
         POST /v1/markets/events/session
@@ -571,11 +599,15 @@ class TradierClient:
             raw = [raw]
         return raw
 
-    def get_quotes(self, symbols: List[str]) -> List[Dict[str, Any]]:
+    def get_quotes(self, symbols: List[str], greeks: bool = False) -> List[Dict[str, Any]]:
         """
         GET /v1/markets/quotes — quotes (last, change, change_percentage, etc.)
         for one or more symbols. Always uses the live endpoint (sandbox lacks
         real market data).
+
+        greeks=True adds a "greeks" block (delta, gamma, theta, vega, IV) to
+        option quotes — the cheap way to re-price a single contract without
+        pulling the whole chain.
         """
         if not symbols:
             return []
@@ -583,7 +615,7 @@ class TradierClient:
         live_token = settings.TRADIER_LIVE_API_KEY
         resp = requests.get(
             f"{live_url}/v1/markets/quotes",
-            params={"symbols": ",".join(symbols)},
+            params={"symbols": ",".join(symbols), "greeks": str(greeks).lower()},
             headers={"Authorization": f"Bearer {live_token}", "Accept": "application/json"},
         )
         resp.raise_for_status()

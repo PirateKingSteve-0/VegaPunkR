@@ -1,5 +1,5 @@
 import { Injectable, inject } from '@angular/core';
-import { HttpClient, HttpHeaders } from '@angular/common/http';
+import { HttpClient, HttpHeaders, HttpParams } from '@angular/common/http';
 import { Observable } from 'rxjs';
 import { Strategy, StrategyTemplate, CreateStrategyRequest, UpdateStrategyRequest } from '../models/strategy.model';
 import { AuthService } from './auth.service';
@@ -82,6 +82,36 @@ export class StrategyService {
       headers: this.getHeaders()
     });
   }
+
+  /**
+   * Closed trades from the engine's own fill records.
+   *
+   * Replaces Tradier's /account/gainloss as the P&L source. That report's cost basis
+   * is corrupt when a contract is round-tripped repeatedly in a session — on
+   * 2026-07-13 it reported -21,057 for a day that actually lost -1,851 — and it is
+   * paginated, so a busy day was truncated on top of being wrong.
+   */
+  getClosedTrades(period: string): Observable<ClosedTrade[]> {
+    return this.http.get<ClosedTrade[]>(`${this.apiUrl}/performance/closed-trades`, {
+      headers: this.getHeaders(),
+      params: new HttpParams().set('period', period),
+    });
+  }
+}
+
+export interface ClosedTrade {
+  close_date: string;
+  open_date: string;
+  cost: number;
+  proceeds: number;
+  gain_loss: number;
+  gain_loss_percent: number;
+  quantity: number;
+  symbol: string;
+  term: number;
+  commission: number;
+  fees: number;
+  net_pnl: number;
 }
 
 export interface EquityCurvePoint {

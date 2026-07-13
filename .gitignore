@@ -19,3 +19,6 @@ dist/
 
 # Claude
 CLAUDE.md
+
+# Diagram maintenance
+scripts/.diagram_update_context.json

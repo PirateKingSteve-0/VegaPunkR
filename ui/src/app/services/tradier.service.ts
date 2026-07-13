@@ -59,7 +59,10 @@ export interface TradeEvent {
   [key: string]: any;
 }
 
-export type BalancePeriod = 'WEEK' | 'MONTH' | 'YTD' | 'YEAR' | 'YEAR_3' | 'YEAR_5' | 'ALL';
+// 'DAY' is a UI-only period: Tradier's historical-balances endpoint has no DAY
+// bucket, so getHistoricalBalances() sends WEEK in its place and the page filters
+// closed positions down to today itself.
+export type BalancePeriod = 'DAY' | 'WEEK' | 'MONTH' | 'YTD' | 'YEAR' | 'YEAR_3' | 'YEAR_5' | 'ALL';
 
 export interface HistoryBar {
   date: string;
@@ -134,7 +137,10 @@ export class TradierService {
   }
 
   getHistoricalBalances(period: BalancePeriod = 'MONTH'): Observable<HistoricalBalances> {
-    const params = new HttpParams().set('period', period);
+    // Tradier has no DAY bucket — asking for one 400s. Send the narrowest period
+    // it does support; the day-level filtering happens on the closed positions.
+    const brokerPeriod = period === 'DAY' ? 'WEEK' : period;
+    const params = new HttpParams().set('period', brokerPeriod);
     return this.http.get<HistoricalBalances>(`${this.apiUrl}/account/historical-balances`, {
       headers: this.headers(),
       params,

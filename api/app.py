@@ -40,10 +40,12 @@ async def lifespan(app: FastAPI):
         logger.warning("🧪 LIVE_TEST_LOGGING on — engine log → %s", path)
 
     from engine.tradier_stream_manager import get_stream_manager
+    from engine.tradier_account_stream import get_account_stream_manager
     from engine.stream_driven_worker import get_stream_driven_worker
     from services.email_report_scheduler import get_email_report_scheduler
 
     stream_mgr = get_stream_manager()
+    account_stream = get_account_stream_manager()
     worker = get_stream_driven_worker()
     email_scheduler = get_email_report_scheduler()
 
@@ -51,6 +53,14 @@ async def lifespan(app: FastAPI):
         await stream_mgr.start()
     except Exception as e:
         logger.error(f"Stream manager failed to start (non-fatal): {e}")
+
+    # Order-event stream: pushes fill confirmations so we don't have to poll for them.
+    # Non-fatal by design — OrderManager falls back to REST polling if this never
+    # connects, which is exactly the behaviour that existed before it.
+    try:
+        await account_stream.start()
+    except Exception as e:
+        logger.error(f"Account event stream failed to start (non-fatal): {e}")
 
     try:
         await worker.start()
@@ -72,6 +82,10 @@ async def lifespan(app: FastAPI):
         pass
     try:
         await worker.stop()
+    except Exception:
+        pass
+    try:
+        await account_stream.stop()
     except Exception:
         pass
     try:

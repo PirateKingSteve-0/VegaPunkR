@@ -36,6 +36,17 @@ class StreamRouter:
             self._routes[symbol].append(q)
             logger.info(f"Strategy {strategy_id} added symbol {symbol} to routes")
 
+    def remove_symbol_from_strategy(self, strategy_id: int, symbol: str):
+        q = self._strategy_queues.get(strategy_id)
+        if not q:
+            return
+        lst = self._routes.get(symbol, [])
+        if q in lst:
+            lst.remove(q)
+            logger.info(f"Strategy {strategy_id} removed symbol {symbol} from routes")
+        if not lst:
+            self._routes.pop(symbol, None)
+
     def unregister_strategy(self, strategy_id: int, symbols: list[str]):
         q = self._strategy_queues.pop(strategy_id, None)
         if q:

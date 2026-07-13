@@ -30,7 +30,20 @@
             <mat-icon>{{ metric.icon }}</mat-icon>
           </div>
           <div class="metric-info">
-            <div class="metric-label">{{ metric.label }}</div>
+            <div class="metric-label">
+              <span>{{ metric.label }}</span>
+              <mat-icon
+                *ngIf="metric.tooltip"
+                class="metric-help"
+                tabindex="0"
+                aria-label="What is this metric?"
+                [matTooltip]="metric.tooltip"
+                matTooltipClass="metric-tooltip"
+                matTooltipPosition="above"
+                [matTooltipShowDelay]="150">
+                help_outline
+              </mat-icon>
+            </div>
             <div class="metric-value">{{ metric.value }}</div>
             <div *ngIf="metric.sub" class="metric-sub">{{ metric.sub }}</div>
           </div>
@@ -138,12 +151,12 @@
 
         <ng-container matColumnDef="open_date">
           <th mat-header-cell *matHeaderCellDef mat-sort-header>Opened</th>
-          <td mat-cell *matCellDef="let row">{{ fmtDate(row.open_date) }}</td>
+          <td mat-cell *matCellDef="let row">{{ fmtDateTime(row.open_date) }}</td>
         </ng-container>
 
         <ng-container matColumnDef="close_date">
           <th mat-header-cell *matHeaderCellDef mat-sort-header>Closed</th>
-          <td mat-cell *matCellDef="let row">{{ fmtDate(row.close_date) }}</td>
+          <td mat-cell *matCellDef="let row">{{ fmtDateTime(row.close_date) }}</td>
         </ng-container>
 
         <ng-container matColumnDef="term">
