@@ -12,8 +12,8 @@ Paper vs Live trading is handled automatically:
   - RiskManager checks if paper strategy is being run in live mode (prevents this)
   - OrderManager routes to TradingClientManager
   - TradingClientManager checks user.selected_trading_mode and routes to:
-    * Paper mode → Alpaca Paper API
-    * Live mode → Schwab Live API
+    * Paper mode → Tradier SANDBOX
+    * Live mode → Tradier LIVE
 """
 import logging
 from typing import Dict, List, Optional, Tuple

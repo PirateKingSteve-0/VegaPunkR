@@ -94,27 +94,6 @@ class TradingClientManager:
 
         return self._clients[cache_key]
 
-    def _get_schwab_client(self):
-        """
-        Get or create Schwab Live Trading client.
-
-        Returns:
-            SchwabClient instance
-        """
-        if TradingMode.LIVE not in self._clients:
-            try:
-                from schwab_integration.client import SchwabClient
-
-                self._clients[TradingMode.LIVE] = SchwabClient()
-                logger.info("✅ Schwab Live Trading client initialized")
-            except ImportError as e:
-                logger.error(f"Failed to import Schwab client: {e}")
-                raise
-            except Exception as e:
-                logger.error(f"Failed to initialize Schwab client: {e}")
-                raise
-
-        return self._clients[TradingMode.LIVE]
 
     async def place_order(self, user: User, symbol: str, qty: int, side: str, order_type: str = "market", **kwargs):
         """

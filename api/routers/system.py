@@ -187,7 +187,7 @@ async def set_trading_mode(
         Success message with new trading mode details
 
     Warning:
-        Live mode uses real money via Schwab API!
+        Live mode uses real money via the Tradier LIVE account!
     """
     # Validate trading mode
     valid_modes = ["paper", "live"]
@@ -215,7 +215,7 @@ async def set_trading_mode(
         logger.error(f"⚠️  TRADING MODE SWITCH TO LIVE - User {current_user.email}")
         logger.error(f"   └─ FROM: {old_api} ({old_mode})")
         logger.error(f"   └─ TO:   {new_api} ({request.mode})")
-        logger.error(f"   └─ ⚠️  ALL ORDERS WILL USE REAL MONEY VIA SCHWAB API ⚠️")
+        logger.error(f"   └─ ⚠️  ALL ORDERS WILL USE REAL MONEY VIA TRADIER LIVE ⚠️")
     else:
         logger.warning(f"🔄 TRADING MODE SWITCH - User {current_user.email}")
         logger.warning(f"   └─ FROM: {old_api} ({old_mode})")

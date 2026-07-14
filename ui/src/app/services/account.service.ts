@@ -11,7 +11,7 @@ export interface AccountInfo {
   portfolio_value: number;
   equity: number;
   open_pl: number;
-  api: string;  // "Tradier Sandbox", "Tradier Live", or "Schwab Live"
+  api: string;  // "Tradier Sandbox" or "Tradier Live" — Tradier is the only broker
 }
 
 export interface Position {
@@ -50,8 +50,8 @@ export class AccountService {
 
   /**
    * Get account information from the appropriate API based on trading mode.
-   * - Paper mode: Returns Alpaca paper trading account
-   * - Live mode: Returns Schwab live account
+   * - Paper mode: Returns Tradier Sandbox account
+   * - Live mode: Returns Tradier Live account
    */
   getAccount(): Observable<AccountInfo> {
     return this.http.get<AccountInfo>(
@@ -64,8 +64,8 @@ export class AccountService {
 
   /**
    * Get positions from the appropriate API based on trading mode.
-   * - Paper mode: Returns Alpaca paper trading positions
-   * - Live mode: Returns Schwab live positions
+   * - Paper mode: Returns Tradier Sandbox positions
+   * - Live mode: Returns Tradier Live positions
    */
   getPositions(): Observable<Position[]> {
     return this.http.get<Position[]>(

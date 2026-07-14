@@ -3,8 +3,8 @@ Order Manager - Order lifecycle management and execution tracking
 
 The Order Manager uses TradingClientManager which automatically routes orders
 to the correct trading API based on user.selected_trading_mode:
-  - Paper mode: Alpaca Paper Trading API
-  - Live mode: Schwab Live Trading API
+  - Paper mode: Tradier SANDBOX
+  - Live mode: Tradier LIVE
 """
 import asyncio
 import logging
@@ -125,6 +125,14 @@ class OrderManager:
     # Keyed by (user_id, strategy_id) -> {order_id: meta}
     _unconfirmed_orders: Dict[Tuple[int, int], Dict[str, Dict]] = {}
 
+    # Strategies we've already emitted ENTRY_BLOCKED_UNCONFIRMED for in the current
+    # block. The eval loop ticks every second and an order can stay unconfirmed until
+    # the 60s reconcile, so without this we'd write ~60 identical system_events per
+    # episode. Cleared when the strategy's last unconfirmed order settles, so the NEXT
+    # block logs again. (Cannot reuse _should_log_throttle — it keys off
+    # _last_order_at, which is only ever stamped with real symbols.)
+    _unconfirmed_block_logged: set = set()
+
     @classmethod
     def _mark_unconfirmed(cls, user_id: int, strategy_id: int, order_id: str, meta: Dict) -> None:
         cls._unconfirmed_orders.setdefault((user_id, strategy_id), {})[str(order_id)] = meta
@@ -137,6 +145,7 @@ class OrderManager:
         bucket.pop(str(order_id), None)
         if not bucket:
             cls._unconfirmed_orders.pop((user_id, strategy_id), None)
+            cls._unconfirmed_block_logged.discard((user_id, strategy_id))
 
     @classmethod
     def has_unconfirmed_orders(cls, user_id: int, strategy_id: int) -> bool:
@@ -404,9 +413,9 @@ class OrderManager:
             return False, None, msg, None
 
         if preview is None:
-            # preview_order returned None for a non-paper trading mode (Schwab
-            # live preview not yet implemented). Treat as "no preview available"
-            # and proceed — Schwab path will be wired in a follow-up.
+            # No preview came back. Treat as "no preview available" and proceed rather
+            # than blocking the trade — Tradier returns one for both sandbox and live,
+            # so this is a transport hiccup, not an expected path.
             return True, None, "preview not available for trading mode", None
 
         # Entry-price drift observation. Compares the per-contract price the
@@ -643,7 +652,9 @@ class OrderManager:
                     "unconfirmed — we may already hold contracts. Waiting for reconcile."
                 )
                 logger.warning(msg)
-                if self._should_log_throttle(user.id, f"unconfirmed:{symbol}"):
+                block_key = (user.id, strategy.id)
+                if block_key not in self._unconfirmed_block_logged:
+                    self._unconfirmed_block_logged.add(block_key)
                     log_event(
                         db=self.db,
                         user_id=user.id,
@@ -936,7 +947,7 @@ class OrderManager:
         # order as unconfirmed (no fill recorded, no position update → the
         # engine believes it is flat while holding a live position, risking a
         # duplicate stacked entry on the next tick). If a client without
-        # get_order is ever returned (e.g. a future Schwab path) we fall through
+        # get_order is ever returned (a future non-Tradier broker) we fall through
         # to None and the caller treats the order as unconfirmed.
         try:
             client = self.trading_client.get_client(user)
@@ -984,19 +995,9 @@ class OrderManager:
         return None
 
     def _extract_order_id(self, order_response: Dict) -> Optional[str]:
-        """Extract order ID from API response"""
-        # Tradier format: { "id": 123456, "status": "ok" }
+        """Extract order ID from a Tradier order response: { "id": 123456, "status": "ok" }"""
         if isinstance(order_response, dict) and 'id' in order_response:
             return str(order_response['id'])
-
-        # Alpaca SDK object
-        if hasattr(order_response, 'id'):
-            return str(order_response.id)
-
-        # Schwab format
-        if isinstance(order_response, dict) and 'orderId' in order_response:
-            return str(order_response['orderId'])
-
         return str(order_response) if order_response else None
 
     def _extract_filled_price(
@@ -1004,40 +1005,24 @@ class OrderManager:
         order_response: Dict,
         estimated_price: Optional[float]
     ) -> float:
-        """Extract filled price from API response.
+        """Extract filled price from a Tradier order.
 
-        Tradier market orders return no fill price immediately — fall back to
-        the mid-price estimate from market data so P&L tracking is reasonable.
+        Tradier market orders return no fill price immediately — fall back to the
+        mid-price estimate from market data so P&L tracking is reasonable.
         """
-        # Tradier: avg_fill_price populated once filled
         if isinstance(order_response, dict) and order_response.get('avg_fill_price'):
             return float(order_response['avg_fill_price'])
-
-        # Alpaca SDK object
-        if hasattr(order_response, 'filled_avg_price') and order_response.filled_avg_price:
-            return float(order_response.filled_avg_price)
-
-        # Schwab format
-        if isinstance(order_response, dict) and 'price' in order_response:
-            return float(order_response['price'])
-
-        # Fallback to bid/ask mid estimate
         return estimated_price or 0.0
 
     def _extract_filled_qty(self, order_response: Dict, requested_qty: int) -> int:
-        """Extract filled quantity from API response"""
-        # Tradier: exec_quantity field
+        """Extract filled quantity from a Tradier order.
+
+        NOTE: the ACCOUNT EVENT STREAM names this field `executed_quantity`, not
+        `exec_quantity` — do not feed a stream event in here. The stream is only a
+        notification; the canonical order always comes from REST get_order.
+        """
         if isinstance(order_response, dict) and order_response.get('exec_quantity'):
             return int(float(order_response['exec_quantity']))
-
-        # Alpaca SDK object
-        if hasattr(order_response, 'filled_qty') and order_response.filled_qty:
-            return int(order_response.filled_qty)
-
-        # Schwab format
-        if isinstance(order_response, dict) and 'quantity' in order_response:
-            return int(order_response['quantity'])
-
         # Assume full fill for market orders
         return requested_qty
 

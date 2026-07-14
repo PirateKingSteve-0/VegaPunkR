@@ -103,7 +103,7 @@ export class OverviewComponent implements OnInit, OnDestroy {
     this.loading.set(true);
     this.error.set(null);
 
-    // Get account info (routes to Alpaca or Schwab based on trading mode)
+    // Get account info (routes to Tradier Sandbox or Tradier Live by trading mode)
     this.accountService.getAccount().subscribe({
       next: (account) => {
         // Update Total Portfolio Value (equity)
@@ -121,7 +121,7 @@ export class OverviewComponent implements OnInit, OnDestroy {
       }
     });
 
-    // Get positions (routes to Alpaca or Schwab based on trading mode)
+    // Get positions (routes to Tradier Sandbox or Tradier Live by trading mode)
     this.accountService.getPositions().subscribe({
       next: (positions) => {
         // Update Open Positions count

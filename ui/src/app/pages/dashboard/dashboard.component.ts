@@ -122,7 +122,7 @@ export class DashboardComponent implements OnInit {
     // Auto-switch environment if needed
     if (mode === 'live' && currentEnv !== 'prod') {
       const confirmed = confirm(
-        '⚠️ WARNING: Live trading uses REAL MONEY via Schwab API!\n\n' +
+        '⚠️ WARNING: Live trading uses REAL MONEY via your Tradier LIVE account!\n\n' +
         'Switching to live trading will also switch to production database.\n\n' +
         'All orders will execute with real capital. Are you absolutely sure?'
       );
@@ -186,7 +186,7 @@ export class DashboardComponent implements OnInit {
       // Environment already compatible, just switch trading mode
       if (mode === 'live') {
         const confirmed = confirm(
-          '⚠️ WARNING: Live trading uses REAL MONEY via Schwab API!\n\n' +
+          '⚠️ WARNING: Live trading uses REAL MONEY via your Tradier LIVE account!\n\n' +
           'All orders will execute with real capital. Are you absolutely sure?'
         );
         if (!confirmed) return;

@@ -15,7 +15,6 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from config import settings
 from routers import auth, strategies, positions, trades, performance, risk_events, system, execution, trading, events, admin
-from schwab_integration import router as schwab_router
 from tradier_integration import router as tradier_router
 
 logger = logging.getLogger(__name__)
@@ -144,7 +143,6 @@ app.include_router(positions.router, prefix=settings.API_V1_PREFIX)
 app.include_router(trades.router, prefix=settings.API_V1_PREFIX)
 app.include_router(performance.router, prefix=settings.API_V1_PREFIX)
 app.include_router(risk_events.router, prefix=settings.API_V1_PREFIX)
-app.include_router(schwab_router.router, prefix=settings.API_V1_PREFIX)
 app.include_router(tradier_router.router, prefix=settings.API_V1_PREFIX)
 app.include_router(trading.router, prefix=settings.API_V1_PREFIX)
 app.include_router(events.router, prefix=settings.API_V1_PREFIX)

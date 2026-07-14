@@ -1,8 +1,8 @@
 """
 Unified Trading API endpoints.
 
-Routes account and position requests to the appropriate API (Alpaca Paper or Schwab Live)
-based on the user's selected trading mode.
+Routes account and position requests to Tradier — SANDBOX for paper mode, LIVE for live
+mode — based on the user's selected trading mode. Tradier is the only broker.
 """
 from typing import Optional
 
@@ -26,7 +26,7 @@ async def get_account(
     Get account information from the appropriate trading API.
 
     - Paper mode: Returns Tradier sandbox account data
-    - Live mode: Returns Schwab live account data
+    - Live mode: Returns Tradier LIVE account data
 
     Syncs portfolio_value → user.account_size_usd so the risk manager
     always uses the real account balance for position sizing.
@@ -87,8 +87,8 @@ async def get_positions(current_user: User = Depends(get_current_user)):
     """
     Get current positions from the appropriate trading API.
 
-    - Paper mode: Returns Alpaca paper trading positions
-    - Live mode: Returns Schwab live positions
+    - Paper mode: Returns Tradier SANDBOX positions
+    - Live mode: Returns Tradier LIVE positions
 
     Returns:
         List of positions with symbol, qty, prices, and P&L

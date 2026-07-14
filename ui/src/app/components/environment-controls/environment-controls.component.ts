@@ -73,7 +73,7 @@ export class EnvironmentControlsComponent implements OnInit {
     // Show confirmation dialog for live mode
     if (mode === 'live') {
       const confirmed = confirm(
-        '⚠️ WARNING: Live trading uses REAL MONEY via Schwab API!\n\n' +
+        '⚠️ WARNING: Live trading uses REAL MONEY via your Tradier LIVE account!\n\n' +
         'All orders will execute with real capital. Are you absolutely sure you want to enable live trading?'
       );
 
@@ -204,8 +204,8 @@ export class EnvironmentControlsComponent implements OnInit {
     }
 
     switch (mode) {
-      case 'paper': return 'Paper trading with Alpaca (no real money)';
-      case 'live': return 'LIVE TRADING with Schwab (REAL MONEY!)';
+      case 'paper': return 'Paper trading via Tradier Sandbox (no real money)';
+      case 'live': return 'LIVE TRADING via Tradier Live (REAL MONEY!)';
       default: return '';
     }
   }

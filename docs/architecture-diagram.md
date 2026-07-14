@@ -36,8 +36,6 @@ graph TB
         TCM[TradingClientManager<br/>Paper OR Live Router<br/>BOTH return TradierClient]
         TC[TradierClient<br/>REST + WebSocket<br/>THE ONLY LIVE BROKER]
         ASM[TradierAccountStream<br/>order events - pushed fills]
-        SC[SchwabClient<br/>NOT a trading path -<br/>TCM never returns it.<br/>OAuth router still mounted]
-        AC[AlpacaClient<br/>DEAD - removed from<br/>the import graph 2026-07-13]
     end
 
     subgraph "Data Layer"
@@ -46,7 +44,6 @@ graph TB
 
     subgraph "External Services"
         TRADIER[Tradier API<br/>Sandbox + Live]
-        SCHWAB[Schwab API<br/>OAuth]
         DISCORD[Discord Webhooks<br/>Notifications]
         EMAIL[Resend Email API<br/>Reports]
     end
@@ -83,15 +80,12 @@ graph TB
     %% TradingClientManager is not a broker abstraction: both branches return TradierClient.
     TCM -->|Paper Mode - sandbox| TC
     TCM -->|Live Mode - live| TC
-    TCM -.->|dead branch| SC
-    TCM -.->|dead branch| AC
 
     %% External calls
     TC <-->|REST| TRADIER
     OM -->|await fill| ASM
     ASM <-->|WebSocket - account events| TRADIER
     TSM <-->|WebSocket - market events| TRADIER
-    SC <-.->|REST - OAuth router only,<br/>no order placement| SCHWAB
 
     %% Database
     AUTH ---|Read Write Users| DB
@@ -116,9 +110,9 @@ graph TB
     classDef external fill:#e8f5e9,stroke:#1b5e20,stroke-width:2px
 
     class SDW,TSM,SR,SE,RM,SG,OM engine
-    class TCM,TC,SC,AC broker
+    class TCM,TC,ASM broker
     class DB db
-    class TRADIER,SCHWAB,DISCORD,EMAIL external
+    class TRADIER,DISCORD,EMAIL external
 ```
 
 ## 2. Database Schema & Relationships
@@ -474,8 +468,6 @@ graph LR
 
     subgraph "Broker Clients"
         TC[tradier_integration/<br/>client.py<br/>router.py]
-        SC[schwab_integration/<br/>router MOUNTED in app.py<br/>but NOT a trading path]
-        AC[alpaca/<br/>DEAD - vendored SDK,<br/>0 modules loaded at runtime]
     end
 
     subgraph "Services"
@@ -521,12 +513,8 @@ graph LR
     OM --> TAS
 
     TCM --> TC
-    TCM -.-> SC
-    TCM -.-> AC
 
     TC --> CFG
-    SC --> CFG
-    AC --> CFG
 
     SCHED --> RPT
     SCHED --> M
@@ -540,7 +528,7 @@ graph LR
 
     class M,DB,CFG,SCH core
     class SDW,TSM,SR,SE,RM,SG,OM,TCM engine
-    class TC,SC,AC broker
+    class TC broker
 ```
 
 ## 6. Multi-Environment Database Routing
@@ -899,7 +887,6 @@ graph TB
             STRATS[StrategyService<br/>CRUD Strategies<br/>Equity Curves<br/>getClosedTrades - P&amp;L SOURCE]
             ACCTS[AccountService<br/>Fetch Balance<br/>Positions<br/>Trades]
             TRAD[TradierService<br/>Proxy to Tradier<br/>Quotes<br/>Option Chains]
-            SCH[SchwabService<br/>OAuth Redirect<br/>Account Info]
             SYS[SystemService<br/>Environment Switch<br/>System Events Stream]
             STRM[MarketStreamService<br/>WebSocket to Tradier<br/>Live Quotes for UI]
             RISK[RiskService<br/>Risk Status<br/>Account Daily Loss]
@@ -940,7 +927,6 @@ graph TB
     STRATS --> API
     ACCTS --> API
     TRAD --> API
-    SCH --> API
     SYS --> API
     RISK --> API
 
@@ -962,11 +948,60 @@ graph TB
     classDef component fill:#f3e5f5,stroke:#6a1b9a,stroke-width:2px
 
     class DASH,STRAT,POS,TRADES,PERF,ADMIN page
-    class AUTHS,STRATS,ACCTS,TRAD,SCH,SYS,STRM,RISK service
+    class AUTHS,STRATS,ACCTS,TRAD,SYS,STRM,RISK service
     class ENV,PROF,RISK_TILE component
 ```
 
 ---
+
+## 11. Option Contract Lifecycle (Arm → Drift Check → Reselect)
+
+`state.option_symbol` is NOT a position — it is the **candidate** the strategy would buy
+the instant an entry signal fires. It is chosen once, then held while we wait. That wait
+can last hours, and on 0DTE gamma walks delta out of the strategy's band in minutes — so
+without a drift check the engine buys, at entry time, a strike that only met the
+delta/OI criteria back when it was picked.
+
+**Why disarm rather than just reject the entry:** contract selection only runs when
+`option_symbol is None`. A contract that drifts out of band while still armed would fail
+the entry gate on every tick, forever, with nothing able to replace it — the strategy
+goes silent while looking perfectly healthy. Disarming is what gives the engine a way
+out. Turning the SignalGenerator delta gate on is only safe *because* reselection exists.
+
+```mermaid
+stateDiagram-v2
+    [*] --> Flat: no position, no contract
+
+    Flat --> Selecting: entry window open<br/>(30s retry throttle)
+    Selecting --> Flat: no contract passes<br/>delta band, OI, spread
+    Selecting --> Armed: best strike wins<br/>(closest to band MIDPOINT —<br/>this is what limits churn)
+
+    Armed --> Armed: waiting for entry signal<br/>(could be seconds, could be hours)
+
+    Armed --> DriftCheck: every 30s while flat
+    DriftCheck --> Armed: still in band<br/>(delta + OI re-priced)
+    DriftCheck --> Armed: no greeks returned<br/>HOLD - a data hiccup must not<br/>churn strikes
+    DriftCheck --> Flat: DRIFTED out of band<br/>disarm, unsubscribe, unroute,<br/>clear greeks
+
+    Armed --> Open: entry signal fires<br/>SignalGenerator delta + OI gates<br/>now actually run
+    Open --> Flat: position closed<br/>disarm - do NOT reuse the<br/>strike we just exited
+
+    note right of DriftCheck
+        Re-prices via get_quotes(greeks=True)
+        on ONE symbol - not the whole chain.
+        The chain is only pulled when a
+        replacement is actually needed.
+    end note
+
+    note right of Armed
+        Each strategy tracks its OWN
+        streamed_symbols. The WS refcount is
+        GLOBAL, so unsubscribing a symbol we
+        never subscribed would decrement
+        another strategy's count and kill
+        its market data feed.
+    end note
+```
 
 ## Key Design Patterns Summary
 

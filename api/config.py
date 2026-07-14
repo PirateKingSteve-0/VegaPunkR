@@ -55,25 +55,15 @@ class Settings(BaseSettings):
         else:
             return self.DATABASE_DEV_URL
 
-    # Alpaca API Keys
-    ALPACA_PAPER_API_KEY: str = os.getenv("ALPACA_PAPER_API_KEY", "")
-    ALPACA_PAPER_SECRET_KEY: str = os.getenv("ALPACA_PAPER_SECRET_KEY", "")
-    ALPACA_LIVE_API_KEY: str = os.getenv("ALPACA_LIVE_API_KEY_ID", "")
-    ALPACA_LIVE_SECRET_KEY: str = os.getenv("ALPACA_LIVE_API_SECRET_KEY", "")
-
-    # Tradier API Keys
+    # Tradier API Keys — Tradier is the ONLY broker. Alpaca and Schwab were removed
+    # 2026-07-13: Alpaca's free tier returns no greeks (it silently disabled the delta
+    # and open-interest gates), and Schwab was never wired to a trading path.
     TRADIER_SANDBOX_API_KEY: str = os.getenv("TRADIER_SANDBOX_API_KEY", "")
     TRADIER_SANDBOX_ACCOUNT_NUMBER: str = os.getenv("TRADIER_SANDBOX_ACCOUNT_NUMBER", "")
     TRADIER_SANDBOX_BASE_URL: str = os.getenv("TRADIER_SANDBOX_BASE_URL", "https://sandbox.tradier.com")
     TRADIER_LIVE_API_KEY: str = os.getenv("TRADIER_LIVE_API_KEY", "")
     TRADIER_LIVE_BASE_URL: str = os.getenv("TRADIER_LIVE_BASE_URL", "https://api.tradier.com")
     TRADIER_ENV: str = os.getenv("TRADIER_ENV", "sandbox")
-
-    # Schwab API Keys
-    SCHWAB_APP_KEY: str = os.getenv("APP_KEY", "")
-    SCHWAB_APP_SECRET: str = os.getenv("APP_SECRET", "")
-    SCHWAB_CALLBACK_URL: str = os.getenv("CALLBACK_URL", "https://127.0.0.1:8182")
-    SCHWAB_TOKEN_PATH: str = os.getenv("TOKEN_PATH", "token.json")
 
     # Discord Webhooks
     DISCORD_WEBHOOK_URL: str = os.getenv("DISCORD_WEBHOOK_URL", "")
