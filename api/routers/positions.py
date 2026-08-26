@@ -94,11 +94,16 @@ def create_position(
                 detail="Strategy not found"
             )
 
-    # Check if position already exists for this symbol
+    # Check for an already-OPEN position on this symbol.
+    # `qty > 0` matters: rows are per-contract now, so closed rows accumulate —
+    # one per contract ever traded. Without the filter this endpoint becomes
+    # permanently unusable for any symbol the engine has ever traded, because a
+    # long-closed row would keep reporting "position already exists".
     existing_position = db.query(Position).filter(
         Position.user_id == current_user.id,
         Position.symbol == position_data.symbol.upper(),
-        Position.strategy_id == position_data.strategy_id
+        Position.strategy_id == position_data.strategy_id,
+        Position.qty > 0,
     ).first()
 
     if existing_position:

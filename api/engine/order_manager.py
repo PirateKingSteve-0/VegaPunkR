@@ -1274,27 +1274,23 @@ class OrderManager:
         when multiple strategies might update the same position concurrently.
         """
         # Find the row for the contract being SOLD, with a row-level lock.
-        # Falls back to the underlying-only lookup for legacy rows written before
-        # per-contract positions existed (their option_symbol may not match).
+        # EXACT match on the contract only — no "closest open row" fallback.
+        #
+        # An earlier draft fell back to the open row for the underlying, meaning
+        # to be lenient about legacy rows. It was not needed and was dangerous:
+        # `_update_position_entry` writes `option_symbol` on every entry (both the
+        # create and the qty=0 reuse branch), so an open row ALWAYS names the
+        # contract it holds and the exact match always finds it. What the fallback
+        # actually did was let an exit for a contract we do NOT hold decrement the
+        # one we DO — booking the wrong contract's P&L at the wrong price.
+        # Failing to find a row and logging is the safe outcome; silently closing
+        # the wrong position is not.
         position = self.db.query(Position).filter(
             Position.user_id == user.id,
             Position.strategy_id == strategy.id,
             Position.symbol == symbol,
             Position.option_symbol == option_symbol,
         ).with_for_update().first()  # Lock the row
-
-        if not position and option_symbol is not None:
-            position = self.db.query(Position).filter(
-                Position.user_id == user.id,
-                Position.strategy_id == strategy.id,
-                Position.symbol == symbol,
-                Position.qty > 0,
-            ).with_for_update().first()
-            if position:
-                logger.warning(
-                    f"Exit for {option_symbol} matched a legacy position row "
-                    f"(id={position.id}, contract={position.option_symbol})"
-                )
 
         if not position:
             logger.warning(
