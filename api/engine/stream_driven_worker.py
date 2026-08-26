@@ -758,13 +758,34 @@ class StreamDrivenWorker:
                             f"Strategy {strategy_id}: adopting {occ_symbol} from "
                             f"inactive strategy {dupe.strategy_id} — clearing its row"
                         )
+                        log_event(
+                            db=db,
+                            user_id=dupe.user_id,
+                            event_type="POSITION_OWNERSHIP_TRANSFERRED",
+                            title=f"Position moved between strategies: {occ_symbol}",
+                            detail=(
+                                f"Strategy {dupe.strategy_id} is inactive and still "
+                                f"held a row for {occ_symbol}; strategy {strategy_id} "
+                                "adopted the broker position and its row was cleared. "
+                                "P&L attribution moves to the adopting strategy."
+                            ),
+                            symbol=dupe.symbol,
+                            strategy_id=strategy_id,
+                            severity="warning",
+                            event_data={
+                                "option_symbol": occ_symbol,
+                                "from_strategy_id": dupe.strategy_id,
+                                "to_strategy_id": strategy_id,
+                                "qty": dupe.qty,
+                            },
+                        )
                         dupe.qty = 0
                         dupe.unrealized_pnl = 0.0
 
                     # Zero only rows the broker does NOT hold.
                     self._flatten_other_contracts(
                         db, strategy_id, db_pos.id,
-                        broker_holds={str(h.get("symbol", "")) for h in held},
+                        broker_holds=_broker_option_symbols(tradier_positions),
                     )
 
                     db.commit()
@@ -772,6 +793,24 @@ class StreamDrivenWorker:
                     logger.info(
                         f"Strategy {strategy_id}: synced from Tradier — "
                         f"{occ_symbol} qty={qty} entry=${entry_price:.2f} (position id={db_pos.id})"
+                    )
+                    # Mirror the event _reconcile_position emits on its adoption
+                    # path. This branch writes position state too, so it needs
+                    # the same audit trail.
+                    log_event(
+                        db=db,
+                        user_id=db_pos.user_id,
+                        event_type="POSITION_ADOPTED_FROM_BROKER",
+                        title=f"Startup sync adopted: {occ_symbol}",
+                        detail=(
+                            f"Broker held {qty} contracts of {occ_symbol} at startup; "
+                            "the local row was synced to broker truth."
+                        ),
+                        symbol=db_pos.symbol,
+                        strategy_id=strategy_id,
+                        severity="warning",
+                        event_data={"option_symbol": occ_symbol, "qty": qty,
+                                    "detected_at": "startup_sync"},
                     )
 
                 elif declined:
@@ -868,57 +907,62 @@ class StreamDrivenWorker:
                 # and this buys nothing — it is here so the two paths stay
                 # symmetric. The day an await appears inside either block, an
                 # asymmetric guard would protect only one of them.
+                # Same lock as _startup_sync, spanning the ownership read
+                # THROUGH the insert and commit — not just the read. A guard that
+                # covers only the SELECT buys nothing the GIL does not already
+                # give us, and would silently fail to protect this path the day
+                # an await (a quote fetch, a preview) appears inside `if held:`.
                 async with _adoption_lock(strat.user_id, underlying):
                     held, _declined = self._adoptable_broker_options(
                         db, strat.user_id, strategy_id, underlying, tradier_positions
                     )
-                if held:
-                    tradier_pos = held[0]
-                    occ = tradier_pos["symbol"]
-                    qty = int(float(tradier_pos.get("quantity", 1)))
-                    cost_basis = float(tradier_pos.get("cost_basis", 0))
-                    entry_price = cost_basis / (qty * 100) if qty > 0 else 0.0
+                    if held:
+                        tradier_pos = held[0]
+                        occ = tradier_pos["symbol"]
+                        qty = int(float(tradier_pos.get("quantity", 1)))
+                        cost_basis = float(tradier_pos.get("cost_basis", 0))
+                        entry_price = cost_basis / (qty * 100) if qty > 0 else 0.0
 
-                    # Adopt into the row for THIS contract, creating it if needed —
-                    # never by rewriting some other contract's row.
-                    adopted = self._position_for_contract(
-                        db, strategy_id, underlying, occ
-                    )
-                    if adopted is None:
-                        logger.error(
-                            f"Strategy {strategy_id}: cannot resolve strategy row — "
-                            f"skipping adoption of {occ}"
+                        # Adopt into the row for THIS contract, creating it if needed —
+                        # never by rewriting some other contract's row.
+                        adopted = self._position_for_contract(
+                            db, strategy_id, underlying, occ
                         )
-                        return
-                    adopted.qty = qty
-                    if entry_price > 0:
-                        adopted.avg_entry_price = entry_price
-                        if not adopted.current_price:
-                            adopted.current_price = entry_price
-                    adopted.opened_at = datetime.utcnow()
-                    # Zero only rows the broker does NOT hold — see the note on
-                    # _flatten_other_contracts.
-                    self._flatten_other_contracts(
-                        db, strategy_id, adopted.id,
-                        broker_holds={str(h.get("symbol", "")) for h in held},
-                    )
-                    db.commit()
-                    state.option_symbol = occ
-                    logger.warning(
-                        f"Strategy {strategy_id}: broker held {occ} qty={qty} "
-                        f"while DB was flat — adopting broker truth (position id={adopted.id})"
-                    )
-                    log_event(
-                        db=db,
-                        user_id=adopted.user_id,
-                        event_type="POSITION_ADOPTED_FROM_BROKER",
-                        title=f"Adopted untracked position: {occ}",
-                        detail=f"Broker held {qty} contracts not tracked locally — adopted.",
-                        symbol=adopted.symbol,
-                        strategy_id=strategy_id,
-                        severity="warning",
-                        event_data={"option_symbol": occ, "qty": qty},
-                    )
+                        if adopted is None:
+                            logger.error(
+                                f"Strategy {strategy_id}: cannot resolve strategy row — "
+                                f"skipping adoption of {occ}"
+                            )
+                            return
+                        adopted.qty = qty
+                        if entry_price > 0:
+                            adopted.avg_entry_price = entry_price
+                            if not adopted.current_price:
+                                adopted.current_price = entry_price
+                        adopted.opened_at = datetime.utcnow()
+                        # Zero only rows the broker does NOT hold — see the note on
+                        # _flatten_other_contracts.
+                        self._flatten_other_contracts(
+                            db, strategy_id, adopted.id,
+                            broker_holds=_broker_option_symbols(tradier_positions),
+                        )
+                        db.commit()
+                        state.option_symbol = occ
+                        logger.warning(
+                            f"Strategy {strategy_id}: broker held {occ} qty={qty} "
+                            f"while DB was flat — adopting broker truth (position id={adopted.id})"
+                        )
+                        log_event(
+                            db=db,
+                            user_id=adopted.user_id,
+                            event_type="POSITION_ADOPTED_FROM_BROKER",
+                            title=f"Adopted untracked position: {occ}",
+                            detail=f"Broker held {qty} contracts not tracked locally — adopted.",
+                            symbol=adopted.symbol,
+                            strategy_id=strategy_id,
+                            severity="warning",
+                            event_data={"option_symbol": occ, "qty": qty},
+                        )
             except Exception as e:
                 logger.warning(f"Inverse-drift reconcile failed for strategy {strategy_id}: {e}")
             return
@@ -1443,6 +1487,26 @@ class StreamDrivenWorker:
                 f"OI={oi} need >={min_oi}) — disarming and reselecting"
             )
             await self._disarm_contract(strategy_id, state, stream_mgr, router)
+
+
+def _broker_option_symbols(tradier_positions) -> set:
+    """Every option contract the broker reports a long position in.
+
+    This is deliberately the RAW broker response, not the adoptable subset.
+    `_flatten_other_contracts` uses it to decide which rows are safe to zero,
+    and its premise is "the broker is the authority" — the authority is what
+    the broker says it holds, never the filtered list of what we chose to
+    manage. Passing the adoptable subset meant a contract DECLINED because
+    another live strategy claims it was absent from the set, so our own row for
+    it was zeroed with the log line "broker does not hold it" — the exact false
+    claim the broker_holds guard exists to eliminate.
+    """
+    out = set()
+    for p in tradier_positions or []:
+        sym = str(p.get("symbol", ""))
+        if parse_occ_symbol(sym) and float(p.get("quantity", 0)) > 0:
+            out.add(sym)
+    return out
 
 
 _adoption_locks: dict = {}

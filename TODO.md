@@ -222,8 +222,13 @@ the portal" to "any strategy auto-stops while holding", which the 20-consecutive
 makes routine.
 
 **Residual:** a strategy can now legitimately hold two open rows when the broker holds two
-contracts. `open_pos` still picks one, so the second is visible and exitable via reconcile but is
-not actively managed for SL/TP. Single-contract operation (`max_positions: 1`) is unaffected.
+contracts. That is fine — `_check_exit_signals` (`strategy_executor.py:368`) iterates **every** open
+row for `(user, strategy, symbol)`, and the forced-EOD block sits inside that same loop, so both
+rows get stop-loss, take-profit and EOD handling. Only the *armed/streamed* contract is one at a
+time; the second is REST-priced. Single-contract operation (`max_positions: 1`) is unaffected.
+
+(An earlier version of this note claimed the second row was "not actively managed for SL/TP". That
+was wrong — do not "fix" the code on the strength of it.)
 
 ### H2. Adoption serialisation is in-process only
 

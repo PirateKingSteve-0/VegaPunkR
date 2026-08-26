@@ -394,5 +394,16 @@ check("we adopt the dead strategy's contract", (PUT, 1) in res["mine"], True)
 check("...and its stale row is cleared, so P&L is not double-counted",
       res["dead"], [(PUT, 0)])
 
+# F-1: a contract DECLINED because another live strategy claims it is still
+# held by the broker. Our own row for it must not be zeroed with the false
+# log line "broker does not hold it".
+res = run_startup_sync(
+    broker_positions=[{"symbol": CALL, "quantity": 1, "cost_basis": 200.0},
+                      {"symbol": PUT, "quantity": 2, "cost_basis": 400.0}],
+    rows=[("mine", CALL, 1), ("mine", PUT, 1), ("other", PUT, 1)],
+    strategies={"mine": True, "other": True})
+check("a DECLINED but broker-held contract keeps its row",
+      (PUT, 1) in res["mine"], True)
+
 print("\n" + ("ALL PASSED" if not fails else f"{len(fails)} FAILURE(S):\n  " + "\n  ".join(fails)))
 sys.exit(1 if fails else 0)

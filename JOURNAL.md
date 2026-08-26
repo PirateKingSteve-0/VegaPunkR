@@ -8715,3 +8715,59 @@ unparseable-contract block emits an event like every other gate instead of only 
 > contents without asking what `held[0]` and `_flatten_other_contracts` do with them. The engine
 > rule "reason about side effects before code" is specifically about the *consumer*, not the
 > function being edited.
+
+### 13. Fifth pass — the same mistake, a fourth time
+
+All six G/L fixes verified correct. Then **F-1**, which is the pattern this journal named two
+entries ago, recurring in the fix written *because* of it:
+
+`_flatten_other_contracts` gained `broker_holds` so it would stop zeroing rows for contracts the
+broker still holds. Both call sites built that set from `held` — **the adoptable subset** — not from
+the broker's actual response. So a contract DECLINED because another live strategy claims it is
+absent from `broker_holds`, and our own row for it is zeroed with the log line "broker does not hold
+it". Exactly the false claim the parameter was added to eliminate.
+
+`broker_holds` is now built by `_broker_option_symbols(tradier_positions)` — the raw broker answer.
+The premise is "the broker is the authority"; the authority is what the broker says it holds, never
+the filtered list of what we chose to manage.
+
+Reachability, for the record: it needs two of the user's strategies holding the **same** OCC symbol
+(the opposite-side gate only blocks the *opposite* side — same-side collisions are allowed by
+design) **and** the adopting strategy holding a second broker-reported contract. Not reachable with
+one call strategy + one put strategy at `max_positions: 1`. Reachable the moment a second
+same-direction strategy exists, or `max_positions > 1`.
+
+Also fixed: **F-2** the `_reconcile_position` lock covered only the SELECT while its own comment
+claimed it spanned the commit — now genuinely spans read → insert → commit like `_startup_sync`;
+**F-3** the `_startup_sync` adoption branch and the G2 ownership-transfer both wrote position state
+with no `SystemEvent`, in a commit whose subject is "P&L must not disappear silently". Both now emit
+(`POSITION_ADOPTED_FROM_BROKER`, `POSITION_OWNERSHIP_TRANSFERRED`).
+
+**Corrected an error in TODO H1's residual note.** It claimed a second open row is "not actively
+managed for SL/TP". That is wrong: `_check_exit_signals` (`strategy_executor.py:368`) iterates every
+open row for `(user, strategy, symbol)` and the forced-EOD block is inside that loop, so both rows
+get full exit handling. Only the *armed and streamed* contract is one at a time; the second is
+REST-priced. The note is corrected in place with a warning not to "fix" the code on the strength of
+the old wording.
+
+### 14. Where this landed, and the honest read on risk
+
+Five review passes over `72a52a6..HEAD`. Passes 3, 4 and 5 each surfaced a high-or-medium defect the
+previous pass's tests did not catch, and every one was the same mechanism: **a filter changed
+without checking what consumes its output.** C4 filtered adoption without asking that adoption
+exists to enable exits. N3 used `is_active` without asking when that flag is set (auto-stop on error
+storm — exactly when a live position loses its worker). F3 changed `held`'s contents without asking
+what `held[0]` and `_flatten_other_contracts` do with them. F-1 added `broker_holds` without
+checking that its producer is a filtered subset.
+
+That rate has not yet gone a pass without recurring, which is the strongest argument for a
+supervised paper session before any of this goes near the live account — stronger than any
+individual finding. What that session needs to cover, specifically:
+
+- a restart **with an open position**, so `_startup_sync` actually takes its adoption branch
+- an observed forced-EOD exit
+- `scripts/morning_check.py` run after, confirming no duplicate `option_symbol` across open rows and
+  nothing held at the broker without a row
+
+**Still open:** H2 — `_adoption_lock` is an in-process `asyncio.Lock`. A second API process, or a
+restart overlapping the old one, reopens double-adoption regardless of any of this.
