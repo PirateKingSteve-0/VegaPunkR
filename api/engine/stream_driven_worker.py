@@ -10,7 +10,8 @@ Each active strategy runs as a persistent asyncio task that:
 import asyncio
 import logging
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+import re
+from datetime import datetime, timedelta, date
 from typing import Optional
 
 from database import SessionLocals, default_environment
@@ -25,6 +26,34 @@ from utils.market_hours import is_market_open
 from utils.symbol_helpers import is_option_symbol
 
 logger = logging.getLogger(__name__)
+
+
+def _occ_expiry(occ: Optional[str]) -> Optional[date]:
+    """Parse the expiry date out of an OCC option symbol (…YYMMDD[C|P]NNNNNNNN).
+    Returns None if it doesn't look like an option symbol."""
+    m = re.search(r"(\d{6})[CP]\d{8}$", occ or "")
+    if not m:
+        return None
+    ymd = m.group(1)
+    try:
+        return date(2000 + int(ymd[:2]), int(ymd[2:4]), int(ymd[4:6]))
+    except ValueError:
+        return None
+
+
+def _contract_expired(occ: Optional[str]) -> bool:
+    """True if the contract's expiry is strictly before today.
+
+    Strictly before — a 0DTE contract on its expiry day is still tradeable intraday,
+    so expiry == today is NOT expired. This exists because a contract armed on a
+    Friday afternoon and held over the weekend is dead by Monday, the broker rejects
+    every order for it ("Expiration date must be greater than the current date"), and
+    since a failed order never opens a position, nothing else ever clears it. That
+    silently halted all trading 2026-07-20 → 07-24.
+    """
+    exp = _occ_expiry(occ)
+    return exp is not None and exp < date.today()
+
 
 _MARKET_CLOSED_LOG_INTERVAL = timedelta(minutes=1)
 _RECONCILE_INTERVAL = timedelta(seconds=60)
@@ -408,6 +437,21 @@ class StreamDrivenWorker:
                                         strategy_id, state, stream_mgr, router
                                     )
                             else:
+                                # Drop an expired armed contract before doing anything
+                                # with it. A 0DTE strike armed Friday afternoon is dead by
+                                # Monday; the broker rejects every order for it, and a
+                                # failed order never opens a position to clear it — so
+                                # without this, one weekend permanently halts the strategy
+                                # (incident 2026-07-20 → 07-24).
+                                if state.option_symbol and _contract_expired(state.option_symbol):
+                                    logger.warning(
+                                        f"Strategy {strategy_id}: armed contract "
+                                        f"{state.option_symbol} expired — disarming and reselecting"
+                                    )
+                                    await self._disarm_contract(
+                                        strategy_id, state, stream_mgr, router
+                                    )
+
                                 # No position open — arm a contract if we don't have one
                                 # (cold start, or we just exited / drifted out of band)
                                 if not state.option_symbol:
@@ -990,6 +1034,14 @@ class StreamDrivenWorker:
         tick, forever, with nothing able to replace it."""
         sym = state.option_symbol
         if not sym:
+            return
+
+        # An expired contract never comes back into band — disarm immediately so the
+        # next tick reselects, instead of falling through to the "no greeks → hold"
+        # path below, which would pin a dead contract forever.
+        if _contract_expired(sym):
+            logger.warning(f"Drift check: {sym} has expired — disarming")
+            await self._disarm_contract(strategy_id, state, stream_mgr, router)
             return
 
         # Stamp up front so a failing quote endpoint retries on the interval rather

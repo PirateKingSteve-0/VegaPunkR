@@ -156,5 +156,13 @@ if __name__ == "__main__":
         host="0.0.0.0",
         port=8000,
         reload=True,
+        # Only reload on Python source changes. Without a scope, the watcher fires on
+        # every file in the tree — docs, TODO.md, .jsonl live-test logs, the diagram
+        # hook's context json, __pycache__ — none of which the server cares about, and
+        # each one prints "watchfiles.main: N change detected". Watch only the api dir
+        # and only .py files.
+        reload_dirs=["."],
+        reload_includes=["*.py"],
+        reload_excludes=["live_test/*", "debug/*", "tests/*", "*.jsonl", "*.log"],
         log_level="info",
     )

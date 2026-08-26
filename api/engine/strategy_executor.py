@@ -377,14 +377,37 @@ class StrategyExecutor:
             bid = market_data.get('bid', 0) or 0
             ask = market_data.get('ask', 0) or 0
             option_symbol = position.option_symbol or market_data.get('option_symbol')
+
+            # The streamed bid/ask belong to the ARMED contract (state.option_symbol),
+            # NOT necessarily the one we HOLD (position.option_symbol). Those diverge
+            # whenever the engine reselects a strike, and pricing an exit off the wrong
+            # contract makes TP/SL fire on a fiction:
+            #
+            #   2026-07-14: held SPY 749C (worth 1.81), priced off 747C (worth ~3.49)
+            #   -> "Take profit hit: 89.67% >= 30.0%"  -> actually sold for -1.6%
+            #   -> "Stop loss hit: -15.58%"            -> actually sold for +5.1%
+            #
+            # Exits were firing essentially at random. Only trust the stream when the
+            # quote is FOR the contract we hold; otherwise go to REST for the truth.
+            streamed_symbol = market_data.get('option_symbol')
+            quote_is_for_this_position = (
+                streamed_symbol is not None and streamed_symbol == position.option_symbol
+            )
+
             if option_symbol:
-                if bid > 0:
+                if quote_is_for_this_position and bid > 0:
                     exit_price = bid
-                elif ask > 0:
+                elif quote_is_for_this_position and ask > 0:
                     # One-sided book — fall back to mid (which is just ask/2 here)
                     exit_price = (bid + ask) / 2
                 else:
-                    # Stream hasn't delivered a quote yet — fall back to Tradier REST
+                    # Either the stream hasn't delivered a quote yet, or it is quoting a
+                    # DIFFERENT contract than the one we hold. Ask the broker directly.
+                    if streamed_symbol and streamed_symbol != position.option_symbol:
+                        logger.warning(
+                            f"Exit quote mismatch: holding {position.option_symbol} but the "
+                            f"stream is quoting {streamed_symbol} — pricing exit from REST"
+                        )
                     rest_price = await self._fetch_option_price(option_symbol)
                     if rest_price > 0:
                         exit_price = rest_price

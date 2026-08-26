@@ -22,3 +22,5 @@ CLAUDE.md
 
 # Diagram maintenance
 scripts/.diagram_update_context.json
+# Live-test JSONL logs — large, machine-generated, never commit
+logs/

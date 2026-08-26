@@ -707,7 +707,14 @@ class OrderManager:
                 side=side,
                 option_symbol=option_symbol,
                 order_type=order_type,
-                signal_price=signal.price,
+                # MUST be the per-contract OPTION price we sized from — `estimated_price`
+                # is the option mid ((bid+ask)/2, strategy_executor.py:292). `signal.price`
+                # is the UNDERLYING (SPY ~751), and passing it made ORDER_PREVIEW_DRIFT
+                # compare a stock price against an option premium: every order logged a
+                # "drift" of ~-99.4%, which is just 4.83/751. That silently poisoned the
+                # entry-drift dataset TODO B2 has been waiting on. Falls back to
+                # signal.price for non-option orders, where they're the same thing.
+                signal_price=estimated_price or signal.price,
             )
             if not preview_ok:
                 return OrderResult(success=False, message=f"Order aborted: {preview_msg}")

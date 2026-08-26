@@ -7658,3 +7658,384 @@ and shows times automatically if a payload ever includes them).
 **Status:** ✅ README startup docs committed-ready; `fmtDateTime` change in working tree, no UI
 difference in sandbox, future-proofed for real timestamps.
 
+
+---
+
+## Session Date: July 13, 2026 (The −21k that wasn't: greeks, gainloss, missing fills, negative expectancy)
+
+The longest session so far. Started as *"how does Alpaca's API compare to Tradier?"* and turned
+into an audit that found the engine had been running with two of its entry gates **silently
+disabled since the day they were written**, that our P&L dashboard was reporting a loss **11×
+larger than reality**, and that the actual money-loser was neither — it was a strategy config
+that was arithmetically guaranteed to lose.
+
+**Headline:** the engine had real bugs. We fixed them. **None of them lost the money.**
+
+---
+
+### 1. The Alpaca discovery — two entry gates dead since birth
+
+Tracing the Alpaca-vs-Tradier question into the code turned up `_refresh_greeks` in
+`stream_driven_worker.py`: every 5 minutes, per strategy, the engine called **Alpaca's** option
+snapshot endpoint for delta and open interest.
+
+Three problems, in ascending order of severity:
+
+1. It was a **blocking** `requests` call inside an `async def` with no `asyncio.to_thread` — it
+   stalled the shared event loop (every strategy task *and* the WebSocket consumer) for the full
+   round trip.
+2. Our Alpaca account is on the free tier. **Greeks are behind the paid OPRA subscription.**
+   Verified live against a real contract:
+
+   | | delta | open_interest |
+   |---|---|---|
+   | Tradier chain | `1.0` | `6` |
+   | Alpaca snapshot | **`None`** | **`None`** |
+
+3. `_refresh_greeks` then did `state.delta = data.get("delta")` — writing **`None` over `None`**,
+   forever.
+
+And both gates in `SignalGenerator` are guarded on `is not None`:
+
+```python
+if additional_data and additional_data.get('delta') is not None:   # ← skipped, not failed
+```
+
+> **`None` does not mean "fail". It means "don't look."**
+> The delta-band gate (`signal_generator.py:208-217`) and the `min_open_interest` gate (`:221-228`)
+> had **never executed in production**.
+
+Not "skipped for 5 minutes" — **permanently**. The `return None` that rejects an out-of-band
+contract has never been reached.
+
+**Saving grace:** contract *selection* (`_select_option_contract`) does enforce delta band, OI and
+spread off the Tradier chain, and that code works. So we were never trading unfiltered. The
+`SignalGenerator` re-checks were always a redundant second pass — and they were inert.
+
+**Fix:** deleted `_refresh_greeks` and the Alpaca import. Selection already reads the greeks off
+the chain; it was throwing them away and then phoning a second vendor for the same numbers.
+
+**Bonus find:** `utils/__init__.py` re-exported `multi_stream`, which imports the Alpaca live-stream
+SDK at module scope. So **any** `utils.*` import (`risk_manager` → `market_hours` → `utils/__init__`)
+dragged the entire Alpaca websocket stack into the process at startup. Dropped the re-export; the
+app now loads **zero** Alpaca modules.
+
+---
+
+### 2. Drift-driven contract reselection ("Row 3")
+
+`state.option_symbol` is **not a position** — it's the *candidate* we'd buy the instant an entry
+signal fires. It was chosen once and then held, sometimes for hours. On 0DTE, gamma walks delta out
+of the band in minutes:
+
+```
+ 9:35  select SPY 753C   delta 0.55  ✓ in band → armed
+10:15  SPY rallies       delta 0.93  ✗ out of band
+10:22  entry fires       → buys it anyway
+```
+
+**Why we couldn't just turn the gate on.** Selection only runs `if not state.option_symbol`. A
+contract that drifts out of band while still armed would fail the entry gate on *every tick,
+forever*, with nothing able to replace it — the strategy goes silent while looking perfectly
+healthy in the logs. **The gate can reject the contract; it has no power to replace it.**
+
+So the fix is a package:
+
+| | drift out of band | result |
+|---|---|---|
+| Before (gate inert) | buy it anyway | trades on stale criteria |
+| Gate on, no reselection | reject forever | **strategy silently dies** |
+| **Gate on + reselection** | swap to a fresh strike | correct |
+
+`_check_contract_drift` re-prices the armed contract every 30s via
+`get_quotes([sym], greeks=True)` — one symbol, not the whole chain — and disarms if it has left the
+band. Chain is only pulled when a replacement is actually needed.
+
+**A missing-greeks response HOLDS the contract rather than disarming.** Treating `None` as a failed
+check is *exactly* the bug that started this whole thread; it would churn strikes on a data hiccup.
+
+---
+
+### 3. A bug I introduced, caught by re-auditing my own work
+
+The re-audit of Row 3 found a bug **in Row 3**. Teardown used a `symbols_to_stream` snapshot captured
+once at startup — fine before, because the armed contract never changed mid-run. Reselection breaks
+that, and the WS refcount is **global across strategies**:
+
+```
+OLD (stale snapshot)
+   strategy-2 stream intact? : False   ✗ STOLE ANOTHER STRATEGY'S STREAM
+   leaked subscriptions      : ['SPY_B']   ✗ LEAK
+   orphaned routes           : {'SPY_A': [2], 'SPY_B': [1]}   ✗ DEAD QUEUE STILL FED
+```
+
+Three failures on shutdown: it unsubscribed a contract **another live strategy was holding, killing
+its market data**; never unsubscribed the swapped-in contract; and left a dead queue routed forever.
+
+**Fix:** each strategy tracks its own `streamed_symbols`. It can only ever release what it actually
+subscribed. This also guards `_reconcile_position`, which can adopt a contract straight off the
+broker without ever streaming it.
+
+---
+
+### 4. The −$21,057 that wasn't
+
+Morning run: the performance page showed **−21k**. The user's CSV export summed to **−2,781.37**.
+The DB said **−1,619**. Three numbers, three answers.
+
+**The −2,781.37** was the `Gain/Loss %` column summed. 125 percentages added together.
+
+**The −21,057** is more interesting, and it is **a Tradier bug our own strategy triggered.**
+
+`TSLA260713C00405000` was a 0DTE contract that decayed from **6.10 → 0.39** over the day. The engine
+round-tripped it **50 times**, re-entering cheaper each cycle.
+
+```
+WHAT ACTUALLY HAPPENED          WHAT /gainloss CLAIMS
+  bought 150 for 14,244           same 150, same proceeds
+  sold   150 for 12,774           but cost: 34,908   ← 2.45x
+  real P&L:      -1,470           reported:  -22,134
+```
+
+Proper FIFO retires a buy lot when it's closed against a sell. **Tradier's sandbox doesn't** — it
+keeps matching new sells against early, expensive, *already-closed* lots. True average entry was
+**$0.95**; the report claims **$2.33**.
+
+**Ground truth:** contract-level cash flow from the broker (264 contracts in, 264 out, flat) =
+**−$1,851.00**, matching Tradier's own `close_pl` to the penny. Account equity ($98,293, all cash)
+confirms it — a real 21k loss from a 100k start would leave ~$79k.
+
+> **Never compute P&L from `/gainloss`. Compute it from fills.**
+> The money is always right — fills are fills. The *report* is not. And if Tradier's LIVE gainloss
+> shares this lot bug, live tax/P&L reporting is equally suspect.
+
+The client also hardcodes `page=1, limit=25` with no pagination — so even the corrupt number was a
+partial slice. I called the endpoint three times and got +646, −10,566 and +474.
+
+---
+
+### 5. Three fills the engine never wrote down
+
+Diffing the DB against Tradier by `order_id` (all 250 rows carry one, so the match is exact) found
+**exactly 3 missing orders**:
+
+```
+35112148  buy_to_open    TSLA405C   3 @ 1.84   ORDER_UNCONFIRMED, 13:45:48
+35112265  buy_to_open    TSLA405C   3 @ 3.30   ORDER_UNCONFIRMED, 13:46:20
+35129974  sell_to_close  SPY751C    2 @ 1.82   manual close in the Tradier portal
+```
+
+**The `ORDER_UNCONFIRMED` path.** `_await_terminal_order` polls `get_order` every 1.5s for 30s. If
+the broker hasn't answered, it logs `ORDER_UNCONFIRMED` and **leaves local state untouched** — a
+deliberate refusal to guess, because both guesses are dangerous (assume filled → phantom position;
+assume dead → unmanaged real position).
+
+**Both orders filled anyway.** The engine wrote no Position row and believed it was flat **while
+holding 6 TSLA contracts** — no stop, no take-profit, and `max_positions` couldn't stop it opening
+another, because there was no Position row to count. The 60s reconcile caught it
+(`POSITION_ADOPTED_FROM_BROKER` at 13:47:20) — the safety net worked — but the *entry Trade row* was
+never written.
+
+Both fired **within 80 seconds of the session's first order**, ~4.5h before anything was touched by
+hand. Smells like cold-start latency blowing the 30s window.
+
+**The manual close.** `_reconcile_position` correctly zeroed the position — but **never wrote the
+closing Trade row**. Its −$104 simply vanished from P&L history. Position state was consistent;
+the *record* silently rotted. Every manual intervention leaves a hole in your own history and you'd
+never know.
+
+---
+
+### 6. What we fixed
+
+| Fix | File |
+|---|---|
+| Unconfirmed order **blocks further BUYS** (never sells — an exit must always run) | `order_manager.py` |
+| Reconcile tick **re-polls** unconfirmed orders and **backfills** the Trade row at the broker's real `avg_fill_price` | `order_manager.py` |
+| `_reconcile_position` **writes a Trade row** on external close, using the broker's actual fill (via new `_broker_close_fill`) rather than the last streamed quote | `stream_driven_worker.py` |
+| **Account event stream** — fills arrive by push instead of a 30s poll | `tradier_account_stream.py` (new) |
+| `/performance/closed-trades` — P&L from the engine's own fill records, not `/gainloss`. Added the missing **1D** filter | `routers/performance.py` |
+| `calculate_performance_metrics` read `t.entry_price` / `t.asset_class` — **neither column exists** — and had been **HTTP 500-ing** for any strategy with trades | `routers/performance.py` |
+
+**Two streams run concurrently.** Tradier's *"not permitted to open more than one session at a time"*
+appears **separately in each doc**, and market/account have distinct session endpoints and sockets —
+so the limit is per stream-*type*. Verified live against sandbox. The account stream is an
+**accelerator, not a replacement**: REST polling remains the fallback, so if it drops the engine
+behaves exactly as before.
+
+Design note: the account event carries **no `symbol` and no `side`**, and names its quantity field
+`executed_quantity` (**not** REST's `exec_quantity`). It is only ever a *notification keyed on order
+id* — the canonical order still comes from REST.
+
+---
+
+### 7. The actual money-loser: negative expectancy by construction
+
+```
+                       stop_loss
+  break-even win rate = ─────────────────────
+                       stop_loss + take_profit
+```
+
+| Strategy | UI showed | **Engine enforced** | Break-even WR |
+|---|---|---|---|
+| TSLA | 20 / 15 | 20 / 15 | **57.1%** |
+| SPY | 15 / 20 | **50 / 25** | **66.7%** |
+
+Actual TSLA win rate: **31%**.
+
+**The stop was WIDER than the target.** Every trade was worth ≈ **−9%** before it was placed. It took
+124 round trips. `124 × ~−$15 ≈ −$1,851`. **The loss was not an accident. It was arithmetic.**
+
+The same broken trade had been running for weeks — it just didn't trade much:
+
+```
+2026-05-21   36 trades    -$2.13
+2026-07-09   40 trades   -$72.00
+2026-07-13  124 trades  -$1,851.00   ← same flaw, more volume
+```
+
+**Volume didn't cause the loss. It revealed it.**
+
+#### The trap that hid SPY's 50% stop
+
+`params_json` carried **both key spellings with different values**, and `signal_generator.py:355`
+reads `_pct` **first**:
+
+```python
+stop_loss_pct = params.get('stop_loss_pct') or params.get('stop_loss_percentage')
+```
+
+SPY had `stop_loss_pct: 50` **and** `stop_loss_percentage: 15`. The UI edits the `_percentage`
+column. **The number on screen was never the number being traded.**
+
+> Two names for one setting is not a convenience. It's a bug waiting for a bad day.
+
+**Fix:** both strategies → **SL 15 / TP 30** (1:2, break-even **33.3%**), with **all four keys and
+both columns** written together (`scripts/fix_strategy_expectancy.py`). Deliberately did *not*
+delete the `_pct` keys — `trading_safeguards.py:54` rejects any strategy whose `stop_loss_pct` is
+absent or < 10 (dead code today, but a landmine if ever wired up).
+
+#### ⚠️ RETRACTED 2026-07-14 — the performance numbers below were fiction
+
+> **This section originally claimed a measured 31% win rate, a −1.08% mean per-trade return and a
+> Sharpe of −0.146, and concluded the strategy was still negative-EV. All of that was computed from
+> Tradier sandbox fills, and sandbox fills are fabricated.**
+>
+> **Proof:** on 2026-07-14 SPY's real tape read **752.02** (the engine's stream agreed: 751.98). A
+> **749 call** therefore carries **$3.00 of intrinsic value**. Tradier sandbox filled it at
+> **$1.84–$2.14** — *below intrinsic*. That is free arbitrage; it cannot happen in a real market.
+>
+> The engine reads LIVE quotes (sandbox has no market-data stream, so it has no choice) but fills in
+> SANDBOX. Entry is booked at a sandbox price, the exit is then judged against a live price:
+> `(3.49 − 1.84)/1.84 = +89.67%` → *"Take profit hit!"* → sells in sandbox at 1.81 → **actually
+> −1.6%**. Measured: **120 of 121** TSLA exits on 2026-07-13 fired at a price we did not get.
+>
+> **The engine's logic was correct. The data was fake.** Exits were effectively random, so any win
+> rate derived from them is a coin flip.
+>
+> **What survives:** the *structural* finding. `SL / (SL + TP)` is the win rate you need just to break
+> even — arithmetic, not data. A stop wider than a target is indefensible regardless, and fixing it
+> was right. **What does not survive:** every claim about how the strategy actually performed. We do
+> not know its win rate, its expectancy, or whether it makes money — **and we cannot find out in
+> sandbox.**
+>
+> The specific **15/30** ratio was also chosen partly to sit below that fake 31%. The *direction* is
+> right; the magnitude should be revisited against real fills.
+
+**What is still true**, because it doesn't depend on fill prices: the **38-second re-entry cadence**
+(median gap between entries; 106 of 119 within 90s), and the 5s rate limiter blocking **108 of ~233
+attempted orders (46%)** — a governor pinned to the floor, not a safety margin. Timing is timing.
+
+Full (corrected) writeup: **`docs/negative-expectancy.md`**.
+
+---
+
+### 8. Reconciled the day to the cent
+
+`scripts/reconcile_2026_07_13.py` (idempotent) — three missing fills inserted, plus one repriced row:
+
+- `35112488` — the sell that closed the 6 adopted contracts. Reconcile had priced it from Tradier's
+  `cost_basis` at **2.36**; the real fills average **2.57**. That one wrong entry price flattered P&L
+  by exactly **$128**.
+
+```
+DB before : -1,619.00
+DB after  : -1,851.00
+broker    : -1,851.00   ✓ reconciled
+```
+
+---
+
+### 9. Alpaca & Schwab ripped out entirely (91 files)
+
+Tradier is now the sole broker. Deleted `api/alpaca/` (a **vendored copy of the alpaca-py SDK,
+committed to the repo** — which is why `import alpaca` resolved despite `alpaca-py` never being in
+the venv), `api/schwab_integration/`, the whole `services/market_data/` tree, the dead legacy
+`strategy_worker.py`, and more.
+
+**The UI was naming the wrong broker in the real-money confirmation dialog:**
+
+```
+'⚠️ WARNING: Live trading uses REAL MONEY via Schwab API!'
+'Paper trading with Alpaca (no real money)'
+```
+
+None of that had been true for a while. Anyone reading those dialogs had a completely wrong mental
+model of where their money was going. Corrected throughout.
+
+---
+
+### 10. Five things I got wrong (and the pattern)
+
+Recorded because the *pattern* matters more than the individual errors:
+
+1. **"Split-brain greeks"** — claimed entry and exit used different vendors' delta. **False.**
+2. **"The exit path reads delta"** — **false**; `check_exit_signal` takes no greeks at all.
+3. **"Alpaca's missing OCO is a dealbreaker"** — **irrelevant**; we don't use broker-side exits.
+4. **"Stops catastrophically failed at −80%"** — **false**, an artifact of the corrupt gainloss CSV.
+   Measured against real fills, only **4 of 121** exits beat the −20% stop. **The stops held.**
+5. **"The account event stream is already in the TODO"** — it wasn't.
+
+> **Four of five came from trusting a data source or a summary without cross-checking it first.**
+> The whole session was an object lesson in this: the gainloss report lied, the architecture diagram
+> lied (it claimed the engine *cancels* an order on timeout — it doesn't), the UI lied about the
+> stop loss, and the UI lied about the broker.
+
+---
+
+### 11. State for the July 14 run
+
+Verified: app boots and serves (89 routes), **both** WebSocket streams connect, worker starts,
+DB and broker flat, `account_size_usd` in sync ($98,293.36), 07-14 is a full session.
+
+**Running SPY only.** TSLA stays off — still negative-EV, and a 120-round-trip day is the worst
+possible conditions for reading logs on code that has never run. SPY is also the better test than
+it looks: its 4 trades on 07-13 were under a secret **50%** stop that almost never triggers; on a
+**15%** stop it will cycle far more. It is the strategy whose params were most wrong and which has
+**never once run correctly**.
+
+**Watch (none of these have ever run in production):**
+
+- `drifted out of criteria` — does reselection actually fire? **Genuinely unverified**, and TSLA
+  round-tripping one contract 50 times suggests it may not have.
+- `ENTRY_BLOCKED_UNCONFIRMED` — should log **once per episode**, not once per tick (see below).
+- `ORDER_BACKFILLED` — a late fill recovered.
+- `ORDER_UNCONFIRMED` — should be **rarer** now that fills arrive by push.
+
+**Late bugfix, found by driving the entry path end-to-end** (which had never been executed since the
+afternoon's changes): the `ENTRY_BLOCKED_UNCONFIRMED` dedupe was a **no-op**. It reused
+`_should_log_throttle`, which keys off `_last_order_at` — only ever stamped with *real* symbols,
+never the synthetic `"unconfirmed:SPY"` key — so it returned `True` on every call. With a 1s eval
+loop and a 60s reconcile, that's ~60 identical `system_events` per blocked episode. Now uses a
+dedicated dedupe set, cleared when the order settles. **This could only ever have surfaced live, at
+the open.**
+
+**Still open, and it is the biggest live-trading risk in the system:**
+
+> **THERE ARE NO BROKER-SIDE STOPS.** Every exit is simulated in-engine and issued as a market sell.
+> **Nothing rests at Tradier.** If the process dies, the host reboots, or the WebSocket wedges while
+> a 0DTE position is open, nothing protects it. Tradier supports OTO/OCO/OTOCO; **no code path calls
+> them.** See TODO item #1.
+
+**Status:** ✅ committed + pushed to `dev` (`fe6bdf3`). Clean revert point before the open.
