@@ -6,183 +6,121 @@
     top: 0;
     bottom: 0;
     height: 100vh;
+    border-left: 1px solid var(--border);
   }
 
   .drawer-close {
     position: absolute;
-    top: 8px;
-    right: 8px;
+    top: var(--sp-2);
+    right: var(--sp-2);
     z-index: 1;
   }
 }
 
-.strategy-list-container {
-  .header {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    margin-bottom: 24px;
+.loading-container {
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  min-height: 280px;
+}
 
-    h1 {
-      font-size: 28px;
-      font-weight: 600;
+.strategies-card {
+  padding: 0;
+  overflow: hidden;
+}
+
+.strategies-table {
+  width: 100%;
+
+  .strategy-name {
+    display: flex;
+    align-items: center;
+    gap: var(--sp-2);
+
+    strong {
       color: var(--text);
-      margin: 0;
+      font-size: var(--fs-sm);
+      font-weight: var(--fw-semibold);
     }
 
-    .header-actions {
-      display: flex;
-      gap: 12px;
-
-      button mat-icon {
-        margin-right: 8px;
-      }
+    // "LIVE" is the single most consequential label in this table.
+    .live-badge {
+      background-color: var(--color-loss) !important;
+      color: #fff !important;
+      font-weight: var(--fw-bold) !important;
+      font-size: var(--fs-micro) !important;
+      letter-spacing: var(--ls-eyebrow);
+      padding: 0 var(--sp-2);
+      min-height: 18px;
+      border-radius: var(--radius-xs) !important;
     }
   }
 
-  .loading-container {
-    display: flex;
-    justify-content: center;
+  mat-chip {
+    text-transform: uppercase;
+    letter-spacing: var(--ls-eyebrow);
+    font-size: var(--fs-micro) !important;
+    font-weight: var(--fw-semibold) !important;
+  }
+
+  .strategy-row {
+    cursor: pointer;
+
+    &:hover {
+      background-color: var(--surface-hover);
+    }
+  }
+
+  .delete-action {
+    color: var(--color-loss);
+  }
+
+  .equity-spark {
+    display: inline-flex;
     align-items: center;
-    min-height: 300px;
-  }
+    gap: var(--sp-2);
+    padding: var(--sp-1);
+    border-radius: var(--radius-xs);
+    cursor: pointer;
+    transition: background-color var(--dur-fast) var(--ease);
 
-  .empty-state {
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    justify-content: center;
-    padding: 60px 20px;
-    text-align: center;
-
-    mat-icon {
-      font-size: 64px;
-      width: 64px;
-      height: 64px;
-      color: var(--text-faint);
-      margin-bottom: 16px;
+    &:hover {
+      background-color: var(--surface-hover);
     }
 
-    h2 {
-      font-size: 24px;
-      margin: 0 0 8px 0;
+    .equity-spark-chart {
+      width: 100px;
+      height: 26px;
+    }
+
+    .equity-spark-value {
+      font-size: var(--fs-xs);
+      font-variant-numeric: tabular-nums;
+      font-weight: var(--fw-medium);
       color: var(--text-muted);
-    }
 
-    p {
-      color: var(--text-faint);
-      margin: 0 0 24px 0;
-    }
-
-    .empty-state-actions {
-      display: flex;
-      gap: 12px;
-
-      button mat-icon {
-        margin-right: 8px;
+      &.profit {
+        color: var(--color-profit);
+      }
+      &.loss {
+        color: var(--color-loss);
       }
     }
   }
 
-  .strategies-card {
-    padding: 0;
-    overflow: hidden;
-  }
-
-  .strategies-table {
-    width: 100%;
-
-    th {
-      font-weight: 600;
-      color: var(--text-muted);
-      padding: 16px;
-    }
-
-    td {
-      padding: 16px;
-    }
-
-    .strategy-name {
-      display: flex;
-      align-items: center;
-      gap: 8px;
-
-      strong {
-        color: var(--text);
-        font-size: 14px;
-      }
-
-      .live-badge {
-        background-color: var(--color-loss);
-        color: white;
-        font-weight: 600;
-        font-size: 10px;
-        padding: 2px 6px;
-        min-height: 20px;
-      }
-    }
-
-    mat-chip {
-      font-size: 12px;
-      text-transform: uppercase;
-    }
-
-    .strategy-row {
-      cursor: pointer;
-      transition: background-color 0.2s ease;
-
-      &:hover {
-        background-color: var(--surface-hover);
-      }
-    }
-
-    .delete-action {
-      color: var(--color-loss);
-    }
-
-    .equity-spark {
-      display: inline-flex;
-      align-items: center;
-      gap: 8px;
-      padding: 4px 6px;
-      border-radius: 4px;
-      cursor: pointer;
-      transition: background-color 0.15s ease;
-
-      &:hover {
-        background-color: var(--surface-hover);
-      }
-
-      .equity-spark-chart {
-        width: 100px;
-        height: 28px;
-      }
-
-      .equity-spark-value {
-        font-size: 12px;
-        font-variant-numeric: tabular-nums;
-        color: var(--text-muted);
-
-        &.profit { color: var(--color-profit); }
-        &.loss { color: var(--color-loss); }
-      }
-    }
-
-    .equity-spark-empty {
-      color: var(--text-faint);
-      font-size: 13px;
-    }
+  .equity-spark-empty {
+    color: var(--text-faint);
+    font-size: var(--fs-sm);
   }
 }
 
 @media (max-width: 960px) {
-  .strategy-list-container .header {
+  .page-header {
     flex-direction: column;
-    align-items: flex-start;
-    gap: 16px;
+    align-items: stretch;
 
-    button {
-      width: 100%;
+    .header-actions button {
+      flex: 1;
     }
   }
 }

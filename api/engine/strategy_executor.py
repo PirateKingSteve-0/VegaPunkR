@@ -22,7 +22,7 @@ from sqlalchemy.orm import Session
 
 from models import User, Strategy, Position
 from engine.risk_manager import RiskManager, RiskCheckResult
-from engine.signal_generator import SignalGenerator, Signal
+from engine.signal_generator import SignalGenerator, Signal, forced_exit_due
 from engine.order_manager import OrderManager, OrderResult
 from utils.market_hours import is_market_open
 
@@ -118,9 +118,17 @@ class StrategyExecutor:
         if market_data.get('option_symbol') and ask > 0:
             current_price = (bid + ask) / 2
 
+        # NOTE: the position price/unrealized-P&L write happens inside
+        # _check_exit_signals, against the price it resolved FOR THE CONTRACT WE
+        # HOLD. Do not add an update_position_prices() call here — `current_price`
+        # above is still the UNDERLYING whenever the option quote is missing
+        # (cold start, or a contract adopted off the broker that was never
+        # streamed), and writing that produced positions marked at $745 with
+        # ~$223k of phantom unrealized P&L. That number then fed the daily-loss
+        # gate and, via _reconcile_position's fallback, became a fake realized
+        # Trade row (incident 2026-08-01, a Saturday).
         try:
             await self._check_exit_signals(user, strategy, symbol, current_price, market_data, results)
-            self.order_manager.update_position_prices(user, strategy, symbol, current_price)
         except Exception as e:
             results['errors'].append(str(e))
             logger.error(f"Exit tick error strategy {strategy.id}: {e}", exc_info=True)
@@ -200,10 +208,10 @@ class StrategyExecutor:
                     user, strategy, symbol, current_price, market_data, results
                 )
 
-            # 5. Update position prices for P&L tracking
-            self.order_manager.update_position_prices(
-                user, strategy, symbol, current_price
-            )
+            # 5. Position prices are marked inside _check_exit_signals, off the
+            # held contract's own quote. `current_price` here is the UNDERLYING —
+            # marking an option position against it is what produced the phantom
+            # $223k unrealized (see the note in execute_exit_tick).
 
             state.error_count = 0  # Reset error count on successful tick
             state.last_error = None
@@ -412,7 +420,39 @@ class StrategyExecutor:
                     if rest_price > 0:
                         exit_price = rest_price
                     else:
-                        continue  # Truly no price available, skip this tick
+                        # No price anywhere. Normally we skip the tick rather than
+                        # evaluate TP/SL against a fiction — but if we are past the
+                        # forced end-of-day exit, skipping means carrying a 0DTE
+                        # overnight, which is strictly worse. close_position sends a
+                        # MARKET order and does not need a quote, so force it through.
+                        eod_reason = forced_exit_due(strategy.params_json, user)
+                        if not eod_reason:
+                            continue  # Truly no price available, skip this tick
+
+                        logger.warning(
+                            f"No price for {option_symbol} at forced-exit time — "
+                            f"closing anyway ({eod_reason})"
+                        )
+                        close_result = await self.order_manager.close_position(
+                            user=user,
+                            strategy=strategy,
+                            position=position,
+                            reason=f"{eod_reason} (unpriced — forced market close)",
+                            option_symbol=position.option_symbol
+                                or market_data.get('option_symbol'),
+                        )
+                        if close_result.success:
+                            results['positions_closed'].append({
+                                'symbol': symbol,
+                                'qty': close_result.filled_qty,
+                                'entry_price': position.avg_entry_price,
+                                'exit_price': close_result.filled_price,
+                                'pnl': close_result.trade.pnl if close_result.trade else None,
+                                'reason': eod_reason,
+                            })
+                        else:
+                            results['errors'].append(close_result.message)
+                        continue
 
             # Update the option's high-water-mark since open. Trailing stops
             # MUST compare against the option price's peak/trough, not the
@@ -422,6 +462,17 @@ class StrategyExecutor:
                 position.peak_price = exit_price
             if position.trough_price is None or exit_price < position.trough_price:
                 position.trough_price = exit_price
+
+            # Mark the position HERE, not in the caller. `exit_price` is the only
+            # price in this loop that is guaranteed to be for position.option_symbol
+            # (streamed bid of the held contract, or REST). The caller's tick price
+            # is the underlying, and marking against it inflates unrealized_pnl by
+            # ~100x the underlying — which the daily-loss gate then reads as real.
+            # Also commits the peak/trough writes above.
+            self.order_manager.update_position_prices(
+                user, strategy, symbol, exit_price,
+                option_symbol=position.option_symbol,
+            )
 
             # Check for exit signal
             exit_signal = self.signal_generator.check_exit_signal(

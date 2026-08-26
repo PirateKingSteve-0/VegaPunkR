@@ -24,7 +24,6 @@ import {
   StreamEvent,
   ConnectionStatus,
 } from '../../services/market-stream.service';
-import { ThemeService } from '../../services/theme.service';
 
 interface TimestampedEvent extends StreamEvent {
   id: number;
@@ -57,7 +56,6 @@ export class StreamDrawerComponent implements OnInit, OnDestroy {
   private streamService = inject(MarketStreamService);
   private cdr = inject(ChangeDetectorRef);
   private zone = inject(NgZone);
-  private themeService = inject(ThemeService);
 
   private subscription?: Subscription;
   private flushTimer: ReturnType<typeof setInterval> | null = null;
@@ -129,15 +127,17 @@ export class StreamDrawerComponent implements OnInit, OnDestroy {
     this.cdr.markForCheck();
   }
 
+  // The dot is a DOM style binding, so it can read the theme tokens directly and
+  // stays correct in dark and colorblind mode without a re-render.
   statusColor(status: ConnectionStatus | null): string {
-    const palette = this.themeService.chartColors();
+    const idle = 'var(--text-faint)';
     const map: Record<ConnectionStatus, string> = {
-      connected: palette.profit,
-      connecting: '#ff9800',
-      disconnected: '#9e9e9e',
-      error: palette.loss,
+      connected: 'var(--color-profit)',
+      connecting: 'var(--color-warning)',
+      disconnected: idle,
+      error: 'var(--color-loss)',
     };
-    return status ? (map[status] ?? '#9e9e9e') : '#9e9e9e';
+    return status ? (map[status] ?? idle) : idle;
   }
 
   statusLabel(status: ConnectionStatus | null): string {

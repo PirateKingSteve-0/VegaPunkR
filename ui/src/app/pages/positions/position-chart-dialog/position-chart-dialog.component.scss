@@ -10,7 +10,7 @@
     display: flex;
     align-items: flex-start;
     justify-content: space-between;
-    padding: 16px 20px 8px;
+    padding: var(--sp-5) var(--sp-5) var(--sp-2);
 
     .title-row {
       display: flex;
@@ -19,22 +19,24 @@
 
       h2 {
         margin: 0;
-        font-size: 22px;
-        font-weight: 500;
+        font-size: var(--fs-lg);
+        font-weight: var(--fw-semibold);
+        letter-spacing: var(--ls-tight);
+        font-family: var(--font-mono);
       }
 
       .meta {
-        font-size: 13px;
+        font-size: var(--fs-sm);
         color: var(--text-muted);
       }
     }
   }
 
   .range-row {
-    padding: 0 20px 12px;
+    padding: 0 var(--sp-5) var(--sp-3);
     display: flex;
     flex-wrap: wrap;
-    gap: 12px;
+    gap: var(--sp-3);
     align-items: center;
 
     .mode-group {
@@ -45,10 +47,11 @@
   .chart-host {
     position: relative;
     flex: 1;
-    margin: 0 20px 20px;
-    border: 1px solid rgba(0, 0, 0, 0.08);
-    border-radius: 8px;
+    margin: 0 var(--sp-5) var(--sp-5);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
     overflow: hidden;
+    background: var(--surface);
 
     .chart-canvas {
       width: 100%;
@@ -62,15 +65,21 @@
       flex-direction: column;
       align-items: center;
       justify-content: center;
-      background: rgba(255, 255, 255, 0.7);
-      gap: 8px;
+      // Theme-aware scrim: the old rgba(255,255,255,.7) went opaque-white over
+      // the dark chart.
+      background: var(--surface);
+      opacity: 0.82;
+      gap: var(--sp-2);
+      color: var(--text-muted);
 
       &.error {
-        color: #b00020;
+        color: var(--color-loss);
+        opacity: 1;
+
         mat-icon {
-          font-size: 36px;
-          width: 36px;
-          height: 36px;
+          font-size: 32px;
+          width: 32px;
+          height: 32px;
         }
       }
     }

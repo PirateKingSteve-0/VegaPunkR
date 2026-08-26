@@ -1,13 +1,18 @@
 <div class="overview-container">
-  <div class="header">
-    <h1>Dashboard Overview</h1>
-    <button mat-raised-button color="primary" (click)="refresh()" [disabled]="loading()">
-      <mat-icon>refresh</mat-icon>
-      Refresh
-    </button>
+  <div class="page-header">
+    <div>
+      <h1>Overview</h1>
+      <div class="page-subtitle">Account-wide position, risk and session state.</div>
+    </div>
+    <div class="header-actions">
+      <button mat-stroked-button (click)="refresh()" [disabled]="loading()">
+        <mat-icon>refresh</mat-icon>
+        Refresh
+      </button>
+    </div>
   </div>
 
-  <div *ngIf="error()" class="error-message">
+  <div *ngIf="error()" class="banner banner-error">
     <mat-icon>error</mat-icon>
     {{ error() }}
   </div>
@@ -62,11 +67,11 @@
     <mat-card *ngFor="let stat of stats; let i = index" class="stat-card">
       <mat-card-content>
         <div class="stat-content">
-          <mat-icon [color]="i === 3 ? pnlColor() : stat.color" class="stat-icon">{{ stat.icon }}</mat-icon>
           <div class="stat-info">
             <div class="stat-label">{{ stat.label }}</div>
             <div class="stat-value">{{ stat.value() }}</div>
           </div>
+          <mat-icon [color]="i === 3 ? pnlColor() : stat.color" class="stat-icon">{{ stat.icon }}</mat-icon>
         </div>
       </mat-card-content>
     </mat-card>

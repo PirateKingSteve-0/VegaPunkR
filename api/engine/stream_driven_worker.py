@@ -420,10 +420,14 @@ class StreamDrivenWorker:
                             # This is the single source of truth — once a position
                             # is open we ONLY look for exits; once it's gone we
                             # look for a new entry.
+                            # At most one row should be open (the entry lockout
+                            # is per-underlying), but rows are now per-contract —
+                            # order explicitly so a duplicate can never be picked
+                            # non-deterministically between ticks.
                             open_pos = db.query(Position).filter(
                                 Position.strategy_id == strategy_id,
                                 Position.qty > 0,
-                            ).first()
+                            ).order_by(Position.id.desc()).first()
 
                             if open_pos:
                                 result = await executor.execute_exit_tick(
@@ -513,6 +517,67 @@ class StreamDrivenWorker:
             raise RuntimeError(f"reconcile: user for strategy {strategy_id} not found")
         return trading_manager.get_client(user)
 
+    @staticmethod
+    def _position_for_contract(db, strategy_id: int, underlying: str, occ: str):
+        """The Position row for exactly this contract, created if absent.
+
+        One row per (user, strategy, underlying, contract) — never one row per
+        ticker. Both recovery paths below used to grab "the strategy's position
+        row" and overwrite its `option_symbol`, which is how a single SPY row came
+        to carry 1,922 trades across every strike ever held and why no historical
+        trade could be attributed to the contract it actually closed.
+        """
+        strat = db.query(Strategy).filter(Strategy.id == strategy_id).first()
+        if strat is None:
+            return None
+        pos = db.query(Position).filter(
+            Position.user_id == strat.user_id,
+            Position.strategy_id == strategy_id,
+            Position.symbol == underlying,
+            Position.option_symbol == occ,
+        ).first()
+        if pos is None:
+            pos = Position(
+                user_id=strat.user_id,
+                strategy_id=strategy_id,
+                symbol=underlying,
+                option_symbol=occ,
+                qty=0,
+                avg_entry_price=0.0,
+                current_price=0.0,
+                unrealized_pnl=0.0,
+                opened_at=datetime.utcnow(),
+            )
+            db.add(pos)
+            db.flush()   # assign an id without ending the caller's transaction
+            logger.info(
+                f"Strategy {strategy_id}: created position row for {occ} (id={pos.id})"
+            )
+        return pos
+
+    @staticmethod
+    def _flatten_other_contracts(db, strategy_id: int, keep_position_id) -> int:
+        """Zero every OPEN position row for this strategy except `keep_position_id`.
+
+        The broker is the authority on what we hold. With per-contract rows, a
+        stale open row for a contract the broker no longer shows would give the
+        worker's `open_pos` lookup two candidates and it would manage the wrong
+        one. Returns how many rows were zeroed.
+        """
+        stale = db.query(Position).filter(
+            Position.strategy_id == strategy_id,
+            Position.qty > 0,
+            Position.id != (keep_position_id or -1),
+        ).all()
+        for row in stale:
+            logger.warning(
+                f"Strategy {strategy_id}: zeroing stale open row id={row.id} "
+                f"({row.option_symbol}) — broker does not hold it"
+            )
+            row.qty = 0
+            row.unrealized_pnl = 0.0
+        return len(stale)
+
     async def _startup_sync(
         self,
         strategy_id: int,
@@ -542,10 +607,6 @@ class StreamDrivenWorker:
                 and float(p.get("quantity", 0)) > 0
             ]
 
-            db_pos = db.query(Position).filter(
-                Position.strategy_id == strategy_id,
-            ).first()
-
             if held:
                 tradier_pos = held[0]
                 occ_symbol = tradier_pos["symbol"]
@@ -553,39 +614,49 @@ class StreamDrivenWorker:
                 cost_basis = float(tradier_pos.get("cost_basis", 0))
                 entry_price = cost_basis / (qty * 100) if qty > 0 else 0.0
 
-                if db_pos:
-                    db_pos.qty = qty
-                    db_pos.option_symbol = occ_symbol
-                    if entry_price > 0:
-                        db_pos.avg_entry_price = entry_price
-                else:
-                    # No DB record at all — log and skip; position will be created
-                    # properly when the next entry fires through our normal flow
-                    logger.warning(
-                        f"Strategy {strategy_id}: Tradier has {occ_symbol} but no DB "
-                        "position record exists — cannot resume automatically"
+                # Find-or-CREATE the row for the contract the broker actually
+                # holds. Previously this grabbed whatever row the strategy had and
+                # rewrote its option_symbol — and when no row existed at all it
+                # gave up ("cannot resume automatically"), leaving a real broker
+                # position unmanaged. Both are fixed by keying on the contract.
+                db_pos = self._position_for_contract(db, strategy_id, underlying, occ_symbol)
+                if db_pos is None:
+                    logger.error(
+                        f"Strategy {strategy_id}: cannot resolve strategy row — "
+                        f"skipping startup sync for {occ_symbol}"
                     )
-                    state.option_symbol = occ_symbol
                     return
+
+                db_pos.qty = qty
+                if entry_price > 0:
+                    db_pos.avg_entry_price = entry_price
+                    if not db_pos.current_price:
+                        db_pos.current_price = entry_price
+
+                # The broker holds exactly this contract, so nothing else is open.
+                self._flatten_other_contracts(db, strategy_id, db_pos.id)
 
                 db.commit()
                 state.option_symbol = occ_symbol
                 logger.info(
                     f"Strategy {strategy_id}: synced from Tradier — "
-                    f"{occ_symbol} qty={qty} entry=${entry_price:.2f}"
+                    f"{occ_symbol} qty={qty} entry=${entry_price:.2f} (position id={db_pos.id})"
                 )
 
             else:
-                # No position in Tradier — zero out DB if stale
-                if db_pos and db_pos.qty > 0:
+                # No position in Tradier — zero out every open row, not just one.
+                open_rows = db.query(Position).filter(
+                    Position.strategy_id == strategy_id,
+                    Position.qty > 0,
+                ).all()
+                for db_pos in open_rows:
                     closed_contract = db_pos.option_symbol
                     logger.info(
-                        f"Strategy {strategy_id}: DB shows open position but "
+                        f"Strategy {strategy_id}: DB shows {closed_contract} open but "
                         "Tradier has none — clearing (was manually closed)"
                     )
                     db_pos.qty = 0
                     db_pos.unrealized_pnl = 0.0
-                    db.commit()
 
                     log_event(
                         db=db,
@@ -600,6 +671,8 @@ class StreamDrivenWorker:
                             "detected_at": "startup_sync",
                         },
                     )
+                if open_rows:
+                    db.commit()
 
         except Exception as e:
             logger.warning(f"Startup Tradier sync failed for strategy {strategy_id}: {e}")
@@ -628,16 +701,17 @@ class StreamDrivenWorker:
 
         # Pick up any row for this strategy regardless of qty so we can detect
         # the inverse-drift case (broker has contracts, DB shows flat).
+        # The OPEN row, if any. With per-contract rows there can be several rows
+        # for a strategy but at most one should be open — the entry lockout
+        # guarantees it. Ordered so a duplicate can never be picked at random.
         position = db.query(Position).filter(
             Position.strategy_id == strategy_id,
+            Position.qty > 0,
         ).order_by(Position.id.desc()).first()
-
-        if not position:
-            return  # no row at all to anchor against
 
         # If DB is flat, look at the broker — if the broker holds something
         # for this underlying, adopt it so the executor stops missing exits.
-        if position.qty <= 0:
+        if position is None:
             try:
                 client = self._tradier_client_for(strategy_id, db)
                 tradier_positions = await asyncio.to_thread(client.get_positions)
@@ -654,24 +728,38 @@ class StreamDrivenWorker:
                     qty = int(float(tradier_pos.get("quantity", 1)))
                     cost_basis = float(tradier_pos.get("cost_basis", 0))
                     entry_price = cost_basis / (qty * 100) if qty > 0 else 0.0
-                    position.qty = qty
-                    position.option_symbol = occ
+
+                    # Adopt into the row for THIS contract, creating it if needed —
+                    # never by rewriting some other contract's row.
+                    adopted = self._position_for_contract(
+                        db, strategy_id, underlying, occ
+                    )
+                    if adopted is None:
+                        logger.error(
+                            f"Strategy {strategy_id}: cannot resolve strategy row — "
+                            f"skipping adoption of {occ}"
+                        )
+                        return
+                    adopted.qty = qty
                     if entry_price > 0:
-                        position.avg_entry_price = entry_price
-                    position.opened_at = datetime.utcnow()
+                        adopted.avg_entry_price = entry_price
+                        if not adopted.current_price:
+                            adopted.current_price = entry_price
+                    adopted.opened_at = datetime.utcnow()
+                    self._flatten_other_contracts(db, strategy_id, adopted.id)
                     db.commit()
                     state.option_symbol = occ
                     logger.warning(
                         f"Strategy {strategy_id}: broker held {occ} qty={qty} "
-                        f"while DB was flat — adopting broker truth"
+                        f"while DB was flat — adopting broker truth (position id={adopted.id})"
                     )
                     log_event(
                         db=db,
-                        user_id=position.user_id,
+                        user_id=adopted.user_id,
                         event_type="POSITION_ADOPTED_FROM_BROKER",
                         title=f"Adopted untracked position: {occ}",
                         detail=f"Broker held {qty} contracts not tracked locally — adopted.",
-                        symbol=position.symbol,
+                        symbol=adopted.symbol,
                         strategy_id=strategy_id,
                         severity="warning",
                         event_data={"option_symbol": occ, "qty": qty},
@@ -680,7 +768,11 @@ class StreamDrivenWorker:
                 logger.warning(f"Inverse-drift reconcile failed for strategy {strategy_id}: {e}")
             return
 
-        contract = state.option_symbol or position.option_symbol
+        # The POSITION's contract wins over the armed one. `state.option_symbol`
+        # is whatever is currently armed, which diverges from what we hold every
+        # time the engine reselects a strike (the 2026-07-14 mispricing). Now that
+        # the row names exactly one contract, it is the authority on what we own.
+        contract = position.option_symbol or state.option_symbol
         if not contract:
             return  # can't identify the contract
 
@@ -694,13 +786,16 @@ class StreamDrivenWorker:
             }
             tradier_qty = held.get(contract, 0)
 
+            # Options trade in 100-share contracts. Hoisted above the branches:
+            # both the full-close and the partial-close path need it.
+            multiplier = 100 if is_option_symbol(position.option_symbol or position.symbol) else 1
+
             if tradier_qty <= 0:
                 logger.warning(
                     f"Strategy {strategy_id}: {contract} not found in Tradier — "
                     "position was manually closed externally"
                 )
                 qty_closed = position.qty
-                multiplier = 100 if is_option_symbol(position.option_symbol or position.symbol) else 1
 
                 # Ask the broker what it actually filled the close at. Without this we
                 # fall back to the last streamed quote, which is a guess — and on
@@ -710,12 +805,9 @@ class StreamDrivenWorker:
                 if fill:
                     exit_price, filled_qty, price_source = fill[0], fill[1], "broker_fill"
                 else:
-                    exit_price = position.current_price or position.avg_entry_price
                     filled_qty = qty_closed
-                    price_source = "approx_streamed_quote"
-                    logger.warning(
-                        f"No broker close-fill found for {contract} — recording exit at "
-                        f"last streamed price {exit_price} (approximate)"
+                    exit_price, price_source = await self._fallback_exit_price(
+                        client, position, contract, state
                     )
 
                 approx_pnl = (exit_price - position.avg_entry_price) * filled_qty * multiplier
@@ -772,6 +864,7 @@ class StreamDrivenWorker:
                         pnl=approx_pnl,
                         strategy_name="Manual close (broker)",
                         option_symbol=contract,
+                        entry_price=position.avg_entry_price,
                     )
                 except Exception as e:
                     logger.warning(f"Discord notify (manual close) failed: {e}")
@@ -786,9 +879,12 @@ class StreamDrivenWorker:
                     f"local={position.qty} tradier={tradier_qty} (partial manual close)"
                 )
                 position.qty = tradier_qty
+                # 100x multiplier, same as every other unrealized-P&L write in
+                # the engine — without it a partial manual close silently
+                # under-reported the remaining leg by 100x.
                 position.unrealized_pnl = (
                     (position.current_price or position.avg_entry_price) - position.avg_entry_price
-                ) * tradier_qty
+                ) * tradier_qty * multiplier
                 db.commit()
 
                 log_event(
@@ -969,6 +1065,82 @@ class StreamDrivenWorker:
                 )
         except Exception as e:
             logger.warning(f"Resolving unconfirmed orders failed for {strategy_id}: {e}")
+
+    @staticmethod
+    def _price_is_plausible_premium(price: float, underlying_price: float) -> bool:
+        """Reject an option 'price' that is really the UNDERLYING's price.
+
+        The engine trades 0DTE contracts in the 0.30–0.90 delta band; such a
+        contract is worth single-digit dollars against an underlying in the
+        hundreds. A premium at a quarter of the underlying's price is not a
+        premium — it is the underlying leaking through a path that failed to
+        resolve the option quote. That contamination is what turned a $2.23
+        SPY contract into a $223k "close" on Sat 2026-08-01, and the number
+        went straight into the daily-loss gate.
+
+        Returns True when the underlying price is unknown — no basis to reject.
+        """
+        if price <= 0:
+            return False
+        if underlying_price <= 0:
+            return True
+        return price < underlying_price * 0.25
+
+    async def _fallback_exit_price(
+        self, client, position, contract: str, state: "StrategyMarketState"
+    ) -> tuple:
+        """Best available exit price when the broker has no close-fill on record
+        (e.g. the close happened in a previous session — Tradier's /orders only
+        covers the current one). Returns (price, source).
+
+        Ordered most- to least-trustworthy. Every candidate is sanity-checked
+        against the underlying so a contaminated mark can never be recorded as a
+        realized fill. If nothing survives, we book the exit AT COST (P&L 0) and
+        log an error rather than invent a number — an obviously-flagged zero is
+        recoverable, a five-figure phantom silently disables the loss cap.
+        """
+        underlying = state.underlying_price or 0.0
+        entry = position.avg_entry_price or 0.0
+
+        # 1. Ask the broker what the contract is worth right now.
+        try:
+            quotes = await asyncio.to_thread(client.get_quotes, [contract])
+            q = quotes[0] if quotes else {}
+            bid = float(q.get("bid") or 0)
+            ask = float(q.get("ask") or 0)
+            rest_price = (bid + ask) / 2 if ask > 0 else float(q.get("last") or 0)
+            if self._price_is_plausible_premium(rest_price, underlying):
+                return rest_price, "rest_quote"
+            # A zero quote on an EXPIRED contract is not missing data — the
+            # contract expired worthless and the loss is the full premium. This
+            # is the outcome when an EOD exit fails to fire and a 0DTE is held
+            # past the bell, so it must be booked, not swallowed.
+            if rest_price <= 0 and _contract_expired(contract):
+                logger.warning(
+                    f"{contract} expired and quotes zero — booking exit at $0 "
+                    "(expired worthless)"
+                )
+                return 0.0, "expired_worthless"
+        except Exception as e:
+            logger.warning(f"REST quote for {contract} failed during reconcile: {e}")
+
+        # 2. Our own last mark. Trustworthy only because _check_exit_signals now
+        #    marks positions off the held contract's quote, never the underlying.
+        marked = position.current_price or 0.0
+        if self._price_is_plausible_premium(marked, underlying):
+            logger.warning(
+                f"No broker close-fill and no REST quote for {contract} — "
+                f"recording exit at last mark {marked} (approximate)"
+            )
+            return marked, "approx_streamed_quote"
+
+        # 3. Nothing usable. Book flat and shout.
+        logger.error(
+            f"No trustworthy exit price for {contract} "
+            f"(rest/mark rejected against underlying={underlying}, entry={entry}) — "
+            "recording exit AT COST so P&L is not fabricated; reconcile manually"
+        )
+        return entry, "unknown_booked_at_cost"
 
     async def _broker_close_fill(self, client, contract: str) -> Optional[tuple]:
         """The broker's actual closing fill for `contract`: (price, qty), or None.

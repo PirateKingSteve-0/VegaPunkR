@@ -1,3 +1,6 @@
+// Settings drawer (a MatDialog pinned to the right edge — see
+// .settings-drawer-panel in styles.scss).
+
 :host {
   display: flex;
   flex-direction: column;
@@ -8,13 +11,14 @@
 h2 {
   display: flex;
   align-items: center;
-  gap: 0.5rem;
+  gap: var(--sp-2);
   margin: 0;
+  font-size: var(--fs-lg);
   color: var(--text);
   flex-shrink: 0;
 
   .title-icon {
-    color: var(--primary);
+    color: var(--text-faint);
   }
 }
 
@@ -27,24 +31,28 @@ mat-dialog-content {
 mat-dialog-actions {
   flex-shrink: 0;
   border-top: 1px solid var(--border);
-  padding: 0.75rem 1rem;
+  padding: var(--sp-3) var(--sp-4);
+  gap: var(--sp-2);
 }
 
 .section-title {
-  font-size: 0.95rem;
-  margin: 0.5rem 0 0.75rem;
-  color: var(--text);
+  font-size: var(--fs-micro);
+  font-weight: var(--fw-semibold);
+  text-transform: uppercase;
+  letter-spacing: var(--ls-eyebrow);
+  color: var(--text-faint);
+  margin: var(--sp-5) 0 var(--sp-3);
 }
 
 .section-hint {
   color: var(--text-muted);
-  font-size: 0.8rem;
-  margin: 0 0 0.75rem;
-  line-height: 1.4;
+  font-size: var(--fs-xs);
+  margin: 0 0 var(--sp-3);
+  line-height: 1.45;
 }
 
 .section-divider {
-  margin: 1.25rem 0 1rem;
+  margin: var(--sp-5) 0 var(--sp-4);
 }
 
 .full-width {
@@ -52,16 +60,16 @@ mat-dialog-actions {
 }
 
 .row {
-  margin-bottom: 0.75rem;
+  margin-bottom: var(--sp-3);
 
   &.disabled {
-    opacity: 0.55;
+    opacity: 0.5;
   }
 }
 
 .time-row {
   display: flex;
-  gap: 0.75rem;
+  gap: var(--sp-3);
 
   mat-form-field {
     flex: 1 1 0;
@@ -71,39 +79,42 @@ mat-dialog-actions {
 .toggles {
   display: flex;
   flex-direction: column;
-  gap: 0.5rem;
+  gap: var(--sp-2);
 }
 
 .checkboxes {
   display: flex;
   flex-direction: column;
-  gap: 0.4rem;
+  gap: var(--sp-1);
 
   .cb-hint {
     color: var(--text-muted);
-    font-size: 0.78rem;
-    margin-left: 0.25rem;
+    font-size: var(--fs-xs);
+    margin-left: var(--sp-1);
   }
 }
 
 .test-row {
   display: flex;
   align-items: center;
-  gap: 0.75rem;
+  gap: var(--sp-3);
   flex-wrap: wrap;
 
   .test-hint {
     color: var(--text-muted);
-    font-size: 0.78rem;
+    font-size: var(--fs-xs);
   }
 }
 
-.result-row {
-  margin-top: 0.5rem;
-  padding: 0.5rem 0.75rem;
-  border-radius: 4px;
-  font-size: 0.85rem;
+.result-row,
+.error-row {
+  margin-top: var(--sp-2);
+  padding: var(--sp-2) var(--sp-3);
+  border-radius: var(--radius-sm);
+  font-size: var(--fs-sm);
+}
 
+.result-row {
   &.success {
     background: var(--color-profit-bg);
     color: var(--color-profit-strong);
@@ -115,19 +126,15 @@ mat-dialog-actions {
   }
 }
 
+.error-row {
+  background: var(--color-error-bg);
+  color: var(--color-error-fg);
+}
+
 .loading-row {
   display: flex;
   justify-content: center;
-  padding: 1.5rem 0;
-}
-
-.error-row {
-  margin-top: 0.5rem;
-  padding: 0.5rem 0.75rem;
-  background: var(--color-error-bg);
-  color: var(--color-error-fg);
-  border-radius: 4px;
-  font-size: 0.85rem;
+  padding: var(--sp-6) 0;
 }
 
 mat-dialog-actions button mat-spinner {

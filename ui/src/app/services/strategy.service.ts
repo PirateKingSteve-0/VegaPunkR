@@ -3,6 +3,7 @@ import { HttpClient, HttpHeaders, HttpParams } from '@angular/common/http';
 import { Observable } from 'rxjs';
 import { Strategy, StrategyTemplate, CreateStrategyRequest, UpdateStrategyRequest } from '../models/strategy.model';
 import { AuthService } from './auth.service';
+import { ResolvedRange } from '../models/date-range';
 
 @Injectable({
   providedIn: 'root'
@@ -91,10 +92,20 @@ export class StrategyService {
    * 2026-07-13 it reported -21,057 for a day that actually lost -1,851 — and it is
    * paginated, so a busy day was truncated on top of being wrong.
    */
-  getClosedTrades(period: string): Observable<ClosedTrade[]> {
+  /**
+   * Closed trades for a resolved reporting range.
+   *
+   * Sends explicit ISO bounds rather than a named period, so any range works —
+   * including ones the old `DAY|WEEK|MONTH|...` enum had no name for. `period`
+   * is still accepted by the API for older callers.
+   */
+  getClosedTrades(range: ResolvedRange): Observable<ClosedTrade[]> {
+    let params = new HttpParams().set('period', range.id);
+    if (range.start) params = params.set('start', range.start.toISOString());
+    params = params.set('end', range.end.toISOString());
     return this.http.get<ClosedTrade[]>(`${this.apiUrl}/performance/closed-trades`, {
       headers: this.getHeaders(),
-      params: new HttpParams().set('period', period),
+      params,
     });
   }
 }

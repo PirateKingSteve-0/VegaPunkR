@@ -5,7 +5,7 @@ from typing import List, Optional
 from fastapi import APIRouter, Depends, HTTPException, status, Query
 from sqlalchemy.orm import Session
 from sqlalchemy import func
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import math
 
 from database import get_db
@@ -115,6 +115,41 @@ def get_equity_curves(
     return result
 
 
+def _iso_utc(dt: Optional[datetime]) -> Optional[str]:
+    """ISO-8601 with an explicit +00:00.
+
+    `Trade.exit_timestamp` is stored naive-UTC, and a bare `.isoformat()` emits
+    no offset. JavaScript parses an offset-less date-time as *local* time, so
+    every timestamp reached the UI shifted by the viewer's UTC offset — seven
+    hours in America/Los_Angeles. Invisible while the UI only used the date part;
+    badly wrong the moment anything plots the time of day.
+    """
+    if dt is None:
+        return None
+    return dt.replace(tzinfo=timezone.utc).isoformat()
+
+
+def _parse_bound(value: Optional[str]) -> Optional[datetime]:
+    """Parse an ISO-8601 bound from the UI into naive UTC for comparison.
+
+    The column is naive-UTC, so an aware value must be converted and stripped
+    rather than compared directly (Postgres and SQLAlchemy both refuse to
+    compare aware and naive datetimes).
+    """
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid ISO-8601 datetime: {value!r}",
+        )
+    if parsed.tzinfo is not None:
+        parsed = parsed.astimezone(timezone.utc).replace(tzinfo=None)
+    return parsed
+
+
 def _period_cutoff(period: str) -> Optional[datetime]:
     """Naive-UTC lower bound for a UI period. Returns None for ALL (no bound).
 
@@ -136,6 +171,8 @@ def _period_cutoff(period: str) -> Optional[datetime]:
 @router.get("/closed-trades")
 def get_closed_trades(
     period: str = Query("MONTH", description="DAY|WEEK|MONTH|YTD|YEAR|YEAR_3|YEAR_5|ALL"),
+    start: Optional[str] = Query(None, description="ISO-8601 inclusive lower bound. Overrides `period`."),
+    end: Optional[str] = Query(None, description="ISO-8601 exclusive upper bound."),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -153,7 +190,16 @@ def get_closed_trades(
     A Trade row pairs each exit with the entry that opened it, recorded at the moment it
     happened — so the pairing is correct by construction and needs no lot matching.
     """
-    cutoff = _period_cutoff(period)
+    # Explicit bounds win. `period` stays for older callers and is resolved the
+    # same way it always was; the UI now sends real dates so any range works,
+    # not just the seven the enum happened to name.
+    lower = _parse_bound(start) if start else _period_cutoff(period)
+    upper = _parse_bound(end)
+    if lower is not None and upper is not None and upper <= lower:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="`end` must be after `start`.",
+        )
 
     q = (
         db.query(Trade, Position)
@@ -165,8 +211,10 @@ def get_closed_trades(
             Trade.exit_timestamp.isnot(None),
         )
     )
-    if cutoff is not None:
-        q = q.filter(Trade.exit_timestamp >= cutoff)
+    if lower is not None:
+        q = q.filter(Trade.exit_timestamp >= lower)
+    if upper is not None:
+        q = q.filter(Trade.exit_timestamp < upper)
 
     rows: List[dict] = []
     for trade, position in q.order_by(Trade.exit_timestamp.desc()).all():
@@ -181,8 +229,8 @@ def get_closed_trades(
         opened_at = (position.opened_at if position and position.opened_at else trade.timestamp)
 
         rows.append({
-            "close_date": trade.exit_timestamp.isoformat(),
-            "open_date": (opened_at or trade.exit_timestamp).isoformat(),
+            "close_date": _iso_utc(trade.exit_timestamp),
+            "open_date": _iso_utc(opened_at or trade.exit_timestamp),
             "cost": round(cost, 2),
             "proceeds": round(proceeds, 2),
             "gain_loss": round(pnl, 2),

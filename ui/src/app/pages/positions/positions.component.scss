@@ -1,66 +1,39 @@
-.positions-container {
-  padding: 24px;
+// Page padding comes from the shell's .content-wrapper; the container adds none.
+// Table chrome, empty states and the page header all come from styles.scss.
 
-  .header {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    gap: 12px;
-    margin-bottom: 24px;
+.page-header .subtitle {
+  font-size: var(--fs-sm);
+  color: var(--text-faint);
+}
 
-    h1 { margin: 0; }
+.positions-table {
+  width: 100%;
 
-    .subtitle {
-      font-size: 13px;
-      color: var(--text-faint);
-    }
+  .profit {
+    color: var(--color-profit);
+    font-weight: var(--fw-medium);
+    font-variant-numeric: tabular-nums;
   }
 
-  mat-card {
-    .empty-state {
-      text-align: center;
-      padding: 64px 24px;
-      color: var(--text-muted);
+  .loss {
+    color: var(--color-loss);
+    font-weight: var(--fw-medium);
+    font-variant-numeric: tabular-nums;
+  }
 
-      mat-icon {
-        font-size: 64px;
-        width: 64px;
-        height: 64px;
-        margin-bottom: 16px;
-        opacity: 0.5;
-      }
+  // Symbols read as instrument identifiers, not prose.
+  .mat-column-symbol {
+    font-family: var(--font-mono);
+    font-weight: var(--fw-semibold);
+    font-size: var(--fs-sm);
+    letter-spacing: -0.01em;
+  }
 
-      p {
-        margin: 8px 0;
-      }
+  .position-row {
+    cursor: pointer;
 
-      .subtitle {
-        font-size: 14px;
-        opacity: 0.7;
-      }
-    }
-
-    .positions-table {
-      width: 100%;
-
-      .profit {
-        color: var(--color-profit);
-        font-weight: 500;
-      }
-
-      .loss {
-        color: var(--color-loss);
-        font-weight: 500;
-      }
-
-      .position-row {
-        cursor: pointer;
-        transition: background-color 120ms ease;
-
-        &:hover {
-          background-color: var(--surface-hover);
-        }
-      }
+    &:hover {
+      background-color: var(--surface-hover);
     }
   }
 }

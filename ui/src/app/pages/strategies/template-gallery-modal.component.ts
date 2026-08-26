@@ -35,22 +35,25 @@ import { StrategyTemplate } from '../../models/strategy.model';
     h2[mat-dialog-title] {
       display: flex;
       align-items: center;
-      gap: 12px;
+      gap: var(--sp-3);
       margin: 0;
-      padding: 20px 24px;
+      padding: var(--sp-5) var(--sp-6);
+      font-size: var(--fs-lg);
+      font-weight: var(--fw-semibold);
+      letter-spacing: var(--ls-tight);
       border-bottom: 1px solid var(--border);
     }
 
     mat-dialog-content {
-      padding: 24px;
+      padding: var(--sp-6);
       max-height: calc(90vh - 180px);
       overflow-y: auto;
     }
 
     .subtitle {
       color: var(--text-muted);
-      margin-bottom: 24px;
-      font-size: 14px;
+      margin-bottom: var(--sp-6);
+      font-size: var(--fs-sm);
     }
 
     .loading-container {
@@ -58,66 +61,67 @@ import { StrategyTemplate } from '../../models/strategy.model';
       flex-direction: column;
       align-items: center;
       justify-content: center;
-      padding: 60px 0;
-      gap: 16px;
+      padding: var(--sp-16) 0;
+      gap: var(--sp-4);
     }
 
     .templates-grid {
       display: grid;
-      grid-template-columns: repeat(auto-fill, minmax(350px, 1fr));
-      gap: 20px;
+      grid-template-columns: repeat(auto-fill, minmax(330px, 1fr));
+      gap: var(--sp-4);
     }
 
+    /* Flat: hover firms up the border instead of lifting the card. */
     .template-card {
       position: relative;
       display: flex;
       flex-direction: column;
-      transition: transform 0.2s, box-shadow 0.2s;
-      border: 2px solid transparent;
+      transition: border-color var(--dur) var(--ease);
     }
 
     .template-card:hover {
-      transform: translateY(-4px);
-      box-shadow: 0 8px 16px rgba(0, 0, 0, 0.15);
+      border-color: var(--border-strong);
     }
 
     .template-card.recommended {
-      border-color: #ff9800;
+      border-color: var(--color-warning);
     }
 
     .recommended-badge {
       position: absolute;
-      top: 12px;
-      right: 12px;
-      background: linear-gradient(135deg, #ff9800 0%, #f57c00 100%);
-      color: white;
-      padding: 4px 12px;
-      border-radius: 12px;
-      font-size: 11px;
-      font-weight: 600;
+      top: var(--sp-3);
+      right: var(--sp-3);
+      background: var(--color-warning-bg);
+      color: var(--color-warning-strong);
+      padding: 2px var(--sp-2);
+      border-radius: var(--radius-pill);
+      font-size: var(--fs-micro);
+      font-weight: var(--fw-semibold);
+      text-transform: uppercase;
+      letter-spacing: var(--ls-eyebrow);
       display: flex;
       align-items: center;
-      gap: 4px;
+      gap: var(--sp-1);
       z-index: 1;
     }
 
     .recommended-badge mat-icon {
-      font-size: 14px;
-      width: 14px;
-      height: 14px;
+      font-size: 13px;
+      width: 13px;
+      height: 13px;
     }
 
     mat-card-header {
       display: flex;
       align-items: center;
-      gap: 12px;
-      margin-bottom: 16px;
+      gap: var(--sp-3);
+      margin-bottom: var(--sp-4);
     }
 
     .template-icon {
-      width: 48px;
-      height: 48px;
-      border-radius: 50%;
+      width: 38px;
+      height: 38px;
+      border-radius: var(--radius-sm);
       display: flex;
       align-items: center;
       justify-content: center;
@@ -125,106 +129,110 @@ import { StrategyTemplate } from '../../models/strategy.model';
     }
 
     .template-icon mat-icon {
-      font-size: 28px;
-      width: 28px;
-      height: 28px;
+      font-size: 20px;
+      width: 20px;
+      height: 20px;
     }
 
+    /* Difficulty is a tinted glyph, not a saturated disc. */
     .icon-beginner {
-      background: var(--color-profit);
-      color: white;
+      background: var(--color-profit-bg);
+      color: var(--color-profit-strong);
     }
 
     .icon-intermediate {
-      background: linear-gradient(135deg, #2196f3 0%, #1976d2 100%);
-      color: white;
+      background: var(--primary-bg);
+      color: var(--primary);
     }
 
     .icon-advanced {
-      background: var(--color-loss);
-      color: white;
+      background: var(--color-loss-bg);
+      color: var(--color-loss-strong);
     }
 
     mat-card-title {
-      font-size: 18px;
-      font-weight: 600;
+      font-size: var(--fs-md);
+      font-weight: var(--fw-semibold);
+      letter-spacing: var(--ls-tight);
       margin: 0;
     }
 
     mat-card-subtitle {
-      font-size: 13px;
+      font-size: var(--fs-xs);
       color: var(--text-muted);
-      margin-top: 4px;
+      margin-top: 2px;
     }
 
     .description {
-      font-size: 14px;
+      font-size: var(--fs-sm);
       color: var(--text-muted);
-      line-height: 1.5;
-      margin-bottom: 16px;
-      min-height: 60px;
+      line-height: 1.55;
+      margin-bottom: var(--sp-4);
+      min-height: 58px;
     }
 
     .template-details {
       display: grid;
       grid-template-columns: 1fr 1fr;
-      gap: 10px;
-      margin-bottom: 16px;
+      gap: var(--sp-2);
+      margin-bottom: var(--sp-4);
     }
 
     .detail-row {
       display: flex;
       align-items: center;
-      gap: 8px;
-      font-size: 13px;
+      gap: var(--sp-2);
+      font-size: var(--fs-xs);
       color: var(--text-muted);
     }
 
     .detail-icon {
-      font-size: 18px;
-      width: 18px;
-      height: 18px;
+      font-size: 16px;
+      width: 16px;
+      height: 16px;
       color: var(--text-faint);
     }
 
     .tags {
       display: flex;
       flex-wrap: wrap;
-      gap: 6px;
-      margin-bottom: 12px;
+      gap: var(--sp-1);
+      margin-bottom: var(--sp-3);
     }
 
     mat-chip {
-      font-size: 11px;
-      min-height: 24px;
-      padding: 4px 8px;
+      font-size: var(--fs-micro);
+      min-height: 22px;
+      padding: 2px var(--sp-2);
     }
 
     .difficulty-chip {
-      font-weight: 600;
+      font-weight: var(--fw-semibold);
+      text-transform: uppercase;
+      letter-spacing: var(--ls-eyebrow);
     }
 
     .difficulty-beginner {
       background-color: var(--color-profit-bg);
-      color: var(--color-profit);
+      color: var(--color-profit-strong);
     }
 
     .difficulty-intermediate {
-      background-color: rgba(25, 118, 210, 0.14);
+      background-color: var(--primary-bg);
       color: var(--primary);
     }
 
     .difficulty-advanced {
       background-color: var(--color-loss-bg);
-      color: var(--color-loss);
+      color: var(--color-loss-strong);
     }
 
     mat-card-actions {
       display: flex;
-      gap: 8px;
+      gap: var(--sp-2);
       justify-content: flex-end;
       margin-top: auto;
-      padding: 16px;
+      padding: var(--sp-4);
       border-top: 1px solid var(--border);
     }
 
@@ -233,8 +241,8 @@ import { StrategyTemplate } from '../../models/strategy.model';
     }
 
     mat-dialog-actions {
-      padding: 16px 24px;
-      border-top: 1px solid #e0e0e0;
+      padding: var(--sp-4) var(--sp-6);
+      border-top: 1px solid var(--border);
     }
   `]
 })

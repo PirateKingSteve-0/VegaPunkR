@@ -196,11 +196,16 @@ class RiskManager:
                 suggested_qty=calculated_qty
             )
 
-        # 7. Check if we have an existing position in this symbol
+        # 7. Check if we have an existing position in this symbol.
+        # Underlying-keyed on purpose — concentration is exposure to SPY, not to
+        # one strike. But it must select an OPEN row: rows are per-contract now,
+        # so a bare .first() could return a closed one and skip the check
+        # entirely while a position was genuinely open.
         existing_position = self.db.query(Position).filter(
             Position.user_id == user.id,
             Position.strategy_id == strategy.id,
-            Position.symbol == symbol
+            Position.symbol == symbol,
+            Position.qty > 0,
         ).first()
 
         if existing_position and existing_position.qty > 0:

@@ -1,5 +1,31 @@
 # VegaPunkR Development Journal
 
+## 📍 Data Accuracy Checkpoints
+
+Points after which recorded trade data is known to be more trustworthy, and what
+specifically changed. Verify any of them with:
+
+```
+psql "$(grep '^DATABASE_DEV_URL=' .env | cut -d= -f2-)" -f scripts/verify_data_checkpoint.sql
+```
+
+| CP | Date | Boundary | Status | What became trustworthy |
+|----|------|----------|--------|--------------------------|
+| **CP-1** | 2026-08-25 | `trades.id > 2905` | ⚠️ **PENDING** — opens at the first engine start after the fixes are deployed | Reconcile exit prices (no longer guessable from the underlying), `Position.unrealized_pnl`, the daily-loss gate, contract identity on every close, no post-15:45 entries, email Cost/Proceeds |
+
+Full detail: [CP-1](#data-checkpoint-cp-1) in the August 25, 2026 (Part 2) entry.
+
+**Before CP-1**, treat with suspicion: any `unrealized_pnl`, any close whose
+`notes.exit_price_source` is `approx_streamed_quote`, any claim that the daily loss
+cap held, and the 186 entries placed after the forced-exit time. Four rows
+(1954 / 2408 / 2758 / 2797) were corrected on 2026-08-25 and carry
+`notes.corrected_at`; originals are in `scripts/backups/`.
+
+When adding a checkpoint: append a row here, add a `### N. 📍 DATA ACCURACY CHECKPOINT — CP-n`
+section to that session's entry with an `<a name="data-checkpoint-cp-n">` anchor, and
+update `cp_trade_id` in `scripts/verify_data_checkpoint.sql`.
+
+
 ## Session Date: November 18, 2025
 
 ### Project Overview
@@ -8039,3 +8065,373 @@ the open.**
 > them.** See TODO item #1.
 
 **Status:** ✅ committed + pushed to `dev` (`fe6bdf3`). Clean revert point before the open.
+
+---
+
+## Session Date: August 25, 2026 (UI redesign: M2 → M3, "flat terminal" design system)
+
+**Scope: UI only.** Nothing in `api/engine/` was touched. The engine/notifications/schema changes
+sitting in the working tree alongside this (the EOD-exit-floor work) are from a separate session and
+are unrelated — they just happen to be uncommitted at the same time.
+
+### 1. Why the UI looked dated
+
+The ask was "make it sleeker." The diagnosis was more specific than taste:
+
+**We were on Angular Material 20.2.13 but themed with the legacy M2 API** —
+`mat.m2-define-palette`, `mat.m2-define-light-theme`, `mat.all-component-themes`. That is the 2018
+Material look by construction: drop-shadowed raised cards, filled underline form fields, a solid
+indigo app bar. No amount of per-component CSS fixes that; the theme itself was the problem.
+
+**Three color systems were fighting each other:**
+
+| Source | Value | Where it showed |
+|---|---|---|
+| M2 theme palette | indigo 700 / pink A200 | toolbar, buttons, ripples |
+| CSS token layer | `--primary: #1976d2` (a *different* blue) | hover states, custom components |
+| Stray brand color | `#667eea` / `#764ba2` | active nav link, login gradient |
+
+So the sidebar's active item was periwinkle, the toolbar was indigo, and `--primary` was a third blue.
+
+**The token layer was good but color-only.** It had light/dark/colorblind profit-loss, surfaces, text
+and borders — and nothing else. The result, measured across 15 stylesheets:
+
+- **27 distinct font sizes** (`12px`, `13px`, `0.8rem`, `0.78rem`, `0.85rem`… px and rem mixed)
+- **7 distinct border radii** (4/6/8/10/16/50%)
+- **62 hardcoded hex values** bypassing the tokens entirely
+- no elevation scale — one hardcoded `rgba(0,0,0,0.1)` toolbar shadow that went muddy in dark mode
+- **no tabular numerals anywhere**, in a UI that is almost entirely numbers in columns
+
+### 2. The foundation rewrite (`ui/src/styles.scss`)
+
+Migrated to **M3** (`mat.theme()` + `mat.theme-overrides()`). The key move: rather than overriding
+components one at a time, override the M3 **system** colors. Every Material component reads those,
+so the whole library follows the app palette automatically and component-level overrides stay rare.
+
+**This collapsed the three color systems into one** and had a large unplanned side effect:
+
+| | before | after |
+|---|---|---|
+| global `styles.css` | **170,355 B** | **26,977 B** |
+
+`mat.all-component-themes` emitted color/typography/density rules for *every* component;
+`mat.theme` emits system CSS variables that components read. ~143 kB of CSS deleted.
+
+Existing token names (`--surface`, `--text`, `--color-profit`, …) were **kept deliberately** —
+code and `CLAUDE.md` depend on them. Added the scales that were missing: spacing (`--sp-*`, 4px
+base), radius, type, weight, tracking, motion, elevation, `--font-mono`. Added shared classes
+(`.page-header`, `.panel`, `.pill`, `.banner`, `.empty-state`, `.eyebrow`, `.mono`) so pages stop
+re-rolling the same chrome.
+
+**Design language: "flat terminal."** Surfaces separated by 1px hairline borders, never drop
+shadows; shadows reserved for things that genuinely float (menus, dialogs, tooltips, snackbars).
+Density −1. `font-variant-numeric: tabular-nums` on `body` so figures align digit-for-digit.
+Monospaced instrument symbols. Uppercase eyebrow labels over large, tight values.
+
+All 15 stylesheets plus the one inline `styles: []` block were rewritten to match.
+
+### 3. Three bugs found while verifying
+
+None of these were in the brief; all three were pre-existing or newly introduced by M3 semantics.
+
+1. **Primary CTAs were rendering as ghost buttons.** M3 maps `mat-raised-button` to the *elevated*
+   button — a surface-colored container with primary-colored text. "New Strategy" was visually
+   indistinguishable from the outlined "Browse Templates" next to it. Re-pointed the
+   `--mat-button-protected-*` tokens at the filled treatment.
+2. **The sidenav footer never reached the bottom of the rail.** `mat-sidenav` wraps projected
+   content in `.mat-drawer-inner-container`, so `display: flex` on the host did nothing and
+   `margin-top: auto` on the environment selector was inert. **Pre-existing** — the old CSS had the
+   same mistake. Fixed by moving the flex column onto the inner container.
+3. **The dropdown caret sat between the icon and the label.** `MatButton` **hoists every projected
+   `<mat-icon>` ahead of the text** and wraps the rest in `.mdc-button__label`. Fixed with explicit
+   flex `order` on the three items.
+
+Also: the nav active-rail was initially painted with `::before` on the list item — **MDC owns
+`::before` there for its hover/focus state layer**. Switched to `box-shadow: inset 3px 0 0`.
+
+### 4. Token violations fixed (these broke the CLAUDE.md rule)
+
+- `position-chart-dialog.component.ts` hardcoded candle colors `#26a69a` / `#ef5350` and marker
+  `#1976d2` instead of `ThemeService.chartColors()` — **colorblind mode did nothing to the chart.**
+- `stream-drawer.component.ts` hardcoded the status dot's `#ff9800` / `#9e9e9e`. Now returns
+  `var(--color-warning)` etc. — it is a DOM style binding, so it can read tokens directly and needs
+  no re-render. Dropped the now-unused `ThemeService` injection.
+- `environment-controls.component.scss` was hardcoded **dark-only** (`#1e1e2e`, `#252535`,
+  `#a0a0b0`) and would have been unreadable in light mode. **It is dead code — not referenced by any
+  template.** Token-ized it so it doesn't rot; invested nothing further.
+
+### 5. Colorblind mode: a deliberate call worth remembering
+
+In CB mode profit becomes **blue**. A blue *accent* would then be indistinguishable from a profit
+figure — a primary button reading as a positive number. So **CB mode now drops the accent to
+graphite** and carries chrome on luminance alone. Data keeps the hue; chrome gives it up.
+Verified in a screenshot: blue/orange figures, graphite nav pill and Refresh button.
+
+> If you add a new accent-colored affordance, check it in CB mode.
+
+### 6. How this was verified (reusable)
+
+Not by inspection. Built a throwaway CDP harness (no puppeteer module needed — `ws` is already in
+`node_modules` via the dev server) driving the Chrome binary in `~/.cache/puppeteer`:
+
+- attach to `--remote-debugging-port=9222`, set `localStorage` (`vp.theme`, `vp.colorblind`), navigate, `Page.captureScreenshot`
+- **the auth guard only checks for `localStorage.access_token`** — so a fake token plus a `currentUser` blob renders the whole authenticated shell with no backend
+- `Fetch.enable` + `fulfillRequest` to mock `/trading/positions`, `/risk-events/account-status`, `/trading/account` and see populated tables
+
+**Gotcha worth writing down:** requests carry an `Authorization` header, so the browser sends a CORS
+**preflight** first. The first attempt silently rendered empty tables because the mock fulfilled the
+`OPTIONS` with a JSON 200 and no `Access-Control-Allow-Headers` — the browser discarded the response
+before Angular saw it. Must answer `OPTIONS` with 204 + full CORS headers.
+
+Captured login, overview, positions and strategies in **light, dark and colorblind**. All correct.
+
+### 7. Build budgets
+
+The production build had been warning for a long time. Checked whether this was a regression by
+compiling the old files from `HEAD` and comparing — **it was not:**
+
+| | before | after |
+|---|---|---|
+| `dashboard.component.scss` | 6380 B | 6768 B |
+| `overview.component.scss` | 4660 B | 4706 B |
+| `performance.component.scss` | 6161 B | 5419 B |
+
+All three were already over the stock 4 kB `anyComponentStyle` budget. The `initial` budget
+*improved* by ~143 kB from the M3 migration.
+
+Also worth knowing: **budgets measure raw, uncompressed bytes.** `initial` was 603.30 kB raw but
+**172.56 kB transferred**. The warning was measuring a number no user downloads.
+
+Raised the stock `ng new` values in `angular.json` to reflect the app:
+
+```json
+{ "type": "initial",           "maximumWarning": "700kB", "maximumError": "1MB"  }
+{ "type": "anyComponentStyle", "maximumWarning": "8kB",   "maximumError": "16kB" }
+```
+
+Leaves ~16% headroom on `initial` and ~18% on the worst component, so both still trip on a real
+regression. The `anyComponentStyle` **error** had to move from 8 kB → 16 kB too: with the warning at
+8 kB, a component crossing it would have hard-failed the build having never once warned.
+
+> A budget that has warned continuously for months isn't doing its job — it has trained you to
+> ignore build output. The alternative "fix" (dumping shell CSS into `styles.scss` to get under
+> 4 kB) would make it *global* to satisfy a *per-component* budget — gaming the metric, and losing
+> the scoping that keeps shell styles out of pages.
+
+### 8. Docs
+
+`CLAUDE.md`'s **UI Theming** section no longer described the system, so it was updated: flat-terminal
+rule, the full token list including the new scales, the shared classes, the tabular-nums rule, the
+"prefer system tokens / `mat.<component>-overrides()` over `.mat-mdc-*`" guidance, an explicit
+**do not reintroduce the M2 API**, and the CB accent rule.
+
+**Status:** ✅ production build clean, no warnings. Not committed — working tree also contains the
+unrelated engine work from the other session, so `git commit -a` would bundle both.
+
+---
+
+## Session Date: August 25, 2026 (Part 2) — The $223k that never happened: phantom P&L, the missing entry gate, notification rewrite
+
+**Scope: `api/` engine, schemas, notifications + two files under `ui/src/app/pages/strategies/`.**
+Runs alongside the M3/"flat terminal" UI redesign from a separate session on the same day; the two
+touch different files apart from the strategy form.
+
+Three things were reported:
+
+1. A **$223,000 "close" on Saturday, 2026-08-01** — a day the market is shut.
+2. Contracts near EOD "not selling until the next morning."
+3. Discord/email P&L reported the **contract premium** (`$2.23`) rather than the dollars actually
+   committed (`$223`).
+
+All three turned out to be connected. Item 2 was also **not what it looked like**.
+
+---
+
+### 1. The $223,119 phantom — full chain
+
+`stream_driven_worker._reconcile_position` books a closing `Trade` when the broker shows flat but the
+DB still holds qty. It asks `_broker_close_fill()` for the real fill, and when that returns nothing —
+Tradier's `/orders` covers **only the current session**, so any close from a previous day is invisible —
+it fell back to:
+
+```python
+exit_price = position.current_price or position.avg_entry_price   # ← 747.03
+approx_pnl = (exit_price - position.avg_entry_price) * filled_qty * multiplier
+```
+
+`position.current_price` held **747.03 — SPY's underlying price**, not the option premium. Confirmed
+against Tradier `/v1/markets/history`: SPY's close on 2026-07-31 was exactly `747.03`.
+
+**How the underlying got in there.** `strategy_executor.execute_exit_tick` did:
+
+```python
+current_price = market_data.get('price', 0.0)          # the UNDERLYING
+if market_data.get('option_symbol') and ask > 0:
+    current_price = (bid + ask) / 2                    # only if a quote had arrived
+...
+self.order_manager.update_position_prices(user, strategy, symbol, current_price)
+```
+
+When no option quote had arrived — cold start, or a contract adopted straight off the broker by
+`_reconcile_position` and never subscribed to the stream — `ask` is `0.0` and the underlying was
+written to `position.current_price` and `unrealized_pnl`. `_check_exit_signals` already defended
+against this (it re-prices off REST); `update_position_prices` did not. **Only half the path was fixed.**
+
+```
+(747.03 - 3.30) x 3 contracts x 100 = 223,119
+```
+
+**Why this was worse than a wrong number.** `Position.unrealized_pnl` feeds the daily-loss gate
+(`risk_manager.py:248`, `:448`) and the phantom `Trade.pnl` feeds `realized` at `:241`. A fake
++$223k **silently disables the daily loss cap** for that session.
+
+---
+
+### 2. Three things asserted early that were wrong
+
+Recorded because the July 13 entry's lesson repeated itself: *trusting a reading before checking it.*
+
+| Claim | Reality |
+|---|---|
+| "`exit_before_close_minutes` is 0, so no EOD exit fires" | **False.** Both strategies have `15`. It is the **most common exit reason in the whole history** — 71 of the last 60 days' closes. |
+| "Contracts aren't selling until the next morning" | **False.** Zero overnight holds exist in the data. The real behaviour is the opposite (below). |
+| "The strategy form's `0` default is why" | **Partly false.** The default *is* 0 and is worth fixing, but neither live strategy was ever at 0. |
+
+The first two were stated from reading the code before querying the database. The database
+contradicted both. The engine floor added in response is still worth having — but it is
+defence-in-depth, **not** the fix for what was actually happening.
+
+---
+
+### 3. The real bug: the forced exit had no entry-side counterpart
+
+`check_entry_signal`'s time gate had a lower bound (`market_open + entry_after_open_minutes`, plus
+`trading_window_start`) and an upper bound **only when `user.trading_window_enabled`** — which is
+`false` on this account. So the 15:45 forced exit sold the position, and nothing stopped the engine
+buying again at 15:46:
+
+```
+Fri 07-31 15:58    buy  → 15:58 sell  "Market close approaching: 15 minutes before close"
+Fri 07-31 15:59    buy  → 15:59 sell  "Market close approaching: 15 minutes before close"
+Fri 07-31 16:00    buy  → 16:00 sell  "Stop loss hit: -32.01%"
+Fri 07-31 16:00:41 buy  → never sold                            ← became trade 2408
+```
+
+**174 entries placed after 15:45, −$1,064.46 realised** in pure spread, every trading day from
+2026-07-15 to 08-21. Ten of them were placed **at or after 16:00** — the market was shut;
+`is_market_open()` let them through because the Tradier clock is cached for 60s.
+
+The last one straddled the bell, expired that day, and became the phantom. The whole chain:
+
+> no entry cutoff → position opened at 16:00:41 → market closed → contract expired →
+> Saturday reconcile found the broker flat → no close-fill on record → fell back to a
+> `current_price` that held the underlying → **+$223,119**
+
+**Fix:** the entry gate now uses `forced_exit_time_et()` as its upper bound. Entries stop exactly when
+forced exits start — reusing the same function rather than re-deriving the bound means the two can
+never drift apart. Verified: entries allowed 09:31–15:44, blocked 15:45 onward.
+
+---
+
+### 4. Code changes
+
+| File | Change |
+|---|---|
+| `engine/signal_generator.py` | `FORCED_EOD_EXIT_FLOOR_MINUTES = 15`, unconditional. Extracted `forced_exit_time_et()` / `forced_exit_due()` as the single source of both the exit time **and** the entry cutoff. |
+| `engine/strategy_executor.py` | Positions marked off the **held contract's** resolved price, never the underlying tick. Forces a market close when past the exit time and no quote can be resolved (previously `continue`d forever). |
+| `engine/stream_driven_worker.py` | New `_fallback_exit_price()`: broker fill → REST quote → own mark, each sanity-checked against the underlying; books **at cost with an ERROR log** rather than inventing a figure. Expired contracts book at real value. Fixed a missing `×100` in the partial-close `unrealized_pnl`, and a `multiplier` that was scoped inside a sibling branch (`NameError` waiting to happen). |
+| `engine/order_manager.py` | `close_position` records `option_symbol` in notes. |
+| `schemas.py` | `exit_before_close_minutes >= 15` on `StrategyCreate`/`StrategyUpdate` — deliberately **not** on `StrategyBase`, which `StrategyResponse` inherits: a legacy row must stay *readable* even when it is no longer *writable*. |
+| `utils/symbol_helpers.py` | `parse_occ_symbol()` / `format_contract()` — `SPY260825C00745000` → `SPY $745 CALL 8/25`. |
+| `notifications/discord.py` | Aligned monospace table in the embed description; Cost / Proceeds / Return %; contract name in the title; strategy in the footer. |
+| `notifications/reports.py` | Joined `Position` for the contract (`is_option_symbol(trade.symbol)` was **always False** — `Trade.symbol` is the underlying, so Cost/Proceeds were 100× too small). Capital-deployed / proceeds / return-on-capital totals over **all** trades, not just the 50 in the table. Restyled to the flat-terminal language. |
+| `ui/.../strategy-form.component.{ts,html}` | Default 15, `Validators.min(15)`, hint corrected (it previously advertised "0 = disabled"). Loads legacy `0` as `15` via `Math.max` — `??` does not fire on `0`, so the form would otherwise have been permanently unsaveable. |
+
+**Three sharp edges worth remembering:**
+
+- **`Trade.symbol` is the underlying**, never the OCC symbol. Anything keying "is this an option?" off
+  it silently answers no.
+- **`positions.option_symbol` is mutable.** `_update_position_entry` reuses a `qty=0` row for the next
+  entry. Trade 2408 closed `SPY260731C00745000`; its position row now reads `SPY260825C00764000`, a
+  month-later strike. Reports must read the contract from the **trade note**, not the position row.
+- **`??` does not fire on `0`.** Cost us a whole class of un-saveable form.
+
+---
+
+### 5. Data correction
+
+Four rows, all created by the same fallback, all on contracts that had **already expired**, all booked
+~06:30 ET pre-market, and **all recorded as gains on losing positions**. All four expired *in the
+money*, so none were worthless. Settlement basis: `max(0, SPY close − strike)` — SPY options are
+PM-settled and auto-exercise if ITM by $0.01 at the 4pm close. Closes from Tradier
+`/v1/markets/history`.
+
+| id | contract | expiry | entry | recorded | corrected |
+|---|---|---|---|---|---|
+| 1954 | SPY260727C00738000 | 07-27 | 1.17 | +39.00 | **−24.00** |
+| 2408 | SPY260731C00745000 | 07-31 | 3.30 | **+223,119.00** | **−381.00** |
+| 2758 | SPY260807C00771000 | 08-07 | 1.79 | +66.00 | **+141.00** |
+| 2797 | SPY260819C00768000 | 08-19 | 1.82 | +33.00 | **−228.00** |
+
+**All-time P&L: +$220,942 → −$3,035.37.** That is the real number.
+
+- Applied by `scripts/fix_phantom_expiry_pnl.sql` (dry-run first, then committed).
+- Originals: `scripts/backups/phantom_trades_pre_correction_2026-08-25.json`.
+- Each row carries `corrected_at`, `corrected_from_pnl`, `corrected_from_exit_price`,
+  `correction_basis`, `correction_source` in its notes.
+- **Prod (`vegapunkr_prod`) was empty — 0 trades.** Dev only.
+
+The 174 churn round-trips were **left in place** — they are real paper trades at real recorded prices.
+They drag ~$1,064 off the strategy's stats and all sit in the 15:45–16:00 ET band if you want to
+exclude them from analysis.
+
+---
+
+### 6. 📍 DATA ACCURACY CHECKPOINT — CP-1
+
+<a name="data-checkpoint-cp-1"></a>
+
+> **Grep for `DATA ACCURACY CHECKPOINT` to find every checkpoint in this journal.**
+
+**Boundary: `trades.id > 2905`** (max id at 2026-08-25 19:07 UTC; 2,480 rows total).
+
+**⚠️ CP-1 is PENDING ACTIVATION.** The fixes are in the working tree, **not committed and not
+running**. CP-1 only truly opens at **the first engine start after this code is deployed**. Trades
+recorded between now and that restart are still pre-checkpoint data. Update the id below to the real
+`max(trades.id)` at restart time, then mark this line ACTIVE.
+
+| | Before CP-1 (`id ≤ 2905`) | After CP-1 |
+|---|---|---|
+| Realized P&L on closes | Trustworthy **except** the 4 corrected rows | Trustworthy |
+| Exit prices from reconcile | **Guessed** — `approx_streamed_quote` could be the underlying | Broker fill → REST quote → sanity-checked mark, else booked at cost + ERROR log |
+| `Position.unrealized_pnl` | **Untrustworthy** — could be ~100× the underlying | Marked off the held contract only |
+| Daily-loss gate | **May have been disabled** by phantom unrealized/realized P&L | Sound |
+| Which contract a close belongs to | Only in `notes` for reconcile closes; otherwise unknowable (position row reused) | Recorded on every close |
+| Entries after 15:45 ET | **186 exist** (174 in 15:45–16:00, 12 at/after the bell) | None |
+| Email report Cost/Proceeds | **100× too small** | Correct |
+
+**Verify with `scripts/verify_data_checkpoint.sql`** — seven invariants, scoped to post-checkpoint
+rows so historical damage cannot mask a regression:
+
+```
+psql "$(grep '^DATABASE_DEV_URL=' .env | cut -d= -f2-)" -f scripts/verify_data_checkpoint.sql
+```
+
+The script is self-validating: run it with `cp_trade_id` set to `0` and checks 2, 3 and 5 **fail**
+against the historical data (186 / 4 / 1225 rows), which is how you know a PASS means something.
+A PASS on checks 1/2/3/5/7 with `trades_since_cp = 0` means only that the engine has not run yet.
+
+---
+
+### 7. Still open
+
+- **`is_market_open()` has a 60s stale window.** Ten entries were placed at/after 16:00 ET because the
+  Tradier clock is cached. The 15:45 entry cutoff makes this moot for entries, but anything else
+  trusting that function inherits the staleness.
+- **The 174 churn trades remain in history** and drag the strategy's measured expectancy.
+- **`routers/performance.py:174`** still labels trades off `position.option_symbol` — same
+  reused-row problem as `reports.py` had. Not fixed this session.
+- **`tests/test_worker_integration.py` does not import** (`SessionLocal` → `SessionLocals`, from the
+  multi-DB refactor), and the rest of the suite needs a local Postgres on 5433 that no longer exists
+  post-RDS-migration. **There is currently no runnable regression suite.** Everything this session was
+  verified with targeted scripts instead.

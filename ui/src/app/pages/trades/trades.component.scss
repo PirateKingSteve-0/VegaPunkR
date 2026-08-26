@@ -1,106 +1,126 @@
-.events-container {
-  padding: 24px;
+// Event log. Severity is carried by a dot + a hairline left rail on the row,
+// not by washing the whole row in color — tinted rows fight the text contrast
+// and make a long feed hard to scan.
 
-  .header {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    margin-bottom: 24px;
+.filters-card {
+  margin-bottom: var(--sp-3);
 
-    h1 { margin: 0; }
+  .filters {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(176px, 1fr));
+    gap: var(--sp-3);
 
-    button { gap: 8px; }
-  }
-
-  .filters-card {
-    margin-bottom: 16px;
-
-    .filters {
-      display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
-      gap: 16px;
-
-      mat-form-field { width: 100%; }
-    }
-  }
-
-  mat-card {
-    .empty-state {
-      text-align: center;
-      padding: 64px 24px;
-      color: var(--text-muted);
-
-      mat-icon {
-        font-size: 64px;
-        width: 64px;
-        height: 64px;
-        margin-bottom: 16px;
-        opacity: 0.5;
-      }
-
-      p { margin: 8px 0; }
-
-      .subtitle {
-        font-size: 14px;
-        opacity: 0.7;
-      }
-    }
-
-    .events-table {
+    mat-form-field {
       width: 100%;
-
-      // Row tinting by severity
-      tr.warning { background: rgba(255, 152, 0, 0.05); }
-      tr.error   { background: var(--color-loss-bg-soft); }
-      tr.success { background: var(--color-profit-bg-soft); }
-
-      // Event type badges
-      .type-badge {
-        display: inline-block;
-        padding: 2px 8px;
-        border-radius: 10px;
-        font-size: 11px;
-        font-weight: 600;
-        letter-spacing: 0.04em;
-        white-space: nowrap;
-
-        &.order-placed    { background: rgba(25, 118, 210, 0.12); color: var(--primary); }
-        &.order-failed    { background: var(--color-loss-bg-strong); color: var(--color-loss-strong); }
-        &.position-opened { background: var(--color-profit-bg-strong); color: var(--color-profit-strong); }
-        &.position-closed { background: rgba(123, 31, 162, 0.12); color: #4a148c; }
-        &.strategy-started { background: rgba(0, 121, 107, 0.12); color: #004d40; }
-        &.strategy-stopped { background: rgba(97, 97, 97, 0.12);  color: #424242; }
-        &.strategy-error  { background: rgba(230, 74, 25, 0.12);  color: #bf360c; }
-        &.risk-alert      { background: rgba(245, 124, 0, 0.12);  color: #e65100; }
-      }
-
-      // Severity indicator dot
-      .severity-dot {
-        display: inline-block;
-        width: 8px;
-        height: 8px;
-        border-radius: 50%;
-        margin-right: 6px;
-        vertical-align: middle;
-
-        &.info    { background: var(--primary); }
-        &.success { background: var(--color-profit); }
-        &.warning { background: #f57c00; }
-        &.error   { background: var(--color-loss); }
-      }
-
-      // Event title + detail stacked
-      .event-title {
-        display: block;
-        font-weight: 500;
-      }
-
-      .event-detail {
-        display: block;
-        font-size: 12px;
-        color: var(--text-faint);
-        margin-top: 1px;
-      }
     }
+  }
+
+  ::ng-deep .mat-mdc-form-field-subscript-wrapper {
+    display: none;
+  }
+}
+
+.events-table {
+  width: 100%;
+
+  tr.mat-mdc-row {
+    // Rail is painted via an inset shadow so it does not disturb cell padding.
+    &.warning td:first-child {
+      box-shadow: inset 3px 0 0 var(--color-warning);
+    }
+    &.error td:first-child {
+      box-shadow: inset 3px 0 0 var(--color-loss);
+    }
+    &.success td:first-child {
+      box-shadow: inset 3px 0 0 var(--color-profit);
+    }
+  }
+
+  // ---- Event type badges ----
+  .type-badge {
+    display: inline-block;
+    padding: 2px var(--sp-2);
+    border-radius: var(--radius-pill);
+    font-size: var(--fs-micro);
+    font-weight: var(--fw-semibold);
+    letter-spacing: var(--ls-eyebrow);
+    text-transform: uppercase;
+    white-space: nowrap;
+    background: var(--surface-inset);
+    color: var(--text-muted);
+
+    &.order-placed {
+      background: var(--primary-bg);
+      color: var(--primary);
+    }
+    &.order-failed,
+    &.strategy-error {
+      background: var(--color-loss-bg-strong);
+      color: var(--color-loss-strong);
+    }
+    &.position-opened {
+      background: var(--color-profit-bg-strong);
+      color: var(--color-profit-strong);
+    }
+    &.position-closed {
+      background: var(--surface-inset);
+      color: var(--text-muted);
+    }
+    &.strategy-started {
+      background: var(--color-profit-bg);
+      color: var(--color-profit-strong);
+    }
+    &.strategy-stopped {
+      background: var(--surface-inset);
+      color: var(--text-faint);
+    }
+    &.risk-alert {
+      background: var(--color-warning-bg);
+      color: var(--color-warning-strong);
+    }
+  }
+
+  // ---- Severity indicator ----
+  .severity-dot {
+    display: inline-block;
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    margin-right: var(--sp-2);
+    vertical-align: middle;
+    flex-shrink: 0;
+
+    &.info {
+      background: var(--primary);
+    }
+    &.success {
+      background: var(--color-profit);
+    }
+    &.warning {
+      background: var(--color-warning);
+    }
+    &.error {
+      background: var(--color-loss);
+    }
+  }
+
+  // ---- Event title + detail stacked ----
+  .event-title {
+    display: block;
+    font-weight: var(--fw-medium);
+    color: var(--text);
+  }
+
+  .event-detail {
+    display: block;
+    font-size: var(--fs-xs);
+    color: var(--text-faint);
+    margin-top: 1px;
+  }
+
+  .mat-column-symbol {
+    font-family: var(--font-mono);
+    font-weight: var(--fw-semibold);
+    font-size: var(--fs-sm);
   }
 }

@@ -1,30 +1,36 @@
+// Live tick feed. This is the one surface in the app that is deliberately a
+// terminal: monospaced, dense, fixed-width columns so a fast-scrolling stream
+// stays readable.
+
 .stream-drawer {
   display: flex;
   flex-direction: column;
   height: 100%;
-  background: var(--surface-alt);
+  background: var(--surface);
 
   .drawer-header {
-    padding: 16px;
+    padding: var(--sp-4);
+    border-bottom: 1px solid var(--border);
 
     .header-top {
       display: flex;
       align-items: center;
       justify-content: space-between;
-      margin-bottom: 8px;
+      margin-bottom: var(--sp-2);
 
       h3 {
         margin: 0;
-        font-size: 16px;
-        font-weight: 600;
+        font-size: var(--fs-md);
+        font-weight: var(--fw-semibold);
+        letter-spacing: var(--ls-tight);
         color: var(--text);
       }
 
       .status-dot {
-        width: 10px;
-        height: 10px;
+        width: 8px;
+        height: 8px;
         border-radius: 50%;
-        transition: background-color 0.3s ease;
+        transition: background-color var(--dur) var(--ease);
         flex-shrink: 0;
       }
     }
@@ -32,39 +38,43 @@
     .strategy-info {
       display: flex;
       flex-direction: column;
-      gap: 2px;
+      gap: var(--sp-1);
 
       .strategy-name {
-        font-size: 13px;
-        font-weight: 500;
+        font-size: var(--fs-sm);
+        font-weight: var(--fw-medium);
         color: var(--text-muted);
       }
 
       .symbols {
-        font-size: 11px;
+        font-size: var(--fs-2xs);
         color: var(--text-faint);
-        font-family: 'Roboto Mono', monospace;
-        padding-top: 10px;
+        font-family: var(--font-mono);
+        letter-spacing: -0.01em;
+        padding-top: var(--sp-2);
       }
     }
   }
 
   .drawer-controls {
-    padding: 10px 16px;
+    padding: var(--sp-2) var(--sp-4);
     display: flex;
     align-items: center;
-    gap: 10px;
+    gap: var(--sp-2);
     flex-wrap: wrap;
+    border-bottom: 1px solid var(--border);
+    background: var(--surface-sunken);
 
     .filter-toggles {
-      font-size: 12px;
+      font-size: var(--fs-xs);
     }
   }
 
   .event-feed {
     flex: 1;
     overflow-y: auto;
-    padding: 6px 0;
+    padding: var(--sp-1) 0;
+    background: var(--surface-sunken);
 
     .empty-feed {
       display: flex;
@@ -75,37 +85,38 @@
       color: var(--text-faint);
 
       mat-icon {
-        font-size: 40px;
-        width: 40px;
-        height: 40px;
-        margin-bottom: 8px;
+        font-size: 32px;
+        width: 32px;
+        height: 32px;
+        margin-bottom: var(--sp-2);
       }
 
       p {
         margin: 0;
-        font-size: 13px;
+        font-size: var(--fs-sm);
       }
     }
 
     .event-row {
       display: flex;
       align-items: baseline;
-      gap: 8px;
-      padding: 3px 14px;
-      border-left: 3px solid transparent;
-      font-family: 'Roboto Mono', monospace;
-      font-size: 12px;
-      line-height: 1.6;
+      gap: var(--sp-2);
+      padding: 2px var(--sp-3);
+      border-left: 2px solid transparent;
+      font-family: var(--font-mono);
+      font-size: var(--fs-2xs);
+      line-height: 1.7;
+      font-variant-numeric: tabular-nums;
 
       &:hover {
         background: var(--surface-hover);
       }
 
       &.event-quote {
-        border-left-color: #2196f3;
+        border-left-color: var(--primary);
 
         .event-badge {
-          color: #2196f3;
+          color: var(--primary);
         }
       }
 
@@ -119,17 +130,17 @@
 
       .event-badge {
         font-size: 9px;
-        font-weight: 700;
+        font-weight: var(--fw-bold);
         text-transform: uppercase;
-        width: 36px;
+        width: 34px;
         flex-shrink: 0;
-        letter-spacing: 0.5px;
+        letter-spacing: 0.06em;
       }
 
       .event-symbol {
-        font-weight: 600;
+        font-weight: var(--fw-semibold);
         color: var(--text);
-        width: 100px;
+        width: 98px;
         flex-shrink: 0;
         overflow: hidden;
         text-overflow: ellipsis;
@@ -139,12 +150,12 @@
       .event-data {
         flex: 1;
         display: flex;
-        gap: 14px;
+        gap: var(--sp-3);
         color: var(--text-muted);
 
         strong {
           color: var(--text);
-          font-weight: 600;
+          font-weight: var(--fw-semibold);
         }
 
         .muted {

@@ -28,9 +28,9 @@ from typing import Dict, List, Optional, Tuple
 import pytz
 from sqlalchemy.orm import Session
 
-from utils.symbol_helpers import is_option_symbol
+from utils.symbol_helpers import format_contract, is_option_symbol
 
-from models import Strategy, Trade, User
+from models import Position, Strategy, Trade, User
 from notifications.email import is_enabled_for, send_report_async, send_test_report
 
 logger = logging.getLogger(__name__)
@@ -108,6 +108,7 @@ class StrategyRow:
     pnl: float
     commission: float
     fees: float
+    cost: float      # Total capital deployed (entry x qty x multiplier)
 
 
 @dataclass
@@ -136,6 +137,12 @@ class ReportData:
     win_count: int
     loss_count: int
     win_rate: Optional[float]   # None when trade_count == 0
+    # Capital actually committed over the period, and what came back. The
+    # premium alone ($2.23) says nothing about exposure; $223 per contract does.
+    total_cost: float
+    total_proceeds: float
+    # Realized P&L as a % of capital deployed. None when nothing was deployed.
+    return_on_capital: Optional[float]
     by_strategy: List[StrategyRow]
     trades: List[TradeRow]      # sorted desc by exit time, capped
 
@@ -150,9 +157,16 @@ def aggregate(db: Session, user: User, period: str, anchor: date) -> ReportData:
     # is set when a position is closed (order_manager._update_position_exit
     # / close_position). Both buys and sells appear in Trade; the closing
     # leg is what carries the PnL.
+    # Position is joined for `option_symbol`: Trade.symbol is the UNDERLYING
+    # ("SPY"), never the OCC contract, so `is_option_symbol(trade.symbol)` is
+    # always False and the 100x contract multiplier was never applied — Cost
+    # and Proceeds read $2.23 where $223 was actually at risk. The broker
+    # position row is the only place the contract identity is recorded.
+    # Same join routers/performance.py uses for the same reason.
     rows = (
-        db.query(Trade, Strategy)
+        db.query(Trade, Strategy, Position)
         .outerjoin(Strategy, Trade.strategy_id == Strategy.id)
+        .outerjoin(Position, Trade.position_id == Position.id)
         .filter(
             Trade.user_id == user.id,
             Trade.exit_timestamp.isnot(None),
@@ -169,10 +183,12 @@ def aggregate(db: Session, user: User, period: str, anchor: date) -> ReportData:
     total_pnl = 0.0
     total_commission = 0.0
     total_fees = 0.0
+    total_cost = 0.0
+    total_proceeds = 0.0
     win_count = 0
     loss_count = 0
 
-    for trade, strategy in rows:
+    for trade, strategy, position in rows:
         pnl = float(trade.pnl or 0.0)
         commission = float(trade.commission or 0.0)
         fees = float(trade.fees or 0.0)
@@ -185,11 +201,37 @@ def aggregate(db: Session, user: User, period: str, anchor: date) -> ReportData:
         else:
             loss_count += 1
 
+        qty = int(trade.filled_qty or trade.qty or 0)
+        entry = float(trade.price or 0.0)
+        exit_price = float(trade.exit_price or trade.price or 0.0)
+
+        # The OCC contract. Trade notes FIRST: they are stamped at trade time and
+        # never change. positions.option_symbol is mutable — a closed row is
+        # reused by the next entry — so for any historical trade it names
+        # whatever was bought most recently, not what this trade closed. Only
+        # fall back to it for older rows written before close_notes carried the
+        # contract. Its presence, not the underlying's spelling, is what makes
+        # this an options trade.
+        occ = (trade.notes or {}).get('option_symbol') or (
+            position.option_symbol if position else None
+        )
+
+        # Total cost and proceeds. Options are quoted per share and trade in
+        # 100-share contracts, so a $2.23 premium on 1 contract is $223 of
+        # capital actually committed — which is the number to report.
+        # Computed for EVERY trade, not just the ones that fit the table cap,
+        # so the header totals cover the whole period.
+        multiplier = 100 if (occ or is_option_symbol(trade.symbol)) else 1
+        cost = entry * qty * multiplier
+        proceeds = exit_price * qty * multiplier
+        total_cost += cost
+        total_proceeds += proceeds
+
         sname = strategy.name if strategy else "(unlinked)"
         if sname not in by_strategy:
             by_strategy[sname] = StrategyRow(
                 name=sname, trades=0, wins=0, losses=0,
-                pnl=0.0, commission=0.0, fees=0.0,
+                pnl=0.0, commission=0.0, fees=0.0, cost=0.0,
             )
         s = by_strategy[sname]
         s.trades += 1
@@ -198,20 +240,12 @@ def aggregate(db: Session, user: User, period: str, anchor: date) -> ReportData:
         s.pnl += pnl
         s.commission += commission
         s.fees += fees
+        s.cost += cost
 
         if len(trade_rows) < _TRADES_TABLE_CAP:
-            qty = int(trade.filled_qty or trade.qty or 0)
-            entry = float(trade.price or 0.0)
-            exit_price = float(trade.exit_price or trade.price or 0.0)
-
-            # Calculate total cost and proceeds (options have 100x multiplier)
-            multiplier = 100 if is_option_symbol(trade.symbol) else 1
-            cost = entry * qty * multiplier
-            proceeds = exit_price * qty * multiplier
-
             trade_rows.append(TradeRow(
                 when=trade.exit_timestamp,
-                symbol=trade.symbol,
+                symbol=occ or trade.symbol,
                 strategy=sname,
                 qty=qty,
                 entry=entry,
@@ -236,6 +270,9 @@ def aggregate(db: Session, user: User, period: str, anchor: date) -> ReportData:
         win_count=win_count,
         loss_count=loss_count,
         win_rate=win_rate,
+        total_cost=total_cost,
+        total_proceeds=total_proceeds,
+        return_on_capital=(total_pnl / total_cost) if total_cost > 0.01 else None,
         by_strategy=sorted(by_strategy.values(), key=lambda r: r.pnl, reverse=True),
         trades=trade_rows,
     )
@@ -256,72 +293,123 @@ def _pct(v: Optional[float]) -> str:
     return "—" if v is None else f"{v * 100:.1f}%"
 
 
+# Palette. Deliberately literal hex, NOT the UI's CSS custom properties: email
+# clients strip <style> blocks and have no :root to resolve var() against, so
+# every colour has to be inline. This is the one place hardcoded hex is correct.
+_INK = "#111827"
+_MUTED = "#6b7280"
+_FAINT = "#9ca3af"
+_LINE = "#e5e7eb"
+_ZEBRA = "#fafafa"
+_WIN = "#15803d"
+_LOSS = "#b91c1c"
+_WIN_BG = "#f0fdf4"
+_LOSS_BG = "#fef2f2"
+
+# Right-aligned numeric cells use tabular figures so decimal points line up
+# across rows in clients that honour font-variant-numeric (most modern ones).
+_NUM = (
+    "font-variant-numeric:tabular-nums;font-feature-settings:'tnum';"
+    "font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;"
+)
+
+
+def _tile(label: str, value: str, color: str = _INK) -> str:
+    """One stat cell in the summary grid."""
+    return (
+        f'<td style="padding:10px 12px;border:1px solid {_LINE};border-radius:6px;'
+        f'background:#fff;" width="33%">'
+        f'<div style="font-size:10px;color:{_MUTED};text-transform:uppercase;'
+        f'letter-spacing:.6px;">{label}</div>'
+        f'<div style="font-size:17px;font-weight:600;color:{color};margin-top:3px;{_NUM}">'
+        f'{value}</div></td>'
+    )
+
+
+def _tile_row(tiles: list) -> str:
+    cells = '<td style="width:8px;"></td>'.join(tiles)
+    return (
+        '<table role="presentation" width="100%" cellpadding="0" cellspacing="0" '
+        'style="border-collapse:separate;margin:0 0 10px;"><tr>' + cells + '</tr></table>'
+    )
+
+
 def render_html(data: ReportData) -> str:
     """Self-contained HTML — no external CSS. Uses inline styles only;
-    Gmail/Outlook strip <style> blocks unpredictably."""
-    pnl_color = "#1b5e20" if data.total_pnl >= 0 else "#b71c1c"
-    pnl_bg = "#e8f5e9" if data.total_pnl >= 0 else "#ffebee"
+    Gmail/Outlook strip <style> blocks unpredictably, and neither supports
+    CSS custom properties, so the UI's theme tokens cannot be used here."""
+    pnl_color = _WIN if data.total_pnl >= 0 else _LOSS
+    pnl_bg = _WIN_BG if data.total_pnl >= 0 else _LOSS_BG
+
+    roc = _pct(data.return_on_capital)
 
     summary = f"""
     <table role="presentation" width="100%" cellpadding="0" cellspacing="0"
-           style="border-collapse:collapse;margin:0 0 16px;">
+           style="border-collapse:collapse;margin:0 0 10px;">
       <tr>
-        <td style="padding:12px 16px;background:{pnl_bg};border-radius:6px;">
-          <div style="font-size:11px;color:#555;text-transform:uppercase;letter-spacing:0.5px;">
+        <td style="padding:16px 18px;background:{pnl_bg};border-radius:8px;
+                   border:1px solid {pnl_color}22;">
+          <div style="font-size:10px;color:{_MUTED};text-transform:uppercase;letter-spacing:.8px;">
             Total realized P&amp;L
           </div>
-          <div style="font-size:24px;font-weight:600;color:{pnl_color};margin-top:2px;">
+          <div style="font-size:32px;font-weight:700;color:{pnl_color};margin-top:2px;{_NUM}">
             {_signed(data.total_pnl)}
+          </div>
+          <div style="font-size:12px;color:{_MUTED};margin-top:4px;">
+            {roc} return on {_money(data.total_cost)} deployed
           </div>
         </td>
       </tr>
     </table>
-    <table role="presentation" width="100%" cellpadding="0" cellspacing="0"
-           style="border-collapse:collapse;margin:0 0 20px;">
-      <tr>
-        <td style="padding:8px 12px;border:1px solid #ddd;border-radius:4px;width:33%;">
-          <div style="font-size:11px;color:#666;text-transform:uppercase;">Trades</div>
-          <div style="font-size:18px;font-weight:600;">{data.trade_count}</div>
-        </td>
-        <td style="width:8px;"></td>
-        <td style="padding:8px 12px;border:1px solid #ddd;border-radius:4px;width:33%;">
-          <div style="font-size:11px;color:#666;text-transform:uppercase;">Win rate</div>
-          <div style="font-size:18px;font-weight:600;">{_pct(data.win_rate)}</div>
-        </td>
-        <td style="width:8px;"></td>
-        <td style="padding:8px 12px;border:1px solid #ddd;border-radius:4px;width:33%;">
-          <div style="font-size:11px;color:#666;text-transform:uppercase;">W / L</div>
-          <div style="font-size:18px;font-weight:600;">{data.win_count} / {data.loss_count}</div>
-        </td>
-      </tr>
-    </table>
-    <div style="font-size:12px;color:#666;margin:0 0 20px;">
-      Commission: {_money(data.total_commission)}
+    {_tile_row([
+        _tile("Trades", str(data.trade_count)),
+        _tile("Win rate", _pct(data.win_rate)),
+        _tile("W / L", f"{data.win_count} / {data.loss_count}"),
+    ])}
+    {_tile_row([
+        _tile("Capital deployed", _money(data.total_cost)),
+        _tile("Proceeds", _money(data.total_proceeds)),
+        _tile("Return on capital", roc, pnl_color),
+    ])}
+    <div style="font-size:11px;color:{_FAINT};margin:8px 0 20px;">
+      Commission {_money(data.total_commission)}
       &nbsp;&middot;&nbsp;
-      Fees: {_money(data.total_fees)}
+      Fees {_money(data.total_fees)}
+      &nbsp;&middot;&nbsp;
+      Net after costs {_signed(data.total_pnl - data.total_commission - data.total_fees)}
     </div>
     """
 
     if data.by_strategy:
         rows = "".join(
-            f"""<tr>
-              <td style="padding:8px 12px;border-bottom:1px solid #eee;">{s.name}</td>
-              <td style="padding:8px 12px;border-bottom:1px solid #eee;text-align:right;">{s.trades}</td>
-              <td style="padding:8px 12px;border-bottom:1px solid #eee;text-align:right;">{s.wins}/{s.losses}</td>
-              <td style="padding:8px 12px;border-bottom:1px solid #eee;text-align:right;color:{'#1b5e20' if s.pnl >= 0 else '#b71c1c'};">{_signed(s.pnl)}</td>
+            f"""<tr style="background:{_ZEBRA if i % 2 else '#fff'};">
+              <td style="padding:9px 12px;border-bottom:1px solid {_LINE};">{s.name}</td>
+              <td style="padding:9px 12px;border-bottom:1px solid {_LINE};text-align:right;{_NUM}">{s.trades}</td>
+              <td style="padding:9px 12px;border-bottom:1px solid {_LINE};text-align:right;{_NUM}">{s.wins}/{s.losses}</td>
+              <td style="padding:9px 12px;border-bottom:1px solid {_LINE};text-align:right;{_NUM}">{_money(s.cost)}</td>
+              <td style="padding:9px 12px;border-bottom:1px solid {_LINE};text-align:right;font-weight:600;{_NUM}
+                         color:{_WIN if s.pnl >= 0 else _LOSS};">{_signed(s.pnl)}</td>
             </tr>"""
-            for s in data.by_strategy
+            for i, s in enumerate(data.by_strategy)
         )
         strategies_block = f"""
-        <h3 style="font-size:14px;color:#333;margin:24px 0 8px;">By strategy</h3>
+        <h3 style="font-size:12px;color:{_MUTED};margin:24px 0 8px;text-transform:uppercase;
+                   letter-spacing:.6px;">By strategy</h3>
         <table role="presentation" width="100%" cellpadding="0" cellspacing="0"
-               style="border-collapse:collapse;font-size:13px;">
+               style="border-collapse:collapse;font-size:13px;border:1px solid {_LINE};
+                      border-radius:6px;overflow:hidden;">
           <thead>
-            <tr style="background:#fafafa;">
-              <th style="padding:8px 12px;text-align:left;border-bottom:1px solid #ddd;">Strategy</th>
-              <th style="padding:8px 12px;text-align:right;border-bottom:1px solid #ddd;">Trades</th>
-              <th style="padding:8px 12px;text-align:right;border-bottom:1px solid #ddd;">W/L</th>
-              <th style="padding:8px 12px;text-align:right;border-bottom:1px solid #ddd;">P&amp;L</th>
+            <tr style="background:#f3f4f6;">
+              <th style="padding:8px 12px;text-align:left;font-size:11px;color:{_MUTED};
+                         text-transform:uppercase;letter-spacing:.5px;">Strategy</th>
+              <th style="padding:8px 12px;text-align:right;font-size:11px;color:{_MUTED};
+                         text-transform:uppercase;letter-spacing:.5px;">Trades</th>
+              <th style="padding:8px 12px;text-align:right;font-size:11px;color:{_MUTED};
+                         text-transform:uppercase;letter-spacing:.5px;">W/L</th>
+              <th style="padding:8px 12px;text-align:right;font-size:11px;color:{_MUTED};
+                         text-transform:uppercase;letter-spacing:.5px;">Capital</th>
+              <th style="padding:8px 12px;text-align:right;font-size:11px;color:{_MUTED};
+                         text-transform:uppercase;letter-spacing:.5px;">P&amp;L</th>
             </tr>
           </thead>
           <tbody>{rows}</tbody>
@@ -331,38 +419,49 @@ def render_html(data: ReportData) -> str:
         strategies_block = ""
 
     if data.trades:
-        trade_rows = "".join(
-            f"""<tr>
-              <td style="padding:6px 8px;border-bottom:1px solid #f0f0f0;color:#666;">{t.when.strftime('%m/%d %H:%M')}</td>
-              <td style="padding:6px 8px;border-bottom:1px solid #f0f0f0;font-family:monospace;">{t.symbol}</td>
-              <td style="padding:6px 8px;border-bottom:1px solid #f0f0f0;color:#666;">{t.strategy}</td>
-              <td style="padding:6px 8px;border-bottom:1px solid #f0f0f0;text-align:right;">{t.qty}</td>
-              <td style="padding:6px 8px;border-bottom:1px solid #f0f0f0;text-align:right;">{_money(t.entry)}</td>
-              <td style="padding:6px 8px;border-bottom:1px solid #f0f0f0;text-align:right;">{_money(t.exit)}</td>
-              <td style="padding:6px 8px;border-bottom:1px solid #f0f0f0;text-align:right;">{_money(t.cost)}</td>
-              <td style="padding:6px 8px;border-bottom:1px solid #f0f0f0;text-align:right;">{_money(t.proceeds)}</td>
-              <td style="padding:6px 8px;border-bottom:1px solid #f0f0f0;text-align:right;color:{'#1b5e20' if t.pnl >= 0 else '#b71c1c'};">{_signed(t.pnl)}</td>
+        def _trade_row(i: int, t: TradeRow) -> str:
+            c = _WIN if t.pnl >= 0 else _LOSS
+            ret = (t.pnl / t.cost * 100) if t.cost > 0.01 else None
+            cell = f"padding:8px;border-bottom:1px solid {_LINE};"
+            return f"""<tr style="background:{_ZEBRA if i % 2 else '#fff'};">
+              <td style="{cell}color:{_FAINT};white-space:nowrap;">{t.when.strftime('%m/%d %H:%M')}</td>
+              <td style="{cell}font-weight:600;white-space:nowrap;">{format_contract(t.symbol, t.symbol)}</td>
+              <td style="{cell}text-align:right;{_NUM}">{t.qty}</td>
+              <td style="{cell}text-align:right;color:{_MUTED};{_NUM}">
+                ${t.entry:.2f} &rarr; ${t.exit:.2f}</td>
+              <td style="{cell}text-align:right;{_NUM}">{_money(t.cost)}</td>
+              <td style="{cell}text-align:right;{_NUM}">{_money(t.proceeds)}</td>
+              <td style="{cell}text-align:right;font-weight:600;color:{c};{_NUM}">{_signed(t.pnl)}</td>
+              <td style="{cell}text-align:right;color:{c};{_NUM}">
+                {'—' if ret is None else f'{ret:+.1f}%'}</td>
             </tr>"""
-            for t in data.trades
-        )
+
+        trade_rows = "".join(_trade_row(i, t) for i, t in enumerate(data.trades))
         cap_note = ""
         if data.trade_count > _TRADES_TABLE_CAP:
-            cap_note = f'<div style="font-size:11px;color:#999;margin-top:6px;">Showing {_TRADES_TABLE_CAP} most recent of {data.trade_count} trades.</div>'
+            cap_note = (
+                f'<div style="font-size:11px;color:{_FAINT};margin-top:6px;">'
+                f'Showing {_TRADES_TABLE_CAP} most recent of {data.trade_count} trades. '
+                f'Totals above cover all {data.trade_count}.</div>'
+            )
+        th = (f'padding:8px;text-align:right;font-size:10px;color:{_MUTED};'
+              f'text-transform:uppercase;letter-spacing:.5px;white-space:nowrap;')
         trades_block = f"""
-        <h3 style="font-size:14px;color:#333;margin:24px 0 8px;">Closed trades</h3>
+        <h3 style="font-size:12px;color:{_MUTED};margin:24px 0 8px;text-transform:uppercase;
+                   letter-spacing:.6px;">Closed trades</h3>
         <table role="presentation" width="100%" cellpadding="0" cellspacing="0"
-               style="border-collapse:collapse;font-size:12px;">
+               style="border-collapse:collapse;font-size:12px;border:1px solid {_LINE};
+                      border-radius:6px;overflow:hidden;">
           <thead>
-            <tr style="background:#fafafa;">
-              <th style="padding:6px 8px;text-align:left;border-bottom:1px solid #ddd;">Time</th>
-              <th style="padding:6px 8px;text-align:left;border-bottom:1px solid #ddd;">Symbol</th>
-              <th style="padding:6px 8px;text-align:left;border-bottom:1px solid #ddd;">Strategy</th>
-              <th style="padding:6px 8px;text-align:right;border-bottom:1px solid #ddd;">Qty</th>
-              <th style="padding:6px 8px;text-align:right;border-bottom:1px solid #ddd;">Entry</th>
-              <th style="padding:6px 8px;text-align:right;border-bottom:1px solid #ddd;">Exit</th>
-              <th style="padding:6px 8px;text-align:right;border-bottom:1px solid #ddd;">Cost</th>
-              <th style="padding:6px 8px;text-align:right;border-bottom:1px solid #ddd;">Proceeds</th>
-              <th style="padding:6px 8px;text-align:right;border-bottom:1px solid #ddd;">P&amp;L</th>
+            <tr style="background:#f3f4f6;">
+              <th style="{th}text-align:left;">Time</th>
+              <th style="{th}text-align:left;">Contract</th>
+              <th style="{th}">Qty</th>
+              <th style="{th}">Entry &rarr; Exit</th>
+              <th style="{th}">Cost</th>
+              <th style="{th}">Proceeds</th>
+              <th style="{th}">P&amp;L</th>
+              <th style="{th}">Return</th>
             </tr>
           </thead>
           <tbody>{trade_rows}</tbody>
@@ -370,20 +469,30 @@ def render_html(data: ReportData) -> str:
         {cap_note}
         """
     else:
-        trades_block = '<div style="color:#888;font-size:13px;margin:24px 0 8px;">No closed trades in this period.</div>'
+        trades_block = (
+            f'<div style="color:{_FAINT};font-size:13px;margin:24px 0 8px;">'
+            f'No closed trades in this period.</div>'
+        )
 
     return f"""<!doctype html>
-<html><body style="margin:0;padding:24px;background:#f5f5f5;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#222;">
-  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="max-width:680px;margin:0 auto;background:#fff;border-radius:8px;padding:24px;">
+<html><body style="margin:0;padding:24px;background:#f3f4f6;
+  font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;color:{_INK};">
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0"
+         style="max-width:720px;margin:0 auto;background:#fff;border-radius:10px;
+                padding:26px;border:1px solid {_LINE};">
     <tr><td>
-      <div style="font-size:11px;color:#888;text-transform:uppercase;letter-spacing:1px;">VegaPunkR</div>
-      <h1 style="font-size:20px;color:#222;margin:4px 0 16px;">{data.label}</h1>
-      <div style="font-size:13px;color:#666;margin-bottom:16px;">Hi {data.user_name},</div>
+      <div style="font-size:10px;color:{_FAINT};text-transform:uppercase;letter-spacing:1.4px;
+                  font-weight:600;">VegaPunkR</div>
+      <h1 style="font-size:19px;color:{_INK};margin:6px 0 2px;font-weight:600;">{data.label}</h1>
+      <div style="font-size:12px;color:{_MUTED};margin-bottom:18px;">Hi {data.user_name},</div>
       {summary}
       {strategies_block}
       {trades_block}
-      <div style="font-size:11px;color:#999;margin-top:32px;border-top:1px solid #eee;padding-top:12px;">
-        Sent to {data.user_email}. Toggle these reports in the user menu under "Email reports".
+      <div style="font-size:11px;color:{_FAINT};margin-top:30px;border-top:1px solid {_LINE};
+                  padding-top:12px;line-height:1.5;">
+        Options are quoted per share and trade in 100-share contracts &mdash; Cost and
+        Proceeds are the dollars actually committed, not the premium.<br>
+        Sent to {data.user_email}. Toggle these reports in the user menu under &ldquo;Email reports&rdquo;.
       </div>
     </td></tr>
   </table>
@@ -398,22 +507,36 @@ def render_text(data: ReportData) -> str:
         "",
         f"Total realized P&L: {_signed(data.total_pnl)}",
         f"Trades: {data.trade_count}  |  Wins/Losses: {data.win_count}/{data.loss_count}  |  Win rate: {_pct(data.win_rate)}",
-        f"Commission: {_money(data.total_commission)}  |  Fees: {_money(data.total_fees)}",
+        f"Capital deployed: {_money(data.total_cost)}  |  Proceeds: {_money(data.total_proceeds)}"
+        f"  |  Return on capital: {_pct(data.return_on_capital)}",
+        f"Commission: {_money(data.total_commission)}  |  Fees: {_money(data.total_fees)}"
+        f"  |  Net after costs: {_signed(data.total_pnl - data.total_commission - data.total_fees)}",
     ]
     if data.by_strategy:
         lines.append("")
         lines.append("By strategy:")
         for s in data.by_strategy:
-            lines.append(f"  {s.name}: {s.trades} trades, {s.wins}W/{s.losses}L, {_signed(s.pnl)}")
+            lines.append(
+                f"  {s.name}: {s.trades} trades, {s.wins}W/{s.losses}L, "
+                f"capital {_money(s.cost)}, {_signed(s.pnl)}"
+            )
     if data.trades:
         lines.append("")
         lines.append(f"Closed trades ({len(data.trades)} of {data.trade_count}):")
+        header = (
+            f"  {'Time':<12} {'Contract':<22} {'Qty':>4}  {'Entry':>7} {'Exit':>7}  "
+            f"{'Cost':>10} {'Proceeds':>10}  {'P&L':>10} {'Return':>8}"
+        )
+        lines.append(header)
+        lines.append("  " + "-" * (len(header) - 2))
         for t in data.trades:
+            ret = f"{t.pnl / t.cost * 100:+.1f}%" if t.cost > 0.01 else "—"
             lines.append(
-                f"  {t.when.strftime('%m/%d %H:%M')}  {t.symbol:<24} "
-                f"{t.qty:>4}  entry {_money(t.entry):>10}  exit {_money(t.exit):>10}  "
-                f"cost {_money(t.cost):>10}  proceeds {_money(t.proceeds):>10}  "
-                f"P&L {_signed(t.pnl)}"
+                f"  {t.when.strftime('%m/%d %H:%M'):<12} "
+                f"{format_contract(t.symbol, t.symbol):<22} {t.qty:>4}  "
+                f"{t.entry:>7.2f} {t.exit:>7.2f}  "
+                f"{_money(t.cost):>10} {_money(t.proceeds):>10}  "
+                f"{_signed(t.pnl):>10} {ret:>8}"
             )
     else:
         lines.append("")

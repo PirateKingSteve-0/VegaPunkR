@@ -1,15 +1,43 @@
 <div class="performance-container">
-  <div class="header">
-    <h1>Performance Analytics</h1>
+  <div class="page-header">
+    <div>
+      <h1>Performance</h1>
+      <div class="page-subtitle">Realized results, equity curve and daily P&amp;L.</div>
+    </div>
     <div class="header-actions">
-      <mat-button-toggle-group
-        [value]="period()"
-        (change)="onPeriodChange($event.value)"
-        aria-label="Period">
-        <mat-button-toggle *ngFor="let p of periods" [value]="p.value">
-          {{ p.label }}
-        </mat-button-toggle>
-      </mat-button-toggle-group>
+      <div class="range-picker">
+        <!-- Common ranges stay one click away; the rest live in the overflow. -->
+        <mat-button-toggle-group
+          [value]="rangeId()"
+          (change)="selectRange($event.value)"
+          aria-label="Reporting range">
+          <mat-button-toggle *ngFor="let p of quickPresets" [value]="p.id"
+                             [matTooltip]="p.title">
+            {{ p.label }}
+          </mat-button-toggle>
+        </mat-button-toggle-group>
+
+        <button mat-stroked-button class="range-more"
+                [class.range-more-active]="isMenuRangeActive()"
+                [matMenuTriggerFor]="rangeMenu"
+                aria-label="More ranges">
+          <span>{{ isMenuRangeActive() ? activeMenuLabel() : 'More' }}</span>
+          <mat-icon class="range-more-caret">arrow_drop_down</mat-icon>
+        </button>
+        <mat-menu #rangeMenu="matMenu">
+          <button mat-menu-item *ngFor="let p of menuPresets"
+                  [class.active]="rangeId() === p.id"
+                  (click)="selectRange(p.id)">
+            <span>{{ p.title }}</span>
+          </button>
+          <mat-divider></mat-divider>
+          <button mat-menu-item [class.active]="rangeId() === 'CUSTOM'"
+                  (click)="openCustomRange()">
+            <mat-icon>date_range</mat-icon>
+            <span>Custom range…</span>
+          </button>
+        </mat-menu>
+      </div>
       <button mat-stroked-button (click)="refresh()" [disabled]="loading()">
         <mat-icon>refresh</mat-icon>
         Refresh
@@ -17,7 +45,36 @@
     </div>
   </div>
 
-  <div *ngIf="error()" class="error-banner">
+  <div class="custom-range" *ngIf="showCustomRange()">
+    <mat-form-field appearance="outline" class="custom-range-field">
+      <mat-label>Start</mat-label>
+      <input matInput [matDatepicker]="rangeStartPicker"
+             [ngModel]="customStart()" (ngModelChange)="customStart.set($event)"
+             [max]="customEnd()">
+      <mat-datepicker-toggle matIconSuffix [for]="rangeStartPicker"></mat-datepicker-toggle>
+      <mat-datepicker #rangeStartPicker></mat-datepicker>
+    </mat-form-field>
+
+    <mat-form-field appearance="outline" class="custom-range-field">
+      <mat-label>End</mat-label>
+      <input matInput [matDatepicker]="rangeEndPicker"
+             [ngModel]="customEnd()" (ngModelChange)="customEnd.set($event)"
+             [min]="customStart()">
+      <mat-datepicker-toggle matIconSuffix [for]="rangeEndPicker"></mat-datepicker-toggle>
+      <mat-datepicker #rangeEndPicker></mat-datepicker>
+    </mat-form-field>
+
+    <button mat-raised-button color="primary"
+            [disabled]="!customStart() || !customEnd() || loading()"
+            (click)="applyCustomRange()">Apply</button>
+    <button mat-button (click)="cancelCustomRange()">Cancel</button>
+
+    <span class="custom-range-hint" *ngIf="range().intraday">
+      Single session — showing intraday realized P&amp;L.
+    </span>
+  </div>
+
+  <div *ngIf="error()" class="banner banner-error">
     <mat-icon>error_outline</mat-icon>
     <span>{{ error() }}</span>
   </div>
@@ -54,8 +111,8 @@
 
   <mat-card class="chart-card">
     <mat-card-header>
-      <mat-card-title>Equity Curve</mat-card-title>
-      <mat-card-subtitle>Account value, {{ periodLabel() }}</mat-card-subtitle>
+      <mat-card-title>{{ chartTitle() }}</mat-card-title>
+      <mat-card-subtitle>{{ periodLabel() }} — {{ chartSubtitle() }}</mat-card-subtitle>
     </mat-card-header>
     <mat-card-content>
       <div class="chart-host" *ngIf="(chartData().labels?.length || 0) > 0; else chartEmpty">
@@ -68,12 +125,19 @@
       <ng-template #chartEmpty>
         <div class="empty-state">
           <mat-icon>show_chart</mat-icon>
-          <p *ngIf="loading()">Loading equity curve…</p>
-          <p *ngIf="!loading()">
-            No historical balance data for this period.
-            <br />
-            <small>Tradier sandbox accounts do not return historical data.</small>
-          </p>
+          <p *ngIf="loading()">Loading…</p>
+          <ng-container *ngIf="!loading()">
+            <p *ngIf="range().intraday">
+              No closed trades in this session yet.
+              <br />
+              <small>The intraday curve is built from your own fills, so it starts at the first exit.</small>
+            </p>
+            <p *ngIf="!range().intraday">
+              No historical balance data for this range.
+              <br />
+              <small>Tradier sandbox accounts do not return historical data.</small>
+            </p>
+          </ng-container>
         </div>
       </ng-template>
     </mat-card-content>

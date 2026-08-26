@@ -1,17 +1,29 @@
+// App shell: flat toolbar + nav rail. Chrome stays quiet so the page content
+// is the only thing competing for attention.
+
 .dashboard-container {
   height: 100vh;
   display: flex;
   flex-direction: column;
 }
 
+// -----------------------------------------------------------------------------
+// Toolbar
+// -----------------------------------------------------------------------------
+
 .dashboard-toolbar {
   z-index: 2;
-  box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
+  height: var(--toolbar-h);
+  min-height: var(--toolbar-h);
+  padding: 0 var(--sp-2) 0 var(--sp-1);
+  gap: var(--sp-1);
 
   .app-title {
-    font-size: 20px;
-    font-weight: 600;
-    margin-left: 16px;
+    font-size: var(--fs-md);
+    font-weight: var(--fw-semibold);
+    letter-spacing: var(--ls-tight);
+    margin-left: var(--sp-2);
+    color: var(--text);
   }
 
   .spacer {
@@ -19,359 +31,339 @@
   }
 }
 
+// -----------------------------------------------------------------------------
+// Sidenav
+// -----------------------------------------------------------------------------
+
 .dashboard-sidenav-container {
   flex: 1;
   overflow: hidden;
 }
 
 .dashboard-sidenav {
-  width: 250px;
+  width: var(--sidenav-w);
   border-right: 1px solid var(--border);
-  display: flex;
-  flex-direction: column;
+
+  // mat-sidenav wraps projected content in .mat-drawer-inner-container, so the
+  // flex column has to live there — on the host it does nothing and the
+  // environment footer never reaches the bottom of the rail.
+  ::ng-deep .mat-drawer-inner-container {
+    display: flex;
+    flex-direction: column;
+    height: 100%;
+  }
 
   mat-nav-list {
-    padding-top: 16px;
+    padding: var(--sp-3) var(--sp-2);
     flex: 1;
 
     a[mat-list-item] {
-      margin: 4px 8px;
-      border-radius: 8px;
-      transition: all 0.2s ease;
+      height: 38px;
+      margin-bottom: 2px;
+      border-radius: var(--radius-sm);
+      color: var(--text-muted);
+      position: relative;
+      transition: background-color var(--dur-fast) var(--ease),
+        color var(--dur-fast) var(--ease);
 
-      &:hover {
-        background-color: var(--surface-hover);
-      }
-
-      &.active-link {
-        background-color: rgba(103, 126, 234, 0.1);
-        color: #667eea;
-
-        mat-icon {
-          color: #667eea;
-        }
+      ::ng-deep .mat-mdc-list-item-title {
+        font-size: var(--fs-sm);
+        font-weight: var(--fw-medium);
+        letter-spacing: var(--ls-tight);
       }
 
       mat-icon {
-        margin-right: 16px;
+        margin-right: var(--sp-3);
+        font-size: 19px;
+        width: 19px;
+        height: 19px;
+        color: var(--text-faint);
+        transition: color var(--dur-fast) var(--ease);
       }
-    }
-  }
-
-  .environment-selector {
-    margin-top: auto;
-    padding: 16px 8px 8px 8px;
-
-    mat-divider {
-      margin-bottom: 12px;
-    }
-
-    .env-button {
-      width: 100%;
-      display: flex;
-      align-items: center;
-      justify-content: flex-start;
-      padding: 8px 12px;
-      text-align: left;
-      border-radius: 8px;
-      transition: background-color 0.2s ease;
-      position: relative;
 
       &:hover {
         background-color: var(--surface-hover);
-      }
+        color: var(--text);
 
-      // Color indicator bar on the left
-      &::before {
-        content: '';
-        position: absolute;
-        left: 0;
-        top: 8px;
-        bottom: 8px;
-        width: 4px;
-        border-radius: 0 4px 4px 0;
-        transition: background-color 0.3s ease;
-      }
-
-      mat-icon:first-child {
-        margin-right: 12px;
-        margin-left: 8px;
-        color: var(--text-muted);
-      }
-
-      .env-label {
-        flex: 1;
-        display: flex;
-        flex-direction: column;
-        min-width: 0;
-
-        .env-title {
-          font-size: 12px;
+        mat-icon {
           color: var(--text-muted);
-          font-weight: 500;
-          text-transform: uppercase;
-          letter-spacing: 0.5px;
-        }
-
-        .env-value {
-          font-size: 14px;
-          font-weight: 600;
-          margin-top: 2px;
-          transition: color 0.3s ease;
         }
       }
 
-      .dropdown-icon {
-        margin-left: 8px;
-        color: var(--text-muted);
-      }
+      &.active-link {
+        background-color: var(--primary-bg);
+        color: var(--primary);
+        // Accent rail on the leading edge. An inset shadow rather than a
+        // pseudo-element: MDC owns ::before on list items for its state layer.
+        box-shadow: inset 3px 0 0 var(--primary);
 
-      // Dev environment styling (positive tone)
-      &.env-dev {
-        &::before {
-          background-color: var(--color-profit);
+        ::ng-deep .mat-mdc-list-item-title {
+          font-weight: var(--fw-semibold);
         }
-        .env-label .env-value {
-          color: var(--color-profit);
-        }
-      }
 
-      // Test environment styling (blue)
-      &.env-test {
-        &::before {
-          background-color: #2196F3;
-        }
-        .env-label .env-value {
-          color: #2196F3;
+        mat-icon {
+          color: var(--primary);
         }
       }
-
-      // Production environment styling (purple)
-      &.env-prod {
-        &::before {
-          background-color: #9C27B0;
-        }
-        .env-label .env-value {
-          color: #9C27B0;
-        }
-      }
-    }
-
-    // Trading mode button styling
-    .trading-button {
-      width: 100%;
-      display: flex;
-      align-items: center;
-      justify-content: flex-start;
-      padding: 8px 12px;
-      text-align: left;
-      border-radius: 8px;
-      transition: background-color 0.2s ease;
-      position: relative;
-      margin-top: 8px;
-
-      &:hover {
-        background-color: var(--surface-hover);
-      }
-
-      // Color indicator bar
-      &::before {
-        content: '';
-        position: absolute;
-        left: 0;
-        top: 8px;
-        bottom: 8px;
-        width: 4px;
-        border-radius: 0 4px 4px 0;
-        transition: background-color 0.3s ease;
-      }
-
-      mat-icon:first-child {
-        margin-right: 12px;
-        margin-left: 8px;
-        color: var(--text-muted);
-      }
-
-      .trading-label {
-        flex: 1;
-        display: flex;
-        flex-direction: column;
-        min-width: 0;
-
-        .trading-title {
-          font-size: 12px;
-          color: var(--text-muted);
-          font-weight: 500;
-          text-transform: uppercase;
-          letter-spacing: 0.5px;
-        }
-
-        .trading-value {
-          font-size: 14px;
-          font-weight: 600;
-          margin-top: 2px;
-          transition: color 0.3s ease;
-        }
-      }
-
-      .dropdown-icon {
-        margin-left: 8px;
-        color: var(--text-muted);
-      }
-
-      // Paper trading styling (safe / positive tone)
-      &.trading-paper {
-        &::before {
-          background-color: var(--color-profit);
-        }
-        .trading-label .trading-value {
-          color: var(--color-profit);
-        }
-      }
-
-      // Live trading styling (danger / negative tone with animation)
-      &.trading-live {
-        &::before {
-          background-color: var(--color-loss);
-          animation: pulse 2s ease-in-out infinite;
-        }
-        .trading-label .trading-value {
-          color: var(--color-loss);
-          animation: pulse-text 2s ease-in-out infinite;
-        }
-      }
-    }
-
-    // Warning banner for live trading
-    .warning-banner {
-      margin-top: 8px;
-      padding: 8px 12px;
-      background-color: var(--color-loss-bg);
-      border-left: 4px solid var(--color-loss);
-      border-radius: 4px;
-      font-size: 12px;
-      font-weight: 500;
-      color: var(--color-loss);
-      animation: pulse-warning 2s ease-in-out infinite;
     }
   }
 }
+
+// -----------------------------------------------------------------------------
+// Environment / trading-mode footer
+// -----------------------------------------------------------------------------
+
+.environment-selector {
+  margin-top: auto;
+  padding: var(--sp-2);
+  border-top: 1px solid var(--border);
+
+  // The divider element in the template is redundant now that the block has a
+  // real top border.
+  mat-divider {
+    display: none;
+  }
+
+  // Shared shape for both the trading-mode and database pickers.
+  .trading-button,
+  .env-button {
+    width: 100%;
+    display: flex;
+    align-items: center;
+    justify-content: flex-start;
+    padding: var(--sp-2) var(--sp-2) var(--sp-2) var(--sp-3);
+    text-align: left;
+    border-radius: var(--radius-sm);
+    border: 1px solid var(--border);
+    background: var(--surface-alt);
+    transition: border-color var(--dur) var(--ease), background-color var(--dur) var(--ease);
+    position: relative;
+    overflow: hidden;
+
+    &:hover:not(:disabled) {
+      background-color: var(--surface-hover);
+      border-color: var(--border-strong);
+    }
+
+    // Status rail down the left edge, tinted by mode.
+    &::before {
+      content: '';
+      position: absolute;
+      left: 0;
+      top: 0;
+      bottom: 0;
+      width: 3px;
+      background-color: var(--text-faint);
+      transition: background-color var(--dur) var(--ease);
+    }
+
+    // MatButton hoists every projected <mat-icon> ahead of the text and wraps
+    // the rest in .mdc-button__label. Left alone that puts the dropdown caret
+    // between the leading icon and the label, so the three flex items are
+    // ordered explicitly instead.
+    mat-icon:not(.dropdown-icon) {
+      order: 1;
+      margin-right: var(--sp-2);
+      font-size: 18px;
+      width: 18px;
+      height: 18px;
+      color: var(--text-faint);
+    }
+
+    ::ng-deep .mdc-button__label {
+      order: 2;
+      flex: 1;
+      min-width: 0;
+      display: flex;
+      text-align: left;
+    }
+
+    .dropdown-icon {
+      order: 3;
+      margin-left: var(--sp-1);
+      font-size: 18px;
+      width: 18px;
+      height: 18px;
+      color: var(--text-faint);
+    }
+  }
+
+  .env-button {
+    margin-top: var(--sp-2);
+  }
+
+  // Label stack: uppercase eyebrow over the current value.
+  .trading-label,
+  .env-label {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    min-width: 0;
+    line-height: 1.25;
+
+    .trading-title,
+    .env-title {
+      font-size: var(--fs-micro);
+      color: var(--text-faint);
+      font-weight: var(--fw-semibold);
+      text-transform: uppercase;
+      letter-spacing: var(--ls-eyebrow);
+    }
+
+    .trading-value,
+    .env-value {
+      font-size: var(--fs-sm);
+      font-weight: var(--fw-semibold);
+      letter-spacing: var(--ls-tight);
+      margin-top: 1px;
+      color: var(--text);
+      transition: color var(--dur) var(--ease);
+    }
+  }
+
+  // ---- Mode tinting ----
+  .trading-button.trading-paper {
+    &::before {
+      background-color: var(--color-profit);
+    }
+    .trading-value {
+      color: var(--color-profit-strong);
+    }
+  }
+
+  // Live trading is the one place in the shell that is allowed to shout.
+  .trading-button.trading-live {
+    border-color: var(--color-loss);
+    background: var(--color-loss-bg-soft);
+
+    &::before {
+      background-color: var(--color-loss);
+      animation: rail-pulse 2s ease-in-out infinite;
+    }
+    .trading-value {
+      color: var(--color-loss-strong);
+    }
+    mat-icon:first-child {
+      color: var(--color-loss);
+    }
+  }
+
+  .env-button {
+    &.env-dev::before {
+      background-color: var(--color-profit);
+    }
+    &.env-test::before {
+      background-color: var(--primary);
+    }
+    &.env-prod::before {
+      background-color: var(--color-warning);
+    }
+  }
+
+  .warning-banner {
+    margin-top: var(--sp-2);
+    padding: var(--sp-2) var(--sp-3);
+    background-color: var(--color-loss-bg);
+    border-radius: var(--radius-sm);
+    font-size: var(--fs-xs);
+    font-weight: var(--fw-medium);
+    line-height: 1.4;
+    color: var(--color-loss-strong);
+  }
+}
+
+// -----------------------------------------------------------------------------
+// Content
+// -----------------------------------------------------------------------------
 
 .dashboard-content {
   background-color: var(--surface-alt);
 }
 
 .content-wrapper {
-  padding: 24px;
-  max-width: 1400px;
+  padding: var(--sp-6);
+  max-width: var(--content-max);
   margin: 0 auto;
 }
+
+// -----------------------------------------------------------------------------
+// User menu
+// -----------------------------------------------------------------------------
 
 .user-info {
   display: flex;
   flex-direction: column;
-  padding: 8px 16px;
+  padding: var(--sp-3) var(--sp-4);
   cursor: default;
+  opacity: 1 !important;
 
   .user-name {
-    font-weight: 600;
-    font-size: 14px;
+    font-weight: var(--fw-semibold);
+    font-size: var(--fs-sm);
     color: var(--text);
   }
 
   .user-email {
-    font-size: 12px;
+    font-size: var(--fs-xs);
     color: var(--text-muted);
-    margin-top: 4px;
+    margin-top: 2px;
   }
 
   .user-role {
-    margin-top: 6px;
+    margin-top: var(--sp-2);
     align-self: flex-start;
-    padding: 2px 8px;
-    font-size: 11px;
-    font-weight: 600;
+    padding: 2px var(--sp-2);
+    font-size: var(--fs-micro);
+    font-weight: var(--fw-semibold);
     text-transform: uppercase;
-    letter-spacing: 0.04em;
-    border-radius: 10px;
-    background: var(--surface-alt);
+    letter-spacing: var(--ls-eyebrow);
+    border-radius: var(--radius-pill);
+    background: var(--surface-inset);
     color: var(--text-muted);
     border: 1px solid var(--border);
   }
 }
 
+::ng-deep .mat-mdc-menu-content button.mat-mdc-menu-item.active {
+  background-color: var(--primary-bg);
+  color: var(--primary);
+
+  mat-icon {
+    color: var(--primary);
+  }
+}
+
+// -----------------------------------------------------------------------------
+// Responsive
+// -----------------------------------------------------------------------------
+
 @media (max-width: 960px) {
   .dashboard-sidenav {
-    width: 200px;
+    width: 208px;
   }
 
   .content-wrapper {
-    padding: 16px;
-  }
-}
-
-// Active menu item styling
-::ng-deep .mat-mdc-menu-content {
-  button.mat-mdc-menu-item.active {
-    background-color: rgba(103, 126, 234, 0.1);
-    color: #667eea;
-
-    mat-icon {
-      color: #667eea;
-    }
-  }
-}
-
-@media (max-width: 960px) {
-  .dashboard-sidenav .environment-selector {
-    .env-label {
-      .env-title {
-        font-size: 11px;
-      }
-
-      .env-value {
-        font-size: 13px;
-      }
-    }
+    padding: var(--sp-4);
   }
 }
 
 @media (max-width: 600px) {
   .dashboard-toolbar .app-title {
-    font-size: 16px;
+    font-size: var(--fs-base);
   }
 
   .content-wrapper {
-    padding: 12px;
+    padding: var(--sp-3);
   }
 }
 
-// Animations for live trading indicators
-@keyframes pulse {
-  0%, 100% {
+@keyframes rail-pulse {
+  0%,
+  100% {
     opacity: 1;
   }
   50% {
-    opacity: 0.6;
-  }
-}
-
-@keyframes pulse-text {
-  0%, 100% {
-    opacity: 1;
-  }
-  50% {
-    opacity: 0.7;
-  }
-}
-
-@keyframes pulse-warning {
-  0%, 100% {
-    opacity: 1;
-    transform: scale(1);
-  }
-  50% {
-    opacity: 0.8;
-    transform: scale(0.99);
+    opacity: 0.35;
   }
 }

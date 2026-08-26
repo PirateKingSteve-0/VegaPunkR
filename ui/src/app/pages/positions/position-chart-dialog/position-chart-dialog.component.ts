@@ -223,11 +223,11 @@ export class PositionChartDialogComponent implements OnInit, AfterViewInit, OnDe
       },
     });
     this.series = this.chart.addSeries(CandlestickSeries, {
-      upColor: '#26a69a',
-      downColor: '#ef5350',
+      upColor: palette.profit,
+      downColor: palette.loss,
       borderVisible: false,
-      wickUpColor: '#26a69a',
-      wickDownColor: '#ef5350',
+      wickUpColor: palette.profit,
+      wickDownColor: palette.loss,
     });
   }
 
@@ -300,7 +300,7 @@ export class PositionChartDialogComponent implements OnInit, AfterViewInit, OnDe
       {
         time: entryTime,
         position: 'belowBar',
-        color: '#1976d2',
+        color: this.themeService.chartColors().primary,
         shape: 'arrowUp',
         text: `Entry @ $${this.position.avg_entry_price.toFixed(2)}`,
       },
@@ -354,7 +354,7 @@ export class PositionChartDialogComponent implements OnInit, AfterViewInit, OnDe
       markers.push({
         time: entryTime,
         position: 'belowBar',
-        color: '#1976d2',
+        color: this.themeService.chartColors().primary,
         shape: 'arrowUp',
         text: `Entry @ $${this.position.avg_entry_price.toFixed(2)}`,
       });
@@ -477,7 +477,7 @@ export class PositionChartDialogComponent implements OnInit, AfterViewInit, OnDe
     this.priceLines.push(
       this.series.createPriceLine({
         price: this.position.avg_entry_price,
-        color: '#1976d2',
+        color: this.themeService.chartColors().primary,
         lineWidth: 1,
         lineStyle: 2,
         axisLabelVisible: true,

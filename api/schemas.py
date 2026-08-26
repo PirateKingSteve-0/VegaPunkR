@@ -140,6 +140,44 @@ class DiscordTestRequest(BaseModel):
 
 # ===== Strategy Schemas =====
 
+def _validate_time_exit_params(params: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """Reject a time-of-day exit weaker than the engine's hard floor.
+
+    `exit_before_close_minutes` counts BACKWARDS from the bell, so a SMALLER
+    number means a LATER exit. The engine clamps anything below the floor up to
+    it (signal_generator.forced_exit_time_et), so accepting e.g. 5 here would
+    store a value the UI displays and the engine ignores. 0 — the old form
+    default — meant "never exit", which is how 0DTE contracts ended up carried
+    overnight. Larger values are fine: they exit earlier, which is stricter.
+
+    Validated here as well as enforced in the engine on purpose: the engine
+    floor is the safety boundary, this is the honesty boundary — what you see
+    stored is what actually runs.
+    """
+    if not isinstance(params, dict) or 'exit_before_close_minutes' not in params:
+        return params
+
+    from engine.signal_generator import FORCED_EOD_EXIT_FLOOR_MINUTES
+
+    raw = params['exit_before_close_minutes']
+    try:
+        minutes = int(raw)
+    except (TypeError, ValueError):
+        raise ValueError(
+            f"exit_before_close_minutes must be a whole number of minutes, got {raw!r}"
+        )
+
+    if minutes < FORCED_EOD_EXIT_FLOOR_MINUTES:
+        raise ValueError(
+            f"exit_before_close_minutes must be at least "
+            f"{FORCED_EOD_EXIT_FLOOR_MINUTES} (got {minutes}). This engine only "
+            f"holds 0DTE contracts; anything still open at the bell expires "
+            f"worthless or is auto-exercised into stock a cash account cannot "
+            f"settle. Use a LARGER number to exit earlier."
+        )
+    return params
+
+
 class StrategyBase(BaseModel):
     """Base strategy schema."""
     name: str
@@ -155,7 +193,15 @@ class StrategyBase(BaseModel):
 
 class StrategyCreate(StrategyBase):
     """Schema for creating a strategy."""
-    pass
+
+    # Deliberately on Create, NOT on StrategyBase: StrategyResponse inherits
+    # Base, and a strategy already stored with a sub-floor value must stay
+    # READABLE (so the UI can load it and heal it on save) even though it is
+    # no longer WRITABLE.
+    @field_validator("params_json")
+    @classmethod
+    def _check_time_exit(cls, v):
+        return _validate_time_exit_params(v)
 
 
 class StrategyUpdate(BaseModel):
@@ -170,6 +216,11 @@ class StrategyUpdate(BaseModel):
     take_profit_percentage: Optional[float] = None
     is_active: Optional[bool] = None
     is_paper_trading: Optional[bool] = None
+
+    @field_validator("params_json")
+    @classmethod
+    def _check_time_exit(cls, v):
+        return _validate_time_exit_params(v)
 
 
 class StrategyResponse(StrategyBase):

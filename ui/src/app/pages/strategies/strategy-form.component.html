@@ -1,5 +1,5 @@
 <div class="strategy-form-container">
-  <div class="header">
+  <div class="page-header">
     <h1>{{ isEditMode ? 'Edit Strategy' : 'Create New Strategy' }}</h1>
   </div>
 
@@ -138,9 +138,17 @@
           <div class="form-row">
             <mat-form-field appearance="outline">
               <mat-label>Exit Before Close</mat-label>
-              <input matInput type="number" formControlName="exit_before_close_minutes" step="1" min="0">
+              <input matInput type="number" formControlName="exit_before_close_minutes"
+                     step="1" [min]="EOD_EXIT_FLOOR_MIN">
               <span matSuffix>min</span>
-              <mat-hint>Force exit N minutes before market close. 0 = disabled.</mat-hint>
+              <mat-hint>
+                Force exit N minutes before the bell. Minimum {{ EOD_EXIT_FLOOR_MIN }} and
+                cannot be disabled — higher exits earlier.
+              </mat-hint>
+              <mat-error *ngIf="strategyForm.get('exit_before_close_minutes')?.hasError('min')">
+                Must be at least {{ EOD_EXIT_FLOOR_MIN }}. 0DTE contracts left open at the
+                close expire worthless or auto-exercise into stock a cash account can't settle.
+              </mat-error>
             </mat-form-field>
           </div>
 

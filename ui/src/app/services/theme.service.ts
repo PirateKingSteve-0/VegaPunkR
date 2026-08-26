@@ -14,6 +14,8 @@ export interface ChartPalette {
   surface: string;
 }
 
+type PaletteKey = ThemeMode | 'light-cb' | 'dark-cb';
+
 const STORAGE_KEY_THEME = 'vp.theme';
 const STORAGE_KEY_CB = 'vp.colorblind';
 
@@ -22,59 +24,67 @@ export class ThemeService {
   readonly theme = signal<ThemeMode>(this.loadTheme());
   readonly colorblind = signal<boolean>(this.loadColorblind());
 
+  /**
+   * Chart libraries (Chart.js, lightweight-charts) take colors as JS values, not
+   * CSS, so the token palette has to be mirrored here.
+   *
+   * These four rows are the JS counterpart of the `--color-*` / `--text*` /
+   * `--surface` custom properties in `src/styles.scss`. If you change a value
+   * there, change the matching row here — they are meant to be identical.
+   */
+  private static readonly PALETTES: Record<PaletteKey, ChartPalette> = {
+    light: {
+      profit: '#06894c',
+      loss: '#d92d20',
+      profitFill: 'rgba(6, 137, 76, 0.12)',
+      lossFill: 'rgba(217, 45, 32, 0.12)',
+      primary: '#2563eb',
+      text: '#0e1626',
+      textMuted: '#58637a',
+      grid: 'rgba(14, 22, 38, 0.08)',
+      surface: '#ffffff',
+    },
+    dark: {
+      profit: '#2bc77e',
+      loss: '#f4695e',
+      profitFill: 'rgba(43, 199, 126, 0.16)',
+      lossFill: 'rgba(244, 105, 94, 0.16)',
+      primary: '#6ea3f7',
+      text: '#e4e9f1',
+      textMuted: '#949eae',
+      grid: 'rgba(255, 255, 255, 0.07)',
+      surface: '#13181f',
+    },
+    // Colorblind mode: blue = profit, orange = loss. The accent drops to
+    // graphite so chrome never reads as a profit figure.
+    'light-cb': {
+      profit: '#1d6fe0',
+      loss: '#e06316',
+      profitFill: 'rgba(29, 111, 224, 0.12)',
+      lossFill: 'rgba(224, 99, 22, 0.13)',
+      primary: '#344054',
+      text: '#0e1626',
+      textMuted: '#58637a',
+      grid: 'rgba(14, 22, 38, 0.08)',
+      surface: '#ffffff',
+    },
+    'dark-cb': {
+      profit: '#5aa5ff',
+      loss: '#ff9445',
+      profitFill: 'rgba(90, 165, 255, 0.16)',
+      lossFill: 'rgba(255, 148, 69, 0.16)',
+      primary: '#c3cddb',
+      text: '#e4e9f1',
+      textMuted: '#949eae',
+      grid: 'rgba(255, 255, 255, 0.07)',
+      surface: '#13181f',
+    },
+  };
+
   readonly chartColors = computed<ChartPalette>(() => {
-    const dark = this.theme() === 'dark';
-    const cb = this.colorblind();
-
-    if (cb) {
-      return dark
-        ? {
-            profit: '#64b5f6',
-            loss: '#ffa726',
-            profitFill: 'rgba(100, 181, 246, 0.18)',
-            lossFill: 'rgba(255, 167, 38, 0.18)',
-            primary: '#90caf9',
-            text: 'rgba(255, 255, 255, 0.87)',
-            textMuted: 'rgba(255, 255, 255, 0.55)',
-            grid: 'rgba(255, 255, 255, 0.08)',
-            surface: '#1e1e1e',
-          }
-        : {
-            profit: '#1976d2',
-            loss: '#ef6c00',
-            profitFill: 'rgba(25, 118, 210, 0.14)',
-            lossFill: 'rgba(239, 108, 0, 0.14)',
-            primary: '#1976d2',
-            text: 'rgba(0, 0, 0, 0.87)',
-            textMuted: 'rgba(0, 0, 0, 0.55)',
-            grid: 'rgba(0, 0, 0, 0.08)',
-            surface: '#ffffff',
-          };
-    }
-
-    return dark
-      ? {
-          profit: '#66bb6a',
-          loss: '#ef5350',
-          profitFill: 'rgba(102, 187, 106, 0.18)',
-          lossFill: 'rgba(239, 83, 80, 0.18)',
-          primary: '#90caf9',
-          text: 'rgba(255, 255, 255, 0.87)',
-          textMuted: 'rgba(255, 255, 255, 0.55)',
-          grid: 'rgba(255, 255, 255, 0.08)',
-          surface: '#1e1e1e',
-        }
-      : {
-          profit: '#2e7d32',
-          loss: '#c62828',
-          profitFill: 'rgba(46, 125, 50, 0.14)',
-          lossFill: 'rgba(198, 40, 40, 0.14)',
-          primary: '#1976d2',
-          text: 'rgba(0, 0, 0, 0.87)',
-          textMuted: 'rgba(0, 0, 0, 0.55)',
-          grid: 'rgba(0, 0, 0, 0.08)',
-          surface: '#ffffff',
-        };
+    const mode: ThemeMode = this.theme() === 'dark' ? 'dark' : 'light';
+    const key: PaletteKey = this.colorblind() ? (`${mode}-cb` as PaletteKey) : mode;
+    return ThemeService.PALETTES[key];
   });
 
   constructor() {

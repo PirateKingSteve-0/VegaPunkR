@@ -15,6 +15,25 @@ logger = logging.getLogger(__name__)
 
 _market_hours = MarketHours()
 
+# Hard floor on the forced end-of-day exit, in minutes before the real close.
+# The engine only ever holds 0DTE contracts, so anything still open at the bell
+# either expires worthless or gets auto-exercised into stock a cash account
+# cannot settle.
+#
+# `exit_before_close_minutes` already implements this and, where it is set, it
+# works — it is the single most common exit reason in the trade history. The
+# floor exists because it is OPT-IN: it is falsy when absent and when 0, and
+# the strategy form defaulted it to 0, so a hand-built strategy silently had no
+# time-of-day exit at all. The floor removes the off switch.
+#
+# It can only ever pull an exit EARLIER: combined with the strategy param and
+# the account trading window by taking the MINIMUM exit time, so a strategy
+# asking for 30 minutes still gets 30, while 0 or absent now gets 15.
+#
+# It is also the upper bound on ENTRIES (check_entry_signal), so the engine
+# cannot open a position it is already obliged to close.
+FORCED_EOD_EXIT_FLOOR_MINUTES = 15
+
 
 def _parse_hhmm(value: Optional[str]) -> Optional[Tuple[int, int]]:
     """Parse "HH:MM" into (hour, minute), or return None if invalid/empty."""
@@ -27,6 +46,75 @@ def _parse_hhmm(value: Optional[str]) -> Optional[Tuple[int, int]]:
             return h, m
     except (ValueError, TypeError):
         pass
+    return None
+
+
+def forced_exit_time_et(
+    params: Dict,
+    user: Optional[User],
+    current_et: datetime,
+) -> Tuple[Optional[datetime], Optional[str]]:
+    """The wall-clock ET time after which an open position MUST be closed, and
+    why. Returns (time, reason).
+
+    Effective time is the earliest of:
+      - floor:    market_close - FORCED_EOD_EXIT_FLOOR_MINUTES  (unconditional)
+      - strategy: market_close - params['exit_before_close_minutes']
+      - account:  user.trading_window_end (when trading_window_enabled)
+
+    Most-restrictive-bound wins: any input can pull the exit earlier, none can
+    push it later. Module-level rather than a method because the executor needs
+    the same answer to decide whether to force a close when no quote is
+    available — the rule must not be written down twice.
+    """
+    close_time = _market_hours.get_market_close_time_et()
+    market_close_et = current_et.replace(
+        hour=close_time.hour, minute=close_time.minute, second=0, microsecond=0
+    )
+
+    # The floor always participates. A strategy asking to exit EARLIER wins
+    # below; one asking for later — or asking for nothing at all — is clamped
+    # to the floor. Nothing this engine holds is safe overnight.
+    exit_time_et: Optional[datetime] = market_close_et - timedelta(
+        minutes=FORCED_EOD_EXIT_FLOOR_MINUTES
+    )
+    exit_reason: Optional[str] = (
+        f"End of day: forced exit {FORCED_EOD_EXIT_FLOOR_MINUTES} minutes before close"
+    )
+
+    exit_before_close_minutes = (params or {}).get('exit_before_close_minutes', None)
+    if exit_before_close_minutes:
+        strategy_exit_et = market_close_et - timedelta(minutes=exit_before_close_minutes)
+        if strategy_exit_et < exit_time_et:
+            exit_time_et = strategy_exit_et
+            exit_reason = (
+                f"Market close approaching: {exit_before_close_minutes} minutes before close"
+            )
+
+    if user is not None and getattr(user, 'trading_window_enabled', False):
+        window_end = _parse_hhmm(getattr(user, 'trading_window_end', None))
+        if window_end is not None:
+            account_end_et = current_et.replace(
+                hour=window_end[0], minute=window_end[1], second=0, microsecond=0
+            )
+            if account_end_et < exit_time_et:
+                exit_time_et = account_end_et
+                exit_reason = (
+                    f"Account trading window ended at {account_end_et.strftime('%H:%M')} ET"
+                )
+
+    return exit_time_et, exit_reason
+
+
+def forced_exit_due(params: Dict, user: Optional[User]) -> Optional[str]:
+    """Reason string if an open position is past its forced-exit time right now,
+    else None. Used by the executor to close a position even when it cannot
+    price it — a market sell needs no quote, and an unsold 0DTE is worse than
+    an unpriced one."""
+    current_et = _market_hours.get_current_et_time()
+    exit_time_et, reason = forced_exit_time_et(params, user, current_et)
+    if exit_time_et is not None and current_et >= exit_time_et:
+        return reason or "Forced exit: trading window closed"
     return None
 
 
@@ -105,12 +193,23 @@ class SignalGenerator:
         params = strategy.params_json
         indicators = {}
 
-        # 0. Entry-time gate. Combines two layers, taking the later of the two as
-        # the effective earliest-entry time so users can never widen past their
-        # account window:
-        #   - strategy: market_open + entry_after_open_minutes (opening-noise blackout)
-        #   - account:  user.trading_window_start (when trading_window_enabled)
-        # The account window also has a hard "no entries past end" upper bound.
+        # 0. Entry-time gate — a lower AND an upper bound on when we may open.
+        #
+        # LOWER: later of market_open + entry_after_open_minutes (opening-noise
+        # blackout) and user.trading_window_start, so neither can widen the other.
+        #
+        # UPPER: the forced-exit time itself. Never open a position we are
+        # already obliged to close — the very next tick would sell it. Until
+        # this bound existed the upper bound came ONLY from the account trading
+        # window, which is opt-in and was off: between 2026-07-15 and 08-21 the
+        # engine placed 174 entries after the 15:45 forced exit, each sold
+        # within seconds for a net -$1,064 in spread. One of them (2026-07-31
+        # 16:00:41) straddled the bell, never exited, and expired — which is the
+        # position the Saturday reconcile then booked at the underlying's price
+        # for a phantom +$223,119.
+        #
+        # Reusing forced_exit_time_et() rather than re-deriving the bound means
+        # the two can never drift apart: entries stop exactly when exits start.
         current_et = _market_hours.get_current_et_time()
         market_open_et = current_et.replace(hour=9, minute=30, second=0, microsecond=0)
 
@@ -119,20 +218,14 @@ class SignalGenerator:
         if entry_after_open_minutes:
             effective_start_et = market_open_et + timedelta(minutes=entry_after_open_minutes)
 
-        account_end_et = None
         if user is not None and getattr(user, 'trading_window_enabled', False):
             window_start = _parse_hhmm(getattr(user, 'trading_window_start', None))
-            window_end = _parse_hhmm(getattr(user, 'trading_window_end', None))
             if window_start is not None:
                 account_start_et = current_et.replace(
                     hour=window_start[0], minute=window_start[1], second=0, microsecond=0
                 )
                 if account_start_et > effective_start_et:
                     effective_start_et = account_start_et
-            if window_end is not None:
-                account_end_et = current_et.replace(
-                    hour=window_end[0], minute=window_end[1], second=0, microsecond=0
-                )
 
         if current_et < effective_start_et:
             logger.debug(
@@ -141,11 +234,12 @@ class SignalGenerator:
                 f"{effective_start_et.strftime('%H:%M')}"
             )
             return None
-        if account_end_et is not None and current_et >= account_end_et:
+
+        entry_cutoff_et, cutoff_reason = forced_exit_time_et(params, user, current_et)
+        if entry_cutoff_et is not None and current_et >= entry_cutoff_et:
             logger.debug(
-                f"{symbol}: Account trading window closed — current ET "
-                f"{current_et.strftime('%H:%M')} >= window end "
-                f"{account_end_et.strftime('%H:%M')}"
+                f"{symbol}: No new entries — current ET {current_et.strftime('%H:%M')} "
+                f">= forced-exit time {entry_cutoff_et.strftime('%H:%M')} ({cutoff_reason})"
             )
             return None
 
@@ -414,33 +508,10 @@ class SignalGenerator:
                     indicators={**indicators, 'time_held_minutes': time_held}
                 )
 
-        # 5. Time-of-day exit. Effective forced-exit time is the earliest of:
-        #   - strategy: market_close - exit_before_close_minutes
-        #   - account:  user.trading_window_end (when trading_window_enabled)
-        # so the user's window can pull exits earlier but never push them later.
-        exit_before_close_minutes = params.get('exit_before_close_minutes', None)
+        # 5. Time-of-day exit — see forced_exit_time_et() for how the floor,
+        # the strategy param and the account window compose (earliest wins).
         current_et = _market_hours.get_current_et_time()
-
-        exit_time_et: Optional[datetime] = None
-        exit_reason: Optional[str] = None
-
-        if exit_before_close_minutes:
-            close_time = _market_hours.get_market_close_time_et()
-            market_close_et = current_et.replace(
-                hour=close_time.hour, minute=close_time.minute, second=0, microsecond=0
-            )
-            exit_time_et = market_close_et - timedelta(minutes=exit_before_close_minutes)
-            exit_reason = f"Market close approaching: {exit_before_close_minutes} minutes before close"
-
-        if user is not None and getattr(user, 'trading_window_enabled', False):
-            window_end = _parse_hhmm(getattr(user, 'trading_window_end', None))
-            if window_end is not None:
-                account_end_et = current_et.replace(
-                    hour=window_end[0], minute=window_end[1], second=0, microsecond=0
-                )
-                if exit_time_et is None or account_end_et < exit_time_et:
-                    exit_time_et = account_end_et
-                    exit_reason = f"Account trading window ended at {account_end_et.strftime('%H:%M')} ET"
+        exit_time_et, exit_reason = forced_exit_time_et(params, user, current_et)
 
         if exit_time_et is not None and current_et >= exit_time_et:
             return Signal(

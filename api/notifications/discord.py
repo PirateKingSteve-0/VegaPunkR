@@ -21,6 +21,8 @@ from typing import Any, Dict, Optional, Tuple
 
 import requests
 
+from utils.symbol_helpers import format_contract, is_option_symbol
+
 logger = logging.getLogger(__name__)
 
 WEBHOOK_TIMEOUT_S = 5.0
@@ -44,6 +46,55 @@ def is_valid_discord_webhook(url: Optional[str]) -> bool:
 
 def _discord_prefs(user_prefs: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     return ((user_prefs or {}).get("discord") or {}) if isinstance(user_prefs, dict) else {}
+
+
+def _contract_multiplier(option_symbol: Optional[str], symbol: str) -> int:
+    """100 for an options contract, 1 for equity.
+
+    Options are quoted per share and trade in 100-share contracts, so the
+    premium alone ("$2.23") says nothing about money at risk — $223 does.
+    Both are worth showing; only one of them is the dollar figure.
+    """
+    return 100 if is_option_symbol(option_symbol or symbol) else 1
+
+
+def _money(v: float) -> str:
+    sign = "-" if v < 0 else ""
+    return f"{sign}${abs(v):,.2f}"
+
+
+def _signed_money(v: float) -> str:
+    return f"{'+' if v >= 0 else ''}{_money(v)}"
+
+
+def _table(rows: list) -> str:
+    """Render label/value pairs as an aligned monospace block.
+
+    A plain ``` fence rather than ```ansi: ANSI colour renders on desktop but
+    degrades to visible escape codes on older/mobile clients, and the embed's
+    colour bar already carries win/loss. Alignment is what buys readability
+    here; colour is a bonus we don't need to risk.
+    """
+    label_w = max((len(label) for label, _ in rows if label != "-"), default=0)
+    rendered = [
+        (label, f"{label:<{label_w}}  {value}".rstrip())
+        for label, value in rows
+    ]
+    # Rule spans the widest actual line, so it reads as a rule and not a dash.
+    rule = "─" * max((len(line) for label, line in rendered if label != "-"), default=0)
+    body = "\n".join(rule if label == "-" else line for label, line in rendered)
+    return f"```\n{body}\n```"
+
+
+def _embed(title: str, color: int, rows: list, strategy_name: Optional[str]) -> Dict[str, Any]:
+    embed: Dict[str, Any] = {
+        "title": title,
+        "color": color,
+        "description": _table(rows),
+    }
+    if strategy_name:
+        embed["footer"] = {"text": strategy_name}
+    return embed
 
 
 def _post_async(webhook_url: str, payload: Dict[str, Any]) -> None:
@@ -71,25 +122,24 @@ def notify_position_opened(
     if not is_valid_discord_webhook(webhook):
         return
 
-    label = option_symbol or symbol
-    fields = [
-        {"name": "Qty", "value": str(qty), "inline": True},
-        {"name": "Price", "value": f"${price:.2f}", "inline": True},
+    multiplier = _contract_multiplier(option_symbol, symbol)
+    cost = price * qty * multiplier
+    unit = "contract" if multiplier == 100 else "share"
+
+    rows = [
+        ("Qty", f"{qty} {unit}{'s' if qty != 1 else ''}"),
+        ("Premium", f"${price:.2f}"),
+        ("-", ""),
+        # The number that actually left the account.
+        ("Cost", _money(cost)),
     ]
-    if strategy_name:
-        fields.append({"name": "Strategy", "value": strategy_name, "inline": False})
 
     _post_async(
         webhook,
-        {
-            "embeds": [
-                {
-                    "title": f"🟢 Opened {label}",
-                    "color": _COLOR_GREEN,
-                    "fields": fields,
-                }
-            ]
-        },
+        {"embeds": [_embed(
+            f"🟢  Opened · {format_contract(option_symbol, symbol)}",
+            _COLOR_GREEN, rows, strategy_name,
+        )]},
     )
 
 
@@ -101,6 +151,7 @@ def notify_position_closed(
     pnl: float,
     strategy_name: Optional[str] = None,
     option_symbol: Optional[str] = None,
+    entry_price: Optional[float] = None,
 ) -> None:
     # Call sites (audited 2026-05-09 — exactly one fire per real fully-closed
     # position, never on bailout/retry):
@@ -125,29 +176,40 @@ def notify_position_closed(
 
     is_win = pnl >= 0
     color = _COLOR_GREEN if is_win else _COLOR_RED
-    sign = "+" if pnl >= 0 else ""
     emoji = "🟢" if is_win else "🔴"
-    label = option_symbol or symbol
 
-    fields = [
-        {"name": "Qty", "value": str(qty), "inline": True},
-        {"name": "Exit", "value": f"${price:.2f}", "inline": True},
-        {"name": "P&L", "value": f"{sign}${pnl:.2f}", "inline": True},
-    ]
-    if strategy_name:
-        fields.append({"name": "Strategy", "value": strategy_name, "inline": False})
+    multiplier = _contract_multiplier(option_symbol, symbol)
+    proceeds = price * qty * multiplier
+    unit = "contract" if multiplier == 100 else "share"
+
+    # Premium vs. dollars, side by side. `price` is the per-share premium
+    # ($2.23); the money that moved is that times qty times the 100-share
+    # contract multiplier ($223). Showing only the premium made every P&L
+    # impossible to read as exposure.
+    rows = [("Qty", f"{qty} {unit}{'s' if qty != 1 else ''}")]
+    if entry_price:
+        cost = entry_price * qty * multiplier
+        rows += [
+            ("Entry", f"${entry_price:.2f}   →   {_money(cost)}"),
+            ("Exit", f"${price:.2f}   →   {_money(proceeds)}"),
+            ("-", ""),
+            ("P&L", _signed_money(pnl)),
+        ]
+        if cost > 0.01:
+            rows.append(("Return", f"{pnl / cost * 100:+.1f}%"))
+    else:
+        rows += [
+            ("Exit", f"${price:.2f}   →   {_money(proceeds)}"),
+            ("-", ""),
+            ("P&L", _signed_money(pnl)),
+        ]
 
     _post_async(
         webhook,
-        {
-            "embeds": [
-                {
-                    "title": f"{emoji} Closed {label}",
-                    "color": color,
-                    "fields": fields,
-                }
-            ]
-        },
+        {"embeds": [_embed(
+            f"{emoji}  Closed · {format_contract(option_symbol, symbol)}",
+            color, rows, strategy_name,
+        )]},
     )
 
 

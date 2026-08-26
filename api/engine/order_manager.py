@@ -612,6 +612,14 @@ class OrderManager:
             # block further entries so we lock in to sell-to-close instead of
             # stacking more contracts. Row-level lock prevents the race where
             # two ticks both see qty=0 and both place orders.
+            #
+            # DELIBERATELY keyed on the UNDERLYING, not the contract, even though
+            # Position rows are now per-contract. This gate asks "do I hold ANY
+            # contract on SPY?" — making it per-contract would let the engine hold
+            # $745C and buy $750C on the same tick, which breaks three things that
+            # assume one position at a time: the worker's single `open_pos` lookup,
+            # the cash-reservation ledger's sizing, and max_positions. Finer row
+            # identity must not widen a safety gate.
             if signal.signal_type == 'entry':
                 existing = self.db.query(Position).filter(
                     Position.user_id == user.id,
@@ -887,7 +895,8 @@ class OrderManager:
                         symbol=symbol,
                         qty=filled_qty,
                         price=filled_price,
-                        trade=trade
+                        trade=trade,
+                        option_symbol=option_symbol,
                     )
 
                 logger.info(
@@ -1129,11 +1138,18 @@ class OrderManager:
         Uses row-level locking (SELECT FOR UPDATE) to prevent race conditions
         when multiple strategies might update the same position concurrently.
         """
-        # Check if position exists with row-level lock
+        # Find the row for THIS CONTRACT, with a row-level lock.
+        #
+        # Keyed on option_symbol as well as the underlying: one row per contract,
+        # not one row per ticker. Before 2026-08-25 a single SPY row was reused for
+        # every strike ever traded (1,922 trades pointed at one row), so
+        # `positions.option_symbol` always named the most recent contract and no
+        # historical trade could be attributed to what it actually held.
         position = self.db.query(Position).filter(
             Position.user_id == user.id,
             Position.strategy_id == strategy.id,
-            Position.symbol == symbol
+            Position.symbol == symbol,
+            Position.option_symbol == option_symbol,
         ).with_for_update().first()  # Lock the row
 
         is_new = position is None
@@ -1200,6 +1216,14 @@ class OrderManager:
                 trough_price=price,
             )
             self.db.add(position)
+            # FLUSH before reading position.id. Without this the id is still None
+            # and `trade.position_id` below silently stays NULL — the trade is
+            # orphaned from its contract. This was survivable while a position row
+            # was created twice in the app's lifetime (2 orphaned trades of 2,480);
+            # with per-contract rows a row is created for every new contract, so
+            # it would orphan the FIRST trade of every contract and defeat the
+            # attribution this keying exists to provide.
+            self.db.flush()
 
             logger.info(f"Created new position: {symbol} qty={qty}, price=${price:.2f}")
 
@@ -1241,22 +1265,41 @@ class OrderManager:
         symbol: str,
         qty: int,
         price: float,
-        trade: Trade
+        trade: Trade,
+        option_symbol: Optional[str] = None,
     ):
         """Update position for exit trade.
 
         Uses row-level locking (SELECT FOR UPDATE) to prevent race conditions
         when multiple strategies might update the same position concurrently.
         """
-        # Find existing position with row-level lock
+        # Find the row for the contract being SOLD, with a row-level lock.
+        # Falls back to the underlying-only lookup for legacy rows written before
+        # per-contract positions existed (their option_symbol may not match).
         position = self.db.query(Position).filter(
             Position.user_id == user.id,
             Position.strategy_id == strategy.id,
-            Position.symbol == symbol
+            Position.symbol == symbol,
+            Position.option_symbol == option_symbol,
         ).with_for_update().first()  # Lock the row
 
+        if not position and option_symbol is not None:
+            position = self.db.query(Position).filter(
+                Position.user_id == user.id,
+                Position.strategy_id == strategy.id,
+                Position.symbol == symbol,
+                Position.qty > 0,
+            ).with_for_update().first()
+            if position:
+                logger.warning(
+                    f"Exit for {option_symbol} matched a legacy position row "
+                    f"(id={position.id}, contract={position.option_symbol})"
+                )
+
         if not position:
-            logger.warning(f"No position found for exit trade: {symbol}")
+            logger.warning(
+                f"No position found for exit trade: {symbol} ({option_symbol})"
+            )
             return None
 
         # Calculate P&L for this exit
@@ -1269,6 +1312,11 @@ class OrderManager:
         trade.exit_price = price
         trade.exit_timestamp = datetime.utcnow()
         trade.pnl = exit_pnl - (trade.commission or 0.0)
+        # Link the closing leg to the contract's row. This path never set it —
+        # survivable only because live exits route through close_position (which
+        # sets position_id at construction), but an unlinked sell is an
+        # unattributable sell, which is the whole point of per-contract rows.
+        trade.position_id = position.id
 
         # Reduce position quantity
         position.qty -= qty
@@ -1315,6 +1363,7 @@ class OrderManager:
                     pnl=exit_pnl,
                     strategy_name=strategy.name,
                     option_symbol=position.option_symbol,
+                    entry_price=entry_price,
                 )
             except Exception as e:
                 logger.warning(f"Discord notify (close) failed: {e}")
@@ -1493,6 +1542,13 @@ class OrderManager:
                 'signal_type': 'exit',
                 'signal_reason': reason,
                 'order_id': order_id,
+                # WHICH contract this closed. The Position row cannot answer that
+                # later: _update_position_entry reuses a qty=0 row for the next
+                # entry, overwriting option_symbol. Trade 2408 (2026-07-31) closed
+                # SPY260731C00745000 but its position row now reads
+                # SPY260825C00764000 — a month-later strike. Reports that label a
+                # trade off the position row therefore show the wrong contract.
+                'option_symbol': option_symbol or position.option_symbol,
             }
             if preview:
                 close_notes['preview'] = {
@@ -1557,6 +1613,7 @@ class OrderManager:
                     pnl=pnl,
                     strategy_name=strategy.name,
                     option_symbol=option_symbol or position.option_symbol,
+                    entry_price=position.avg_entry_price,
                 )
             except Exception as e:
                 logger.warning(f"Discord notify (close) failed: {e}")
@@ -1592,17 +1649,31 @@ class OrderManager:
         user: User,
         strategy: Strategy,
         symbol: str,
-        current_price: float
+        current_price: float,
+        option_symbol: Optional[str] = None,
     ):
-        """Update current price and unrealized P&L for a position.
+        """Update current price and unrealized P&L for ONE position.
+
+        `option_symbol` selects which contract to mark. Callers that hold a
+        Position already should pass its `option_symbol` — marking "the first row
+        for SPY" was safe only while a single row existed per ticker, and would
+        now silently mark the wrong contract.
 
         Uses row-level locking to prevent race conditions during concurrent updates.
         """
-        position = self.db.query(Position).filter(
+        q = self.db.query(Position).filter(
             Position.user_id == user.id,
             Position.strategy_id == strategy.id,
-            Position.symbol == symbol
-        ).with_for_update().first()  # Lock the row
+            Position.symbol == symbol,
+        )
+        if option_symbol is not None:
+            q = q.filter(Position.option_symbol == option_symbol)
+        else:
+            # No contract given — only ever mark something actually open, so a
+            # closed historical row can never be revived with a stale price.
+            q = q.filter(Position.qty > 0)
+
+        position = q.with_for_update().first()  # Lock the row
 
         if not position or position.qty <= 0:
             return

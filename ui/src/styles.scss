@@ -1,181 +1,990 @@
-/* You can add global styles to this file, and also import other style files */
+// =============================================================================
+//  VegaPunkR — global design system
+//
+//  Aesthetic: "flat terminal".
+//    - Surfaces are separated by 1px hairline borders, never by drop shadows.
+//      Shadows are reserved for things that genuinely float above the page
+//      (menus, dialogs, tooltips, snackbars).
+//    - Dense, quiet chrome; the numbers are the loudest thing on screen.
+//    - Every price / P&L / percentage renders in tabular numerals so columns
+//      of figures line up digit-for-digit.
+//
+//  Theming is Angular Material 3 (`mat.theme` + `mat.theme-overrides`). The M3
+//  *system* colors are overridden with the palette below, which means every
+//  Material component inherits this palette automatically — there is exactly
+//  one source of truth for color, and component-level overrides stay rare.
+//
+//  Consumers should only ever use the CSS custom properties emitted at the
+//  bottom of this file (`--surface`, `--text`, `--color-profit`, `--sp-*`,
+//  `--fs-*`, `--radius-*`, …). Do not hardcode hex values in component styles.
+// =============================================================================
 
-// Import Angular Material theming
 @use '@angular/material' as mat;
+@use 'sass:map';
 
-// Include the common styles for Angular Material
-@include mat.core();
+// -----------------------------------------------------------------------------
+// 1. Palette source of truth
+//
+// These Sass maps feed *both* the Material M3 system tokens and the app-level
+// CSS custom properties, so the two can never drift apart.
+// -----------------------------------------------------------------------------
 
-// ----- Palettes -----
-$vegapunk-primary: mat.m2-define-palette(mat.$m2-indigo-palette, 700);
-$vegapunk-accent: mat.m2-define-palette(mat.$m2-pink-palette, A200);
-$vegapunk-warn: mat.m2-define-palette(mat.$m2-red-palette);
+$font-sans: (Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif);
+$font-mono: ('JetBrains Mono', ui-monospace, SFMono-Regular, 'SF Mono', Menlo, monospace);
 
-$vegapunk-typography: mat.m2-define-typography-config(
-  $font-family: 'Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif',
+// ---- Light neutrals -------------------------------------------------------
+$l-bg: #f4f6fa; // page background
+$l-surface: #ffffff; // cards, toolbar, table body
+$l-surface-alt: #eef1f6; // recessed chips, inset wells
+$l-surface-sunken: #f8fafc; // table headers
+$l-surface-raised: #ffffff; // menus, dialogs
+$l-border: #e3e7ee; // default hairline
+$l-border-strong: #ccd3de; // emphasized divider / input outline
+$l-border-subtle: #eef1f5; // table row rules
+$l-text: #0e1626;
+$l-text-muted: #58637a;
+$l-text-faint: #8a94a6;
+$l-primary: #2563eb;
+$l-primary-hover: #1d4ed8;
+$l-on-primary: #ffffff;
+$l-primary-container: #dce7fd;
+$l-on-primary-container: #12305f;
+
+// ---- Dark neutrals --------------------------------------------------------
+$d-bg: #0a0d12;
+$d-surface: #13181f;
+$d-surface-alt: #1b212a;
+$d-surface-sunken: #10151b;
+$d-surface-raised: #1a2029;
+$d-border: #262d38;
+$d-border-strong: #38414f;
+$d-border-subtle: #1d232c;
+$d-text: #e4e9f1;
+$d-text-muted: #949eae;
+$d-text-faint: #646e7e;
+$d-primary: #6ea3f7;
+$d-primary-hover: #8ab6f9;
+$d-on-primary: #062050;
+$d-primary-container: #1c3b78;
+$d-on-primary-container: #d5e3fd;
+
+// ---- Colorblind accent ----------------------------------------------------
+// In colorblind mode the data palette becomes blue (profit) / orange (loss).
+// A blue *accent* would then be indistinguishable from a profit figure, so the
+// chrome drops to graphite and carries itself on luminance alone. Data keeps
+// the hue; chrome gives it up.
+$l-cb-primary: #344054;
+$l-cb-primary-hover: #1d2939;
+$l-cb-primary-container: #e4e7ec;
+$l-cb-on-primary-container: #1d2939;
+$d-cb-primary: #c3cddb;
+$d-cb-primary-hover: #dbe3ed;
+$d-cb-on-primary: #0e1626;
+$d-cb-primary-container: #2c3542;
+$d-cb-on-primary-container: #dfe5ee;
+
+// -----------------------------------------------------------------------------
+// 2. Material M3 system overrides
+//
+// One map per mode, applied via `mat.theme-overrides`. Overriding the *system*
+// layer (rather than each component) is what keeps Material in lockstep with
+// the app palette.
+// -----------------------------------------------------------------------------
+
+$shape-overrides: (
+  corner-extra-small: 4px,
+  corner-small: 6px,
+  corner-medium: 10px,
+  corner-large: 14px,
+  corner-extra-large: 18px,
 );
 
-// ----- Light theme (default) -----
-$vegapunk-theme: mat.m2-define-light-theme((
-  color: (
-    primary: $vegapunk-primary,
-    accent: $vegapunk-accent,
-    warn: $vegapunk-warn,
-  ),
-  typography: $vegapunk-typography,
-  density: 0,
-));
+$light-sys: map.merge(
+  $shape-overrides,
+  (
+    background: $l-bg,
+    on-background: $l-text,
+    surface: $l-surface,
+    surface-dim: $l-surface-alt,
+    surface-bright: $l-surface,
+    surface-container-lowest: $l-surface,
+    surface-container-low: $l-surface,
+    surface-container: $l-surface-raised,
+    surface-container-high: $l-surface-raised,
+    surface-container-highest: $l-surface-alt,
+    surface-variant: $l-surface-alt,
+    on-surface: $l-text,
+    on-surface-variant: $l-text-muted,
+    outline: $l-border-strong,
+    outline-variant: $l-border,
 
-@include mat.all-component-themes($vegapunk-theme);
+    primary: $l-primary,
+    on-primary: $l-on-primary,
+    primary-container: $l-primary-container,
+    on-primary-container: $l-on-primary-container,
+    inverse-primary: #a9c6fb,
 
-// ----- Dark theme override -----
-$vegapunk-dark-primary: mat.m2-define-palette(mat.$m2-indigo-palette, 200);
-$vegapunk-dark-accent: mat.m2-define-palette(mat.$m2-pink-palette, A100);
-$vegapunk-dark-warn: mat.m2-define-palette(mat.$m2-red-palette, 300);
-$vegapunk-dark-theme: mat.m2-define-dark-theme((
-  color: (
-    primary: $vegapunk-dark-primary,
-    accent: $vegapunk-dark-accent,
-    warn: $vegapunk-dark-warn,
-  ),
-  typography: $vegapunk-typography,
-  density: 0,
-));
+    // Secondary / tertiary are deliberately neutral: nothing in this app should
+    // introduce a third accent hue competing with profit/loss.
+    secondary: #475467,
+    on-secondary: #ffffff,
+    secondary-container: $l-surface-alt,
+    on-secondary-container: #1d2939,
+    tertiary: $l-primary,
+    on-tertiary: $l-on-primary,
+    tertiary-container: $l-primary-container,
+    on-tertiary-container: $l-on-primary-container,
+
+    error: #d92d20,
+    on-error: #ffffff,
+    error-container: #fee4e2,
+    on-error-container: #7a1710,
+
+    inverse-surface: #1d2939,
+    inverse-on-surface: #f4f6fa,
+    shadow: #0e1626,
+    scrim: #0e1626,
+  )
+);
+
+$dark-sys: map.merge(
+  $shape-overrides,
+  (
+    background: $d-bg,
+    on-background: $d-text,
+    surface: $d-surface,
+    surface-dim: $d-bg,
+    surface-bright: $d-surface-alt,
+    surface-container-lowest: $d-bg,
+    surface-container-low: $d-surface,
+    surface-container: $d-surface-raised,
+    surface-container-high: $d-surface-raised,
+    surface-container-highest: $d-surface-alt,
+    surface-variant: $d-surface-alt,
+    on-surface: $d-text,
+    on-surface-variant: $d-text-muted,
+    outline: $d-border-strong,
+    outline-variant: $d-border,
+
+    primary: $d-primary,
+    on-primary: $d-on-primary,
+    primary-container: $d-primary-container,
+    on-primary-container: $d-on-primary-container,
+    inverse-primary: $l-primary,
+
+    secondary: #98a2b3,
+    on-secondary: #16202e,
+    secondary-container: $d-surface-alt,
+    on-secondary-container: #dbe1ea,
+    tertiary: $d-primary,
+    on-tertiary: $d-on-primary,
+    tertiary-container: $d-primary-container,
+    on-tertiary-container: $d-on-primary-container,
+
+    error: #f97066,
+    on-error: #55160c,
+    error-container: #7a271a,
+    on-error-container: #fecdca,
+
+    inverse-surface: $d-text,
+    inverse-on-surface: $d-surface,
+    shadow: #000000,
+    scrim: #000000,
+  )
+);
+
+$light-cb-sys: (
+  primary: $l-cb-primary,
+  on-primary: #ffffff,
+  primary-container: $l-cb-primary-container,
+  on-primary-container: $l-cb-on-primary-container,
+  tertiary: $l-cb-primary,
+  on-tertiary: #ffffff,
+  tertiary-container: $l-cb-primary-container,
+  on-tertiary-container: $l-cb-on-primary-container,
+);
+
+$dark-cb-sys: (
+  primary: $d-cb-primary,
+  on-primary: $d-cb-on-primary,
+  primary-container: $d-cb-primary-container,
+  on-primary-container: $d-cb-on-primary-container,
+  tertiary: $d-cb-primary,
+  on-tertiary: $d-cb-on-primary,
+  tertiary-container: $d-cb-primary-container,
+  on-tertiary-container: $d-cb-on-primary-container,
+);
+
+// -----------------------------------------------------------------------------
+// 3. Emit the themes
+// -----------------------------------------------------------------------------
+
+html {
+  @include mat.theme(
+    (
+      color: (
+        primary: mat.$azure-palette,
+        tertiary: mat.$azure-palette,
+        theme-type: light,
+      ),
+      typography: (
+        plain-family: $font-sans,
+        brand-family: $font-sans,
+        bold-weight: 650,
+        medium-weight: 550,
+        regular-weight: 400,
+      ),
+      // -1 tightens every Material control by 4px. This is a data-dense app;
+      // the stock 0 scale wastes a lot of vertical space in tables and forms.
+      density: -1,
+    )
+  );
+
+  color-scheme: light;
+  @include mat.theme-overrides($light-sys);
+}
 
 body[data-theme='dark'] {
-  @include mat.all-component-colors($vegapunk-dark-theme);
+  color-scheme: dark;
+  @include mat.theme-overrides($dark-sys);
 }
 
-// ----- Theme tokens (CSS custom properties) -----
-// Default = light + standard red/green
-:root,
-body[data-theme='light'] {
-  --color-profit: #2e7d32;
-  --color-profit-strong: #1b5e20;
-  --color-loss: #c62828;
-  --color-loss-strong: #b71c1c;
-  --color-profit-bg: rgba(46, 125, 50, 0.14);
-  --color-loss-bg: rgba(198, 40, 40, 0.14);
-  --color-profit-bg-soft: rgba(76, 175, 80, 0.05);
-  --color-loss-bg-soft: rgba(244, 67, 54, 0.05);
-  --color-profit-bg-strong: rgba(56, 142, 60, 0.12);
-  --color-loss-bg-strong: rgba(211, 47, 47, 0.12);
-  --color-error-bg: #fdecea;
-  --color-error-fg: #b71c1c;
-  --color-warning: #ed6c02;
-  --color-warning-strong: #e65100;
-  --color-warning-bg: rgba(237, 108, 2, 0.14);
-  --color-warning-bg-soft: rgba(237, 108, 2, 0.06);
-
-  --surface: #ffffff;
-  --surface-alt: #fafafa;
-  --surface-hover: rgba(25, 118, 210, 0.06);
-  --text: rgba(0, 0, 0, 0.87);
-  --text-muted: rgba(0, 0, 0, 0.6);
-  --text-faint: rgba(0, 0, 0, 0.45);
-  --border: rgba(0, 0, 0, 0.12);
-  --primary: #1976d2;
-}
-
-body[data-theme='dark'] {
-  --color-profit: #66bb6a;
-  --color-profit-strong: #81c784;
-  --color-loss: #ef5350;
-  --color-loss-strong: #e57373;
-  --color-profit-bg: rgba(102, 187, 106, 0.18);
-  --color-loss-bg: rgba(239, 83, 80, 0.18);
-  --color-profit-bg-soft: rgba(102, 187, 106, 0.08);
-  --color-loss-bg-soft: rgba(239, 83, 80, 0.08);
-  --color-profit-bg-strong: rgba(102, 187, 106, 0.22);
-  --color-loss-bg-strong: rgba(239, 83, 80, 0.22);
-  --color-error-bg: rgba(239, 83, 80, 0.18);
-  --color-error-fg: #ef9a9a;
-  --color-warning: #ffa726;
-  --color-warning-strong: #ffb74d;
-  --color-warning-bg: rgba(255, 167, 38, 0.18);
-  --color-warning-bg-soft: rgba(255, 167, 38, 0.08);
-
-  --surface: #1e1e1e;
-  --surface-alt: #121212;
-  --surface-hover: rgba(144, 202, 249, 0.10);
-  --text: rgba(255, 255, 255, 0.87);
-  --text-muted: rgba(255, 255, 255, 0.65);
-  --text-faint: rgba(255, 255, 255, 0.45);
-  --border: rgba(255, 255, 255, 0.14);
-  --primary: #90caf9;
-}
-
-// Colorblind override — applies on top of light or dark.
-// Uses blue (positive) / orange (negative), which preserve contrast across
-// deuteranopia, protanopia, and tritanopia.
-body[data-colorblind='true'][data-theme='light'],
-body[data-colorblind='true']:not([data-theme='dark']) {
-  --color-profit: #1976d2;
-  --color-profit-strong: #0d47a1;
-  --color-loss: #ef6c00;
-  --color-loss-strong: #e65100;
-  --color-profit-bg: rgba(25, 118, 210, 0.14);
-  --color-loss-bg: rgba(239, 108, 0, 0.14);
-  --color-profit-bg-soft: rgba(25, 118, 210, 0.06);
-  --color-loss-bg-soft: rgba(239, 108, 0, 0.06);
-  --color-profit-bg-strong: rgba(25, 118, 210, 0.18);
-  --color-loss-bg-strong: rgba(239, 108, 0, 0.18);
+body[data-colorblind='true'] {
+  @include mat.theme-overrides($light-cb-sys);
 }
 
 body[data-colorblind='true'][data-theme='dark'] {
-  --color-profit: #64b5f6;
-  --color-profit-strong: #90caf9;
-  --color-loss: #ffa726;
-  --color-loss-strong: #ffb74d;
-  --color-profit-bg: rgba(100, 181, 246, 0.18);
-  --color-loss-bg: rgba(255, 167, 38, 0.18);
-  --color-profit-bg-soft: rgba(100, 181, 246, 0.08);
-  --color-loss-bg-soft: rgba(255, 167, 38, 0.08);
-  --color-profit-bg-strong: rgba(100, 181, 246, 0.22);
-  --color-loss-bg-strong: rgba(255, 167, 38, 0.22);
+  @include mat.theme-overrides($dark-cb-sys);
 }
 
-// ----- Global -----
+// -----------------------------------------------------------------------------
+// 4. App-level design tokens
+//
+// Non-color scales (spacing, radius, type, motion, elevation) are mode-agnostic
+// and live on :root. Color tokens are re-declared per mode below.
+// -----------------------------------------------------------------------------
+
+:root {
+  // ---- Spacing (4px base) ----
+  --sp-1: 4px;
+  --sp-2: 8px;
+  --sp-3: 12px;
+  --sp-4: 16px;
+  --sp-5: 20px;
+  --sp-6: 24px;
+  --sp-8: 32px;
+  --sp-10: 40px;
+  --sp-12: 48px;
+  --sp-16: 64px;
+
+  // ---- Radius ----
+  --radius-xs: 4px;
+  --radius-sm: 6px;
+  --radius-md: 10px;
+  --radius-lg: 14px;
+  --radius-xl: 18px;
+  --radius-pill: 999px;
+
+  // ---- Type scale ----
+  --fs-micro: 10.5px; // uppercase eyebrow labels
+  --fs-2xs: 11px;
+  --fs-xs: 12px;
+  --fs-sm: 13px;
+  --fs-base: 14px;
+  --fs-md: 15px;
+  --fs-lg: 18px;
+  --fs-xl: 22px;
+  --fs-2xl: 28px;
+  --fs-3xl: 36px;
+
+  --lh-tight: 1.15;
+  --lh-snug: 1.32;
+  --lh-normal: 1.5;
+
+  --fw-regular: 400;
+  --fw-medium: 500;
+  --fw-semibold: 600;
+  --fw-bold: 700;
+
+  // Large type gets slightly negative tracking (Inter is designed for it);
+  // small uppercase labels get positive tracking so they stay readable.
+  --ls-tight: -0.014em;
+  --ls-tighter: -0.022em;
+  --ls-eyebrow: 0.07em;
+
+  --font-sans: #{$font-sans};
+  --font-mono: #{$font-mono};
+
+  // ---- Motion ----
+  --dur-fast: 110ms;
+  --dur: 170ms;
+  --dur-slow: 260ms;
+  --ease: cubic-bezier(0.2, 0, 0, 1);
+
+  // ---- Layout ----
+  --toolbar-h: 56px;
+  --sidenav-w: 244px;
+  --content-max: 1440px;
+}
+
+// ---- Light (default) ----
+:root,
+body[data-theme='light'] {
+  --color-profit: #06894c;
+  --color-profit-strong: #04663a;
+  --color-loss: #d92d20;
+  --color-loss-strong: #b42318;
+  --color-profit-bg: rgba(6, 137, 76, 0.12);
+  --color-loss-bg: rgba(217, 45, 32, 0.12);
+  --color-profit-bg-soft: rgba(6, 137, 76, 0.05);
+  --color-loss-bg-soft: rgba(217, 45, 32, 0.05);
+  --color-profit-bg-strong: rgba(6, 137, 76, 0.16);
+  --color-loss-bg-strong: rgba(217, 45, 32, 0.16);
+  --color-error-bg: #fee4e2;
+  --color-error-fg: #912018;
+  --color-warning: #d97706;
+  --color-warning-strong: #b45309;
+  --color-warning-bg: rgba(217, 119, 6, 0.13);
+  --color-warning-bg-soft: rgba(217, 119, 6, 0.06);
+
+  --surface: #{$l-surface};
+  --surface-alt: #{$l-bg};
+  --surface-sunken: #{$l-surface-sunken};
+  --surface-raised: #{$l-surface-raised};
+  --surface-inset: #{$l-surface-alt};
+  --surface-hover: rgba(14, 22, 38, 0.045);
+  --surface-active: rgba(14, 22, 38, 0.07);
+  --text: #{$l-text};
+  --text-muted: #{$l-text-muted};
+  --text-faint: #{$l-text-faint};
+  --border: #{$l-border};
+  --border-strong: #{$l-border-strong};
+  --border-subtle: #{$l-border-subtle};
+  --primary: #{$l-primary};
+  --primary-hover: #{$l-primary-hover};
+  --primary-bg: rgba(37, 99, 235, 0.10);
+  --primary-bg-soft: rgba(37, 99, 235, 0.055);
+  --focus-ring: rgba(37, 99, 235, 0.28);
+
+  --shadow-overlay: 0 10px 28px -8px rgba(14, 22, 38, 0.18), 0 2px 8px -2px rgba(14, 22, 38, 0.08);
+  --shadow-modal: 0 28px 56px -16px rgba(14, 22, 38, 0.28), 0 4px 12px -4px rgba(14, 22, 38, 0.12);
+}
+
+// ---- Dark ----
+body[data-theme='dark'] {
+  --color-profit: #2bc77e;
+  --color-profit-strong: #5fe0a0;
+  --color-loss: #f4695e;
+  --color-loss-strong: #fb9089;
+  --color-profit-bg: rgba(43, 199, 126, 0.16);
+  --color-loss-bg: rgba(244, 105, 94, 0.16);
+  --color-profit-bg-soft: rgba(43, 199, 126, 0.07);
+  --color-loss-bg-soft: rgba(244, 105, 94, 0.07);
+  --color-profit-bg-strong: rgba(43, 199, 126, 0.2);
+  --color-loss-bg-strong: rgba(244, 105, 94, 0.2);
+  --color-error-bg: rgba(244, 105, 94, 0.16);
+  --color-error-fg: #fca7a1;
+  --color-warning: #f5a524;
+  --color-warning-strong: #fbbf4d;
+  --color-warning-bg: rgba(245, 165, 36, 0.16);
+  --color-warning-bg-soft: rgba(245, 165, 36, 0.07);
+
+  --surface: #{$d-surface};
+  --surface-alt: #{$d-bg};
+  --surface-sunken: #{$d-surface-sunken};
+  --surface-raised: #{$d-surface-raised};
+  --surface-inset: #{$d-surface-alt};
+  --surface-hover: rgba(255, 255, 255, 0.045);
+  --surface-active: rgba(255, 255, 255, 0.075);
+  --text: #{$d-text};
+  --text-muted: #{$d-text-muted};
+  --text-faint: #{$d-text-faint};
+  --border: #{$d-border};
+  --border-strong: #{$d-border-strong};
+  --border-subtle: #{$d-border-subtle};
+  --primary: #{$d-primary};
+  --primary-hover: #{$d-primary-hover};
+  --primary-bg: rgba(110, 163, 247, 0.14);
+  --primary-bg-soft: rgba(110, 163, 247, 0.08);
+  --focus-ring: rgba(110, 163, 247, 0.32);
+
+  --shadow-overlay: 0 10px 28px -8px rgba(0, 0, 0, 0.6), 0 2px 8px -2px rgba(0, 0, 0, 0.44);
+  --shadow-modal: 0 28px 56px -16px rgba(0, 0, 0, 0.72), 0 4px 12px -4px rgba(0, 0, 0, 0.5);
+}
+
+// ---- Colorblind data palette (blue = profit, orange = loss) ----
+// Layers on top of light or dark. Preserves contrast across deuteranopia,
+// protanopia and tritanopia.
+body[data-colorblind='true'][data-theme='light'],
+body[data-colorblind='true']:not([data-theme='dark']) {
+  --color-profit: #1d6fe0;
+  --color-profit-strong: #14508f;
+  --color-loss: #e06316;
+  --color-loss-strong: #b34a0c;
+  --color-profit-bg: rgba(29, 111, 224, 0.12);
+  --color-loss-bg: rgba(224, 99, 22, 0.13);
+  --color-profit-bg-soft: rgba(29, 111, 224, 0.055);
+  --color-loss-bg-soft: rgba(224, 99, 22, 0.06);
+  --color-profit-bg-strong: rgba(29, 111, 224, 0.16);
+  --color-loss-bg-strong: rgba(224, 99, 22, 0.17);
+
+  --primary: #{$l-cb-primary};
+  --primary-hover: #{$l-cb-primary-hover};
+  --primary-bg: rgba(52, 64, 84, 0.10);
+  --primary-bg-soft: rgba(52, 64, 84, 0.055);
+  --focus-ring: rgba(52, 64, 84, 0.3);
+}
+
+body[data-colorblind='true'][data-theme='dark'] {
+  --color-profit: #5aa5ff;
+  --color-profit-strong: #8dc2ff;
+  --color-loss: #ff9445;
+  --color-loss-strong: #ffb277;
+  --color-profit-bg: rgba(90, 165, 255, 0.16);
+  --color-loss-bg: rgba(255, 148, 69, 0.16);
+  --color-profit-bg-soft: rgba(90, 165, 255, 0.07);
+  --color-loss-bg-soft: rgba(255, 148, 69, 0.07);
+  --color-profit-bg-strong: rgba(90, 165, 255, 0.2);
+  --color-loss-bg-strong: rgba(255, 148, 69, 0.2);
+
+  --primary: #{$d-cb-primary};
+  --primary-hover: #{$d-cb-primary-hover};
+  --primary-bg: rgba(195, 205, 219, 0.13);
+  --primary-bg-soft: rgba(195, 205, 219, 0.07);
+  --focus-ring: rgba(195, 205, 219, 0.3);
+}
+
+// -----------------------------------------------------------------------------
+// 5. Base
+// -----------------------------------------------------------------------------
+
 * {
   margin: 0;
   padding: 0;
   box-sizing: border-box;
 }
 
-html, body {
+html,
+body {
   height: 100%;
-  font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
 }
 
 body {
   margin: 0;
+  font-family: var(--font-sans);
+  font-size: var(--fs-base);
+  line-height: var(--lh-normal);
   background-color: var(--surface-alt);
   color: var(--text);
-  transition: background-color 150ms ease, color 150ms ease;
+  // Figures line up digit-for-digit everywhere: tables, tiles, tickers.
+  font-variant-numeric: tabular-nums;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  transition: background-color var(--dur) var(--ease), color var(--dur) var(--ease);
 }
 
-// Right-edge drawer styling for ProfileDialog opened via MatDialog
+h1,
+h2,
+h3,
+h4 {
+  font-weight: var(--fw-semibold);
+  letter-spacing: var(--ls-tight);
+  line-height: var(--lh-snug);
+  color: var(--text);
+}
+
+h1 {
+  font-size: var(--fs-2xl);
+  letter-spacing: var(--ls-tighter);
+}
+h2 {
+  font-size: var(--fs-xl);
+}
+h3 {
+  font-size: var(--fs-lg);
+}
+
+::selection {
+  background: var(--primary-bg);
+}
+
+// -----------------------------------------------------------------------------
+// 6. Shared utility classes
+// -----------------------------------------------------------------------------
+
+// Small uppercase label above a value. The workhorse of the metric tiles.
+.eyebrow {
+  font-size: var(--fs-2xs);
+  font-weight: var(--fw-semibold);
+  text-transform: uppercase;
+  letter-spacing: var(--ls-eyebrow);
+  color: var(--text-faint);
+}
+
+// Monospaced figures — symbols, order ids, stream rows.
+.mono {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.01em;
+}
+
+// Page-level chrome shared by every route.
+.page-header {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: var(--sp-4);
+  flex-wrap: wrap;
+  margin-bottom: var(--sp-6);
+
+  h1 {
+    font-size: var(--fs-2xl);
+  }
+
+  .page-subtitle {
+    margin-top: var(--sp-1);
+    font-size: var(--fs-sm);
+    color: var(--text-muted);
+  }
+
+  .header-actions {
+    display: flex;
+    align-items: center;
+    gap: var(--sp-2);
+  }
+}
+
+// Flat surface primitive: a bordered panel with no shadow. Use this instead of
+// reaching for a mat-card when the content is not really a card.
+.panel {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+}
+
+// Status / severity pill.
+.pill {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-1);
+  padding: 2px var(--sp-2);
+  border-radius: var(--radius-pill);
+  font-size: var(--fs-2xs);
+  font-weight: var(--fw-semibold);
+  text-transform: uppercase;
+  letter-spacing: var(--ls-eyebrow);
+  white-space: nowrap;
+  background: var(--surface-inset);
+  color: var(--text-muted);
+  border: 1px solid var(--border);
+
+  &.pill-profit {
+    background: var(--color-profit-bg);
+    color: var(--color-profit-strong);
+    border-color: transparent;
+  }
+  &.pill-loss {
+    background: var(--color-loss-bg);
+    color: var(--color-loss-strong);
+    border-color: transparent;
+  }
+  &.pill-warning {
+    background: var(--color-warning-bg);
+    color: var(--color-warning-strong);
+    border-color: transparent;
+  }
+  &.pill-primary {
+    background: var(--primary-bg);
+    color: var(--primary);
+    border-color: transparent;
+  }
+}
+
+// Inline banner (error / warning / info) used across pages.
+.banner {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  padding: var(--sp-3) var(--sp-4);
+  border-radius: var(--radius-md);
+  font-size: var(--fs-sm);
+  border: 1px solid transparent;
+  margin-bottom: var(--sp-4);
+
+  mat-icon {
+    font-size: 18px;
+    width: 18px;
+    height: 18px;
+    flex-shrink: 0;
+  }
+
+  &.banner-error {
+    background: var(--color-error-bg);
+    color: var(--color-error-fg);
+  }
+  &.banner-warning {
+    background: var(--color-warning-bg);
+    color: var(--color-warning-strong);
+  }
+  &.banner-info {
+    background: var(--surface-inset);
+    color: var(--text-muted);
+    border-color: var(--border);
+  }
+}
+
+// Centered empty / zero state.
+.empty-state {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  padding: var(--sp-16) var(--sp-6);
+  color: var(--text-muted);
+
+  mat-icon {
+    font-size: 40px;
+    width: 40px;
+    height: 40px;
+    margin-bottom: var(--sp-3);
+    color: var(--text-faint);
+    opacity: 0.7;
+  }
+
+  h2 {
+    margin: 0 0 var(--sp-2);
+    font-size: var(--fs-lg);
+    font-weight: var(--fw-semibold);
+    color: var(--text);
+  }
+
+  p {
+    margin: 0;
+    font-size: var(--fs-base);
+  }
+
+  .subtitle,
+  small {
+    margin-top: var(--sp-1);
+    font-size: var(--fs-sm);
+    color: var(--text-faint);
+  }
+
+  .empty-state-actions {
+    display: flex;
+    gap: var(--sp-2);
+    margin-top: var(--sp-5);
+  }
+}
+
+.profit {
+  color: var(--color-profit);
+}
+.loss {
+  color: var(--color-loss);
+}
+
+// -----------------------------------------------------------------------------
+// 7. Material component layer — flatten
+//
+// Material ships elevation-first. These rules move it to a border-first model.
+// Kept in one place so component stylesheets never need ::ng-deep for chrome.
+// -----------------------------------------------------------------------------
+
+// ---- Cards: flat, hairline-bordered ----
+.mat-mdc-card {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  box-shadow: none !important;
+  background: var(--surface);
+  overflow: hidden;
+}
+
+.mat-mdc-card-header {
+  padding: var(--sp-4) var(--sp-4) 0;
+}
+
+.mat-mdc-card-title {
+  font-size: var(--fs-md) !important;
+  font-weight: var(--fw-semibold) !important;
+  letter-spacing: var(--ls-tight) !important;
+  color: var(--text);
+}
+
+.mat-mdc-card-subtitle {
+  font-size: var(--fs-sm) !important;
+  color: var(--text-muted) !important;
+}
+
+.mat-mdc-card-content {
+  padding: var(--sp-4);
+
+  &:last-child {
+    padding-bottom: var(--sp-4);
+  }
+}
+
+// ---- Toolbar: flat bar, hairline underline ----
+.mat-toolbar {
+  background: var(--surface) !important;
+  color: var(--text) !important;
+  border-bottom: 1px solid var(--border);
+  box-shadow: none;
+}
+
+// ---- Buttons ----
+.mat-mdc-button-base {
+  letter-spacing: 0 !important;
+  font-weight: var(--fw-medium) !important;
+  border-radius: var(--radius-sm) !important;
+}
+
+// M3 maps `mat-raised-button` to the *elevated* button: a surface-colored
+// container with primary-colored text. In this app every raised button is the
+// page's primary action, and an elevated button is visually indistinguishable
+// from the outlined secondary next to it. Re-point it at the filled treatment
+// and drop the elevation — filled accent, no shadow.
+.mat-mdc-raised-button,
+.mat-mdc-unelevated-button {
+  box-shadow: none !important;
+  --mat-button-protected-container-color: var(--mat-sys-primary);
+  --mat-button-protected-label-text-color: var(--mat-sys-on-primary);
+  --mat-button-protected-state-layer-color: var(--mat-sys-on-primary);
+  --mat-button-protected-ripple-color: rgba(255, 255, 255, 0.16);
+  --mat-button-protected-container-elevation-shadow: none;
+  --mat-button-protected-hover-container-elevation-shadow: none;
+  --mat-button-protected-focus-container-elevation-shadow: none;
+  --mat-button-protected-pressed-container-elevation-shadow: none;
+  --mat-button-protected-disabled-container-elevation-shadow: none;
+
+  .mat-icon {
+    color: inherit;
+  }
+}
+
+// Destructive primary actions keep the same weight, in the error color.
+.mat-mdc-raised-button.mat-warn {
+  --mat-button-protected-container-color: var(--mat-sys-error);
+  --mat-button-protected-label-text-color: var(--mat-sys-on-error);
+  --mat-button-protected-state-layer-color: var(--mat-sys-on-error);
+}
+
+.mat-mdc-outlined-button:not(:disabled) {
+  border-color: var(--border-strong) !important;
+}
+
+.mat-mdc-icon-button {
+  border-radius: var(--radius-sm) !important;
+}
+
+// Visible, consistent keyboard focus everywhere.
+.mat-mdc-button-base:focus-visible,
+a:focus-visible,
+button:focus-visible,
+[tabindex]:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 3px var(--focus-ring) !important;
+}
+
+// ---- Form fields ----
+.mat-mdc-form-field {
+  width: 100%;
+}
+
+.mat-mdc-form-field-subscript-wrapper {
+  font-size: var(--fs-xs);
+}
+
+.mat-mdc-text-field-wrapper {
+  border-radius: var(--radius-sm);
+}
+
+// ---- Tables ----
+.mat-mdc-table {
+  background: transparent;
+
+  .mat-mdc-header-row {
+    background: var(--surface-sunken);
+    border-bottom: 1px solid var(--border);
+    height: 40px;
+  }
+
+  .mat-mdc-header-cell {
+    font-size: var(--fs-2xs);
+    font-weight: var(--fw-semibold);
+    text-transform: uppercase;
+    letter-spacing: var(--ls-eyebrow);
+    color: var(--text-faint);
+    border-bottom: none;
+    white-space: nowrap;
+  }
+
+  .mat-mdc-row {
+    height: 46px;
+    transition: background-color var(--dur-fast) var(--ease);
+  }
+
+  .mat-mdc-cell {
+    font-size: var(--fs-sm);
+    color: var(--text);
+    border-bottom-color: var(--border-subtle);
+  }
+
+  // Numeric columns stay monospaced-ish via tabular figures inherited from body;
+  // right-align anything explicitly marked numeric.
+  .cell-num {
+    text-align: right;
+    font-variant-numeric: tabular-nums;
+  }
+}
+
+.mat-mdc-paginator {
+  background: transparent;
+  border-top: 1px solid var(--border-subtle);
+  font-size: var(--fs-sm);
+}
+
+.mat-sort-header-arrow {
+  color: var(--text-faint);
+}
+
+// ---- Overlays: the only place shadows are allowed ----
+.mat-mdc-menu-panel {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg) !important;
+  box-shadow: var(--shadow-overlay) !important;
+  background: var(--surface-raised) !important;
+}
+
+.mat-mdc-menu-item {
+  font-size: var(--fs-sm) !important;
+  min-height: 38px !important;
+  border-radius: var(--radius-xs);
+}
+
+.mat-mdc-select-panel,
+.mat-mdc-autocomplete-panel {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md) !important;
+  box-shadow: var(--shadow-overlay) !important;
+  background: var(--surface-raised) !important;
+}
+
+.mat-mdc-dialog-surface {
+  border-radius: var(--radius-xl) !important;
+  border: 1px solid var(--border);
+  box-shadow: var(--shadow-modal) !important;
+  background: var(--surface-raised) !important;
+}
+
+.mat-mdc-tooltip .mdc-tooltip__surface {
+  border-radius: var(--radius-sm) !important;
+  font-size: var(--fs-xs) !important;
+  padding: var(--sp-2) var(--sp-3) !important;
+}
+
+.mat-mdc-snack-bar-container .mdc-snackbar__surface {
+  border-radius: var(--radius-md) !important;
+}
+
+// ---- Sidenav / drawer ----
+.mat-drawer {
+  background: var(--surface) !important;
+  border-right-color: var(--border) !important;
+}
+
+.mat-drawer-container {
+  background: var(--surface-alt) !important;
+  color: var(--text);
+}
+
+// ---- Nav list items: pill-shaped selection ----
+.mat-mdc-list-item {
+  border-radius: var(--radius-sm);
+}
+
+// ---- Chips ----
+.mat-mdc-chip {
+  border-radius: var(--radius-sm) !important;
+  font-size: var(--fs-xs) !important;
+  font-weight: var(--fw-medium) !important;
+}
+
+// ---- Divider ----
+.mat-divider {
+  border-top-color: var(--border) !important;
+}
+
+// -----------------------------------------------------------------------------
+// 8. Overlay panel classes referenced by components
+// -----------------------------------------------------------------------------
+
+// Right-edge drawer styling for ProfileDialog opened via MatDialog.
 .settings-drawer-panel {
   height: 100vh !important;
   max-height: 100vh !important;
 
   .mat-mdc-dialog-container,
-  .mdc-dialog__surface {
-    border-radius: 0 !important;
-    height: 100vh;
-    max-height: 100vh;
-  }
-
+  .mdc-dialog__surface,
   .mat-mdc-dialog-surface {
     border-radius: 0 !important;
+    border: none;
+    border-left: 1px solid var(--border);
+    height: 100vh;
+    max-height: 100vh;
   }
 }
 
 // Multi-line metric tooltips on the Performance page (matTooltipClass="metric-tooltip").
-// The tooltip panel renders in the global CDK overlay, so this must live in global styles.
+// The tooltip panel renders in the global CDK overlay, so this must live here.
 .metric-tooltip {
   white-space: pre-line; // honor "\n" line breaks in the tooltip text
   max-width: 320px !important;
-  font-size: 12.5px;
-  line-height: 1.45;
+
+  .mdc-tooltip__surface {
+    font-size: var(--fs-xs) !important;
+    line-height: 1.5 !important;
+    max-width: 320px !important;
+  }
+}
+
+// -----------------------------------------------------------------------------
+// 9. Scrollbars — thin and theme-aware
+// -----------------------------------------------------------------------------
+
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--border-strong) transparent;
+}
+
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--border-strong);
+  border: 3px solid transparent;
+  background-clip: content-box;
+  border-radius: var(--radius-pill);
+
+  &:hover {
+    background: var(--text-faint);
+    background-clip: content-box;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
 }

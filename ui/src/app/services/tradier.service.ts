@@ -59,10 +59,11 @@ export interface TradeEvent {
   [key: string]: any;
 }
 
-// 'DAY' is a UI-only period: Tradier's historical-balances endpoint has no DAY
-// bucket, so getHistoricalBalances() sends WEEK in its place and the page filters
-// closed positions down to today itself.
-export type BalancePeriod = 'DAY' | 'WEEK' | 'MONTH' | 'YTD' | 'YEAR' | 'YEAR_3' | 'YEAR_5' | 'ALL';
+// BalancePeriod is Tradier's own enum and now lives with the range model, which
+// is what decides which bucket a given range needs. Re-exported so existing
+// importers of this service keep working.
+import type { BalancePeriod } from '../models/date-range';
+export type { BalancePeriod };
 
 export interface HistoryBar {
   date: string;
@@ -136,11 +137,14 @@ export class TradierService {
     });
   }
 
+  /**
+   * Daily account-value snapshots. `period` must be one of Tradier's buckets —
+   * use `brokerPeriodFor()` to pick the narrowest one covering your range, then
+   * slice the returned bars down. The broker cannot filter to a date range and
+   * has no intraday bucket (docs/tradier/accounts/balance_overtime.md).
+   */
   getHistoricalBalances(period: BalancePeriod = 'MONTH'): Observable<HistoricalBalances> {
-    // Tradier has no DAY bucket — asking for one 400s. Send the narrowest period
-    // it does support; the day-level filtering happens on the closed positions.
-    const brokerPeriod = period === 'DAY' ? 'WEEK' : period;
-    const params = new HttpParams().set('period', brokerPeriod);
+    const params = new HttpParams().set('period', period);
     return this.http.get<HistoricalBalances>(`${this.apiUrl}/account/historical-balances`, {
       headers: this.headers(),
       params,

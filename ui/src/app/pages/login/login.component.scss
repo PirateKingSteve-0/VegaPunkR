@@ -1,45 +1,72 @@
+// Login: a single flat card on a quiet grid backdrop. No gradient — the old
+// purple wash was the only place in the app using an off-palette brand color.
+
 .login-container {
+  position: relative;
   display: flex;
   justify-content: center;
   align-items: center;
   min-height: 100vh;
-  background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-  padding: 20px;
+  padding: var(--sp-5);
+  background: var(--surface-alt);
+  overflow: hidden;
+
+  // Faint graph-paper backdrop. Reads as "instrument panel" without adding a
+  // second brand color, and fades out toward the edges so the card stays the
+  // focal point.
+  &::before {
+    content: '';
+    position: absolute;
+    inset: 0;
+    background-image: linear-gradient(var(--border) 1px, transparent 1px),
+      linear-gradient(90deg, var(--border) 1px, transparent 1px);
+    background-size: 44px 44px;
+    mask-image: radial-gradient(ellipse 62% 62% at 50% 45%, #000 0%, transparent 100%);
+    opacity: 0.6;
+    pointer-events: none;
+  }
 }
 
 .login-card {
+  position: relative;
   width: 100%;
-  max-width: 450px;
-  padding: 20px;
+  max-width: 400px;
+  padding: var(--sp-8) var(--sp-8) var(--sp-6);
+  background: var(--surface);
 
-  mat-card-header {
+  ::ng-deep .mat-mdc-card-header {
     display: flex;
     flex-direction: column;
-    align-items: center;
-    margin-bottom: 30px;
-
-    mat-card-title {
-      font-size: 32px;
-      font-weight: 700;
-      color: #667eea;
-      margin-bottom: 8px;
-    }
-
-    mat-card-subtitle {
-      font-size: 16px;
-      color: var(--text-muted);
-    }
+    align-items: flex-start;
+    padding: 0;
+    margin-bottom: var(--sp-6);
   }
 
-  mat-card-content {
-    padding: 0 20px;
+  ::ng-deep .mat-mdc-card-title {
+    font-size: var(--fs-xl) !important;
+    font-weight: var(--fw-bold) !important;
+    letter-spacing: var(--ls-tighter) !important;
+    color: var(--text);
+  }
+
+  ::ng-deep .mat-mdc-card-subtitle {
+    margin-top: var(--sp-1);
+    font-size: var(--fs-micro) !important;
+    font-weight: var(--fw-semibold) !important;
+    text-transform: uppercase;
+    letter-spacing: var(--ls-eyebrow);
+    color: var(--text-faint) !important;
+  }
+
+  ::ng-deep .mat-mdc-card-content {
+    padding: 0;
   }
 }
 
 form {
   display: flex;
   flex-direction: column;
-  gap: 16px;
+  gap: var(--sp-2);
 }
 
 .full-width {
@@ -48,41 +75,45 @@ form {
 
 mat-form-field {
   mat-icon[matPrefix] {
-    margin-right: 8px;
-    color: var(--text-muted);
+    margin-right: var(--sp-2);
+    color: var(--text-faint);
+    font-size: 18px;
+    width: 18px;
+    height: 18px;
   }
 }
 
 .error-message {
   display: flex;
   align-items: center;
-  gap: 8px;
-  padding: 12px;
+  gap: var(--sp-2);
+  padding: var(--sp-3);
   background-color: var(--color-error-bg);
   color: var(--color-error-fg);
-  border-radius: 4px;
-  font-size: 14px;
+  border-radius: var(--radius-sm);
+  font-size: var(--fs-sm);
 
   mat-icon {
-    font-size: 20px;
-    width: 20px;
-    height: 20px;
+    font-size: 18px;
+    width: 18px;
+    height: 18px;
+    flex-shrink: 0;
   }
 }
 
 .login-button {
-  height: 48px;
-  font-size: 16px;
-  font-weight: 600;
-  margin-top: 16px;
+  height: 44px;
+  font-size: var(--fs-base);
+  font-weight: var(--fw-semibold) !important;
+  margin-top: var(--sp-3);
 
   &:disabled {
-    opacity: 0.6;
+    opacity: 0.55;
   }
 
   mat-spinner {
     display: inline-block;
-    margin-right: 8px;
+    margin-right: var(--sp-2);
   }
 
   span {
@@ -93,8 +124,6 @@ mat-form-field {
 
 @media (max-width: 600px) {
   .login-card {
-    mat-card-header mat-card-title {
-      font-size: 28px;
-    }
+    padding: var(--sp-6) var(--sp-5) var(--sp-5);
   }
 }

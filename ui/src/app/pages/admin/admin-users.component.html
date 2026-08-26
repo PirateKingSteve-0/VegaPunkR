@@ -1,5 +1,5 @@
 <div class="admin-users-container">
-  <div class="header">
+  <div class="page-header">
     <h1>Users</h1>
     <button mat-stroked-button (click)="refresh()" [disabled]="loading()">
       <mat-icon>refresh</mat-icon>
@@ -8,14 +8,14 @@
   </div>
 
   <ng-container *ngIf="!isAdmin()">
-    <div class="auditor-banner">
+    <div class="banner banner-info">
       <mat-icon>visibility</mat-icon>
       You are viewing as auditor — read-only.
     </div>
   </ng-container>
 
   <ng-container *ngIf="error()">
-    <div class="error-banner">
+    <div class="banner banner-error">
       <mat-icon>error</mat-icon>
       {{ error() }}
     </div>

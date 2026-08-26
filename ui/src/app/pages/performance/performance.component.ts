@@ -4,6 +4,12 @@ import { FormsModule } from '@angular/forms';
 import { MatCardModule } from '@angular/material/card';
 import { MatButtonModule } from '@angular/material/button';
 import { MatButtonToggleModule } from '@angular/material/button-toggle';
+import { MatMenuModule } from '@angular/material/menu';
+import { MatDividerModule } from '@angular/material/divider';
+import { MatDatepickerModule } from '@angular/material/datepicker';
+import { MatNativeDateModule } from '@angular/material/core';
+import { MatFormFieldModule } from '@angular/material/form-field';
+import { MatInputModule } from '@angular/material/input';
 import { MatIconModule } from '@angular/material/icon';
 import { MatTableModule, MatTableDataSource } from '@angular/material/table';
 import { MatSortModule, MatSort } from '@angular/material/sort';
@@ -19,7 +25,6 @@ import { ChartConfiguration, ChartData } from 'chart.js';
 
 import {
   TradierService,
-  BalancePeriod,
   ClosedPosition,
   HistoricalBalances,
   TradeEvent,
@@ -28,6 +33,14 @@ import {
 import { SystemService } from '../../services/system.service';
 import { ThemeService } from '../../services/theme.service';
 import { StrategyService } from '../../services/strategy.service';
+import {
+  MENU_PRESETS,
+  QUICK_PRESETS,
+  RangeId,
+  ResolvedRange,
+  etDateKey,
+  resolveRange,
+} from '../../models/date-range';
 
 interface MetricCard {
   label: string;
@@ -63,6 +76,12 @@ interface CalendarCell {
     MatProgressSpinnerModule,
     MatDialogModule,
     MatTooltipModule,
+    MatMenuModule,
+    MatDividerModule,
+    MatDatepickerModule,
+    MatNativeDateModule,
+    MatFormFieldModule,
+    MatInputModule,
     BaseChartDirective,
   ],
   templateUrl: './performance.component.html',
@@ -79,24 +98,34 @@ export class PerformanceComponent implements OnInit, OnDestroy {
   @ViewChild(MatSort) sort?: MatSort;
   @ViewChild(MatPaginator) paginator?: MatPaginator;
 
-  readonly periods: { value: BalancePeriod; label: string }[] = [
-    { value: 'DAY', label: '1D' },
-    { value: 'WEEK', label: '1W' },
-    { value: 'MONTH', label: '1M' },
-    { value: 'YTD', label: 'YTD' },
-    { value: 'YEAR', label: '1Y' },
-    { value: 'YEAR_3', label: '3Y' },
-    { value: 'YEAR_5', label: '5Y' },
-    { value: 'ALL', label: 'All' },
-  ];
+  // Both lists come from RANGE_PRESETS — adding a range is one row there, not a
+  // change here, in the template, and in two cutoff switches.
+  readonly quickPresets = QUICK_PRESETS;
+  readonly menuPresets = MENU_PRESETS;
 
-  period = signal<BalancePeriod>('MONTH');
+  rangeId = signal<RangeId>('MONTH');
+  customStart = signal<Date | null>(null);
+  customEnd = signal<Date | null>(null);
+  /** Reveals the inline start/end pickers. */
+  showCustomRange = signal(false);
+
+  /** The one resolved range everything else derives from. */
+  range = computed<ResolvedRange>(() => {
+    const id = this.rangeId();
+    const start = this.customStart();
+    const end = this.customEnd();
+    return resolveRange(id, id === 'CUSTOM' && start && end ? { start, end } : null);
+  });
   loading = signal(false);
   error = signal<string | null>(null);
 
   balances = signal<TradierBalances | null>(null);
   history = signal<HistoricalBalances | null>(null);
   closedPositions = signal<ClosedPosition[]>([]);
+
+  /** Account-history events used for commission/fee attribution. Not range-scoped. */
+  private costEvents: TradeEvent[] = [];
+  private feeEvents: TradeEvent[] = [];
 
   // Anchored to the first of the displayed month
   calendarMonth = signal<Date>(this.startOfMonth(new Date()));
@@ -254,7 +283,7 @@ export class PerformanceComponent implements OnInit, OnDestroy {
           'plus available cash.',
       },
       {
-        label: `${this.periodLabel()} Change`,
+        label: `${this.periodLabelShort()} Change`,
         value: `${delta >= 0 ? '+' : ''}${this.fmtCurrency(delta)}`,
         sub: `${deltaPct >= 0 ? '+' : ''}${deltaPct.toFixed(2)}%`,
         icon: delta >= 0 ? 'trending_up' : 'trending_down',
@@ -273,7 +302,7 @@ export class PerformanceComponent implements OnInit, OnDestroy {
           "market and isn't locked in until you close the position.",
       },
       {
-        label: `Realized P&L (${this.periodLabel()})`,
+        label: `Realized P&L (${this.periodLabelShort()})`,
         value: `${realizedPL >= 0 ? '+' : ''}${this.fmtCurrency(realizedPL)}`,
         sub: `${totalTrades} trade${totalTrades === 1 ? '' : 's'}`,
         icon: 'attach_money',
@@ -283,7 +312,7 @@ export class PerformanceComponent implements OnInit, OnDestroy {
           'before commissions and fees are subtracted.',
       },
       {
-        label: `Net P&L (${this.periodLabel()})`,
+        label: `Net P&L (${this.periodLabelShort()})`,
         value: `${netPL >= 0 ? '+' : ''}${this.fmtCurrency(netPL)}`,
         sub: `After ${this.fmtCurrency(periodCosts)} costs`,
         icon: 'request_quote',
@@ -390,10 +419,33 @@ export class PerformanceComponent implements OnInit, OnDestroy {
     this.settingsSub?.unsubscribe();
   }
 
-  onPeriodChange(p: BalancePeriod): void {
-    if (p === this.period()) return;
-    this.period.set(p);
-    this.loadHistory();
+  selectRange(id: RangeId): void {
+    if (id === this.rangeId() && id !== 'CUSTOM') return;
+    this.showCustomRange.set(false);
+    this.rangeId.set(id);
+    this.loadRangeData();
+  }
+
+  openCustomRange(): void {
+    // Seed the pickers from the range currently on screen so the dialog opens on
+    // something sensible rather than empty fields.
+    const current = this.range();
+    if (!this.customStart()) this.customStart.set(current.start ?? new Date());
+    if (!this.customEnd()) this.customEnd.set(new Date());
+    this.showCustomRange.set(true);
+    this.rangeId.set('CUSTOM');
+    this.loadRangeData();
+  }
+
+  applyCustomRange(): void {
+    if (!this.customStart() || !this.customEnd()) return;
+    this.rangeId.set('CUSTOM');
+    this.loadRangeData();
+  }
+
+  cancelCustomRange(): void {
+    this.showCustomRange.set(false);
+    this.selectRange('MONTH');
   }
 
   refresh(): void {
@@ -469,12 +521,12 @@ export class PerformanceComponent implements OnInit, OnDestroy {
     this.error.set(null);
     forkJoin({
       balances: this.tradier.getBalances(),
-      history: this.tradier.getHistoricalBalances(this.period()),
+      history: this.tradier.getHistoricalBalances(this.range().brokerPeriod),
       // Closed trades come from the ENGINE, not Tradier's /gainloss. That report's
       // cost basis is corrupt for repeatedly round-tripped contracts (it reported
       // -21,057 on 2026-07-13 for a day that lost -1,851) and it truncates at its
       // page limit. The engine pairs each exit with its own entry at fill time.
-      gainloss: this.strategies.getClosedTrades(this.period()),
+      gainloss: this.strategies.getClosedTrades(this.range()),
       tradeHistory: this.tradier.getAccountHistory('trade', undefined, undefined, 500).pipe(
         catchError(() => of([] as TradeEvent[])),
       ),
@@ -488,15 +540,12 @@ export class PerformanceComponent implements OnInit, OnDestroy {
       next: ({ balances, history, gainloss, tradeHistory, optionHistory, feeHistory }) => {
         this.balances.set(balances);
         this.history.set(history);
-        const enriched = this.attachCostsToClosedPositions(
-          gainloss || [],
-          [...(tradeHistory || []), ...(optionHistory || [])],
-          feeHistory || [],
-        );
-        this.closedPositions.set(enriched);
-        this.closedDataSource.data = enriched;
-        if (this.sort) this.closedDataSource.sort = this.sort;
-        if (this.paginator) this.closedDataSource.paginator = this.paginator;
+        // Cost attribution events are not range-scoped (they are fetched
+        // unbounded), so cache them and reuse on range changes rather than
+        // re-pulling 1500 rows every time the user clicks a different button.
+        this.costEvents = [...(tradeHistory || []), ...(optionHistory || [])];
+        this.feeEvents = feeHistory || [];
+        this.applyClosed(gainloss || []);
         this.rebuildChart();
         this.loading.set(false);
       },
@@ -562,24 +611,69 @@ export class PerformanceComponent implements OnInit, OnDestroy {
     });
   }
 
-  private loadHistory(): void {
+  /**
+   * Refetch everything that depends on the selected range.
+   *
+   * This used to reload only the equity curve, which meant widening the range
+   * could not show trades the initial 30-day fetch never retrieved — the metrics
+   * were then computed from a month of data and labelled "1Y". Closed trades are
+   * range-scoped server-side, so they have to be refetched too.
+   */
+  private loadRangeData(): void {
+    const range = this.range();
     this.loading.set(true);
-    this.tradier.getHistoricalBalances(this.period()).subscribe({
-      next: h => {
-        this.history.set(h);
+    forkJoin({
+      history: this.tradier.getHistoricalBalances(range.brokerPeriod),
+      gainloss: this.strategies.getClosedTrades(range),
+    }).subscribe({
+      next: ({ history, gainloss }) => {
+        this.history.set(history);
+        this.applyClosed(gainloss || []);
         this.rebuildChart();
         this.loading.set(false);
       },
       error: err => {
-        console.error('Failed to load historical balances:', err);
+        console.error('Failed to load range data:', err);
+        this.error.set(err?.error?.detail || 'Unable to load data for that range.');
         this.loading.set(false);
       },
     });
   }
 
+  /** Enrich closed trades with cached cost events and push into the table. */
+  private applyClosed(rows: ClosedPosition[]): void {
+    const enriched = this.attachCostsToClosedPositions(rows, this.costEvents, this.feeEvents);
+    this.closedPositions.set(enriched);
+    this.closedDataSource.data = enriched;
+    if (this.sort) this.closedDataSource.sort = this.sort;
+    if (this.paginator) this.closedDataSource.paginator = this.paginator;
+  }
+
+  /** Chart caption — the two modes plot different quantities and must say so. */
+  chartTitle(): string {
+    return this.range().intraday ? 'Realized P&L (intraday)' : 'Account Value';
+  }
+
+  chartSubtitle(): string {
+    return this.range().intraday
+      ? 'Cumulative realized P&L from your own fills, plotted at fill time. ' +
+          'Excludes unrealized P&L on open positions — the broker publishes account ' +
+          'value once nightly, so intraday account value is not available.'
+      : 'Daily account value from the broker.';
+  }
+
   private rebuildChart(): void {
+    if (this.range().intraday) {
+      this.rebuildIntradayChart();
+      return;
+    }
+
     const h = this.history();
-    const points = h?.balances ?? [];
+    // Tradier only takes its own coarse buckets, so the response reaches back
+    // further than asked for. Trim it to the range that is actually selected.
+    const start = this.range().start;
+    const fromKey = start ? etDateKey(start) : null;
+    const points = (h?.balances ?? []).filter(p => !fromKey || (p.date || '') >= fromKey);
     const labels = points.map(p => this.fmtChartDate(p.date));
     const values = points.map(p => p.value);
     const last = values.length > 0 ? values[values.length - 1] : 0;
@@ -603,42 +697,38 @@ export class PerformanceComponent implements OnInit, OnDestroy {
     });
   }
 
+  /**
+   * The API already scopes closed trades to the range, so this is belt-and-braces
+   * for the window between a range change and its response landing.
+   */
   private filteredClosedForPeriod(): ClosedPosition[] {
-    const cutoff = this.periodCutoff();
-    if (!cutoff) return this.closedPositions();
+    const { start, end } = this.range();
+    if (!start) return this.closedPositions();
     return this.closedPositions().filter(p => {
       const d = new Date(p.close_date);
-      return !isNaN(d.getTime()) && d >= cutoff;
+      return !isNaN(d.getTime()) && d >= start && d < end;
     });
   }
 
-  private periodCutoff(): Date | null {
-    const now = new Date();
-    switch (this.period()) {
-      case 'DAY':
-        // Midnight local today — close_date is a date-only stamp from Tradier,
-        // so anything closed today lands at or after this.
-        return new Date(now.getFullYear(), now.getMonth(), now.getDate());
-      case 'WEEK':
-        return new Date(now.getFullYear(), now.getMonth(), now.getDate() - 7);
-      case 'MONTH':
-        return new Date(now.getFullYear(), now.getMonth() - 1, now.getDate());
-      case 'YTD':
-        return new Date(now.getFullYear(), 0, 1);
-      case 'YEAR':
-        return new Date(now.getFullYear() - 1, now.getMonth(), now.getDate());
-      case 'YEAR_3':
-        return new Date(now.getFullYear() - 3, now.getMonth(), now.getDate());
-      case 'YEAR_5':
-        return new Date(now.getFullYear() - 5, now.getMonth(), now.getDate());
-      case 'ALL':
-      default:
-        return null;
-    }
+  periodLabel(): string {
+    return this.range().label;
   }
 
-  periodLabel(): string {
-    return this.periods.find(p => p.value === this.period())?.label ?? '';
+  /** Compact form for metric-tile headings — see ResolvedRange.shortLabel. */
+  periodLabelShort(): string {
+    return this.range().shortLabel;
+  }
+
+  /** Terse label for the active range, for the segmented control's overflow button. */
+  activeMenuLabel(): string {
+    const id = this.rangeId();
+    if (id === 'CUSTOM') return 'Custom';
+    return this.menuPresets.find(p => p.id === id)?.label ?? 'More';
+  }
+
+  isMenuRangeActive(): boolean {
+    const id = this.rangeId();
+    return id === 'CUSTOM' || this.menuPresets.some(p => p.id === id);
   }
 
   fmtCurrency(value: number): string {
@@ -661,6 +751,79 @@ export class PerformanceComponent implements OnInit, OnDestroy {
     const date = new Date(d);
     if (isNaN(date.getTime())) return d;
     return date.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+  }
+
+  /** Fill time on an Eastern wall clock — a session is read in market time. */
+  private fmtChartTime(d: Date): string {
+    return d.toLocaleTimeString('en-US', {
+      timeZone: 'America/New_York',
+      hour: 'numeric',
+      minute: '2-digit',
+    });
+  }
+
+  /**
+   * Intraday curve: the running sum of realized P&L over the range's fills.
+   *
+   * Built from our own Trade records rather than the broker. Tradier's account
+   * history is documented as nightly-only and its balances carry a date with no
+   * time (docs/tradier/accounts/balance_overtime.md), so there is no intraday
+   * account value to plot. What we do have is every exit at the moment it
+   * filled, which is exact — it is just a different quantity, hence the caption.
+   */
+  private rebuildIntradayChart(): void {
+    const { start } = this.range();
+    const fills = this.filteredClosedForPeriod()
+      .map(p => ({ at: new Date(p.close_date), pnl: p.net_pnl ?? p.gain_loss ?? 0 }))
+      .filter(f => !isNaN(f.at.getTime()))
+      .sort((a, b) => a.at.getTime() - b.at.getTime());
+
+    const palette = this.themeService.chartColors();
+
+    if (fills.length === 0) {
+      this.chartData.set({ labels: [], datasets: [] });
+      return;
+    }
+
+    // Anchor at zero from the session's start so the first fill reads as a move
+    // off the flat line rather than as the starting level.
+    const labels: string[] = [start ? this.fmtChartTime(start) : 'Open'];
+    const values: number[] = [0];
+    let cum = 0;
+    for (const f of fills) {
+      cum += f.pnl;
+      labels.push(this.fmtChartTime(f.at));
+      values.push(Number(cum.toFixed(2)));
+    }
+
+    const up = cum >= 0;
+    const stroke = up ? palette.profit : palette.loss;
+    this.chartData.set({
+      labels,
+      datasets: [
+        {
+          data: values,
+          label: 'Realized P&L',
+          borderColor: stroke,
+          backgroundColor: up ? palette.profitFill : palette.lossFill,
+          fill: 'origin',
+          pointBackgroundColor: stroke,
+          // One point per fill — on a busy 0DTE day that is a lot of dots.
+          pointRadius: values.length > 40 ? 0 : 2,
+          // Realized P&L is a step function: it does not move between exits, it
+          // jumps at one. The default smoothing would draw drift that never
+          // happened (and overshoot past the actual values between fills).
+          //
+          // 'before' is counter-intuitive but correct — in Chart.js it draws the
+          // segment at the PREVIOUS point's y and steps at the next x, i.e. it
+          // holds the running total until the next fill. 'after' steps at the
+          // previous x, which would show each trade's P&L as if it existed
+          // before the trade closed.
+          stepped: 'before',
+          tension: 0,
+        },
+      ],
+    });
   }
 
   prevMonth(): void {

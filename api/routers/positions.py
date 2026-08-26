@@ -28,7 +28,14 @@ def get_positions(
     - symbol: Filter positions by specific symbol (e.g., 'AAPL')
     - strategy_id: Filter positions by strategy ID
     """
-    query = db.query(Position).filter(Position.user_id == current_user.id)
+    # Open rows only. Position rows are per-contract now, so closed ones
+    # accumulate — one per contract ever traded — and "positions" means what is
+    # held, not what was ever held (that is what `trades` is for). The Angular
+    # page already filtered `qty > 0` client-side; this makes the API agree.
+    query = db.query(Position).filter(
+        Position.user_id == current_user.id,
+        Position.qty > 0,
+    )
 
     if symbol:
         query = query.filter(Position.symbol == symbol.upper())
@@ -202,7 +209,13 @@ def get_positions_summary(
     - Total unrealized P&L
     - Total market value
     """
-    positions = db.query(Position).filter(Position.user_id == current_user.id).all()
+    # `qty > 0` matters here specifically: total_positions is a COUNT of rows, so
+    # without it a per-contract schema reports every contract ever traded as an
+    # open position. The P&L sums were always safe (closed rows are zeroed).
+    positions = db.query(Position).filter(
+        Position.user_id == current_user.id,
+        Position.qty > 0,
+    ).all()
 
     total_positions = len(positions)
     total_unrealized_pnl = sum(p.unrealized_pnl or 0 for p in positions)

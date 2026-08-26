@@ -16,6 +16,15 @@ import { MatChipInputEvent } from '@angular/material/chips';
 import { StrategyType } from '../../models/strategy.model';
 import { StrategyService } from '../../services/strategy.service';
 
+/**
+ * Hard floor on the forced end-of-day exit, in minutes before the bell.
+ * Mirrors `FORCED_EOD_EXIT_FLOOR_MINUTES` in api/engine/signal_generator.py.
+ * The backend rejects anything lower (schemas._validate_time_exit_params) and
+ * the engine clamps it regardless — this constant only keeps the form honest.
+ * Keep the two in sync if the floor ever moves.
+ */
+const EOD_EXIT_FLOOR_MIN = 15;
+
 @Component({
   selector: 'app-strategy-form',
   standalone: true,
@@ -48,6 +57,9 @@ export class StrategyFormComponent implements OnInit {
   isSaving = false;
 
   strategyTypes = Object.values(StrategyType);
+  // Exposed to the template so the hint/error text and the `min` binding
+  // all read from the single constant rather than a hardcoded 15.
+  readonly EOD_EXIT_FLOOR_MIN = EOD_EXIT_FLOOR_MIN;
 
   instruments: string[] = [];
   readonly separatorKeysCodes = [ENTER, COMMA] as const;
@@ -62,7 +74,11 @@ export class StrategyFormComponent implements OnInit {
       take_profit_percentage: [4, [Validators.min(0.1), Validators.max(50)]],
       max_hold_time_minutes: [0, [Validators.min(0)]],
       entry_after_open_minutes: [0, [Validators.min(0)]],
-      exit_before_close_minutes: [0, [Validators.min(0)]],
+      // Minimum 15, never 0. Mirrors the engine's hard floor
+      // (signal_generator.FORCED_EOD_EXIT_FLOOR_MINUTES); the API rejects
+      // anything lower. Counts BACKWARDS from the bell, so a bigger number
+      // exits EARLIER — which is why the floor is a minimum, not a maximum.
+      exit_before_close_minutes: [EOD_EXIT_FLOOR_MIN, [Validators.required, Validators.min(EOD_EXIT_FLOOR_MIN)]],
       trailing_stop: [false],
       trailing_stop_activation: [0, [Validators.min(0)]],
       trailing_stop_distance: [0, [Validators.min(0)]],
@@ -96,7 +112,10 @@ export class StrategyFormComponent implements OnInit {
           take_profit_percentage: strategy.take_profit_percentage,
           max_hold_time_minutes: p['max_hold_time_minutes'] ?? 0,
           entry_after_open_minutes: p['entry_after_open_minutes'] ?? 0,
-          exit_before_close_minutes: p['exit_before_close_minutes'] ?? 0,
+          // Clamp up, don't just default: legacy strategies stored 0, and
+          // `??` does not fire on 0 — it would load 0 and then fail to save.
+          exit_before_close_minutes: Math.max(
+            p['exit_before_close_minutes'] ?? EOD_EXIT_FLOOR_MIN, EOD_EXIT_FLOOR_MIN),
           trailing_stop: p['trailing_stop'] ?? false,
           trailing_stop_activation: p['trailing_stop_activation'] ?? 0,
           trailing_stop_distance: p['trailing_stop_distance'] ?? 0,
