@@ -747,7 +747,8 @@ class StreamDrivenWorker:
                     # only be a dead claimant's — a live one would have been
                     # declined above. Two rows against one broker holding
                     # double-count unrealized P&L into the account-wide
-                    # daily-loss halt, so clear it in the same transaction.
+                    # daily-loss halt, so clear it here, before the adoption is
+                    # committed.
                     for dupe in db.query(Position).filter(
                         Position.user_id == strat.user_id,
                         Position.option_symbol == occ_symbol,
@@ -758,6 +759,15 @@ class StreamDrivenWorker:
                             f"Strategy {strategy_id}: adopting {occ_symbol} from "
                             f"inactive strategy {dupe.strategy_id} — clearing its row"
                         )
+                        # Zero the row BEFORE log_event, which does its own
+                        # db.commit() (event_logger.py). Logging first would
+                        # commit the adoption with the duplicate row still open
+                        # — persisting, however briefly, the exact double-count
+                        # state this loop exists to prevent. Zeroing first means
+                        # that commit carries both writes.
+                        prior_qty = dupe.qty
+                        dupe.qty = 0
+                        dupe.unrealized_pnl = 0.0
                         log_event(
                             db=db,
                             user_id=dupe.user_id,
@@ -776,11 +786,11 @@ class StreamDrivenWorker:
                                 "option_symbol": occ_symbol,
                                 "from_strategy_id": dupe.strategy_id,
                                 "to_strategy_id": strategy_id,
-                                "qty": dupe.qty,
+                                # Captured before the write above, so this is the
+                                # qty that was actually transferred, not 0.
+                                "qty": prior_qty,
                             },
                         )
-                        dupe.qty = 0
-                        dupe.unrealized_pnl = 0.0
 
                     # Zero only rows the broker does NOT hold.
                     self._flatten_other_contracts(
