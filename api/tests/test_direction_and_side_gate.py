@@ -193,24 +193,95 @@ async def _c3():
 asyncio.run(_c3())
 check("side mismatch disarms before any quote call", disarmed == [True], True)
 
-print("\nC4: adoption must not steal the other strategy's contract")
+print("\nC4/N1/N2: adoption is an EXIT-enabling path — filter ownership, not side")
 db, u = fresh()
+u2 = User(email="other@t.com", hashed_password="x", name="O", role="user",
+          account_size_usd=100000)
+db.add(u2); db.flush()
 a = Strategy(user_id=u.id, name="calls", strategy_type="momentum",
-             params_json={'direction': 'call'})
+             params_json={'direction': 'call'}, is_active=True)
 b = Strategy(user_id=u.id, name="puts", strategy_type="momentum",
-             params_json={'direction': 'put'})
+             params_json={'direction': 'put'}, is_active=True)
 db.add_all([a, b]); db.flush()
 db.add(Position(user_id=u.id, strategy_id=b.id, symbol="SPY", option_symbol=PUT,
                 qty=3, avg_entry_price=2.0, current_price=2.0, unrealized_pnl=0.0))
 db.commit()
 broker = [{"symbol": PUT, "quantity": 3}, {"symbol": CALL, "quantity": 1},
-          {"symbol": "SPY", "quantity": 100}]
-got = StreamDrivenWorker._adoptable_broker_options(db, a.id, "SPY", broker, 'call')
-check("call strategy ignores the put and the stock",
+          {"symbol": "SPY", "quantity": 100}, {"symbol": "SPYG271231C00050000", "quantity": 9}]
+
+got, declined = StreamDrivenWorker._adoptable_broker_options(db, u.id, a.id, "SPY", broker)
+check("skips the stock leg and the SPYG contract (root match, not prefix)",
       [p["symbol"] for p in got], [CALL])
-got = StreamDrivenWorker._adoptable_broker_options(db, a.id, "SPY", broker, 'put')
-check("and refuses a put already owned by another strategy",
-      [p["symbol"] for p in got], [])
+check("...and reports the put as DECLINED, not absent", declined, 1)
+
+# N2: a call strategy MUST still be able to adopt a live put it owns, otherwise
+# flipping Direction orphans the open position at the broker with no exit path.
+db2, u3 = fresh()
+solo = Strategy(user_id=u3.id, name="flipped", strategy_type="momentum",
+                params_json={'direction': 'put'}, is_active=True)
+db2.add(solo); db2.commit()
+got, declined = StreamDrivenWorker._adoptable_broker_options(
+    db2, u3.id, solo.id, "SPY", [{"symbol": CALL, "quantity": 2}])
+check("a put-direction strategy still adopts a live CALL it must exit",
+      [p["symbol"] for p in got], [CALL])
+check("nothing declined, so the caller will not zero the row", declined, 0)
+
+# N1: OCC symbols are global. Another USER's row must not block our adoption.
+db3, u4 = fresh()
+u5 = User(email="b@t.com", hashed_password="x", name="B", role="user",
+          account_size_usd=100000)
+db3.add(u5); db3.flush()
+mine3 = Strategy(user_id=u4.id, name="mine", strategy_type="momentum",
+                 params_json={}, is_active=True)
+theirs = Strategy(user_id=u5.id, name="theirs", strategy_type="momentum",
+                  params_json={}, is_active=True)
+db3.add_all([mine3, theirs]); db3.flush()
+db3.add(Position(user_id=u5.id, strategy_id=theirs.id, symbol="SPY",
+                 option_symbol=CALL, qty=3, avg_entry_price=2.0,
+                 current_price=2.0, unrealized_pnl=0.0))
+db3.commit()
+got, declined = StreamDrivenWorker._adoptable_broker_options(
+    db3, u4.id, mine3.id, "SPY", [{"symbol": CALL, "quantity": 3}])
+check("another USER's row does not block adoption of our own position",
+      [p["symbol"] for p in got], [CALL])
+
+print("\nN3: a stale row on an INACTIVE strategy must not block entries forever")
+
+
+def gate_with_owner_active(is_active):
+    db, u = fresh()
+    other = Strategy(user_id=u.id, name="other", strategy_type="momentum",
+                     max_positions=1, params_json={}, is_active=is_active)
+    mine = Strategy(user_id=u.id, name="mine", strategy_type="momentum",
+                    max_positions=1, params_json={'direction': 'call'}, is_active=True)
+    db.add_all([other, mine]); db.flush()
+    db.add(Position(user_id=u.id, strategy_id=other.id, symbol="SPY",
+                    option_symbol=PUT, qty=3, avg_entry_price=2.0,
+                    current_price=2.0, unrealized_pnl=0.0))
+    db.commit()
+    sig = Signal(signal_type='entry', action='buy', symbol="SPY", confidence=1.0,
+                 reason="t", price=2.0)
+    OrderManager._last_order_at.clear()
+    return (asyncio.run(OrderManager(db).execute_signal(
+        user=u, strategy=mine, signal=sig, qty=1, option_symbol=CALL,
+        estimated_price=2.0)).message or "")
+
+
+check("an ACTIVE opposite-side strategy still blocks",
+      BLOCK in gate_with_owner_active(True), True)
+check("a DEACTIVATED strategy's stale row does not",
+      BLOCK in gate_with_owner_active(False), False)
+
+print("\nN5: no parseable contract means no side conflict")
+check("equity/None option_symbol is not treated as a call",
+      BLOCK in gate_msg(PUT, 'call', buying=None), False)
+
+print("\nN4: an entry_signal with no direction word imposes no bound")
+# 'ema_crossover' names the indicator but no bound. Before direction existed
+# this imposed no price-vs-EMA constraint; it must still impose none.
+check("bullish price passes", entry_signal_for('call', 900.0, 'ema_crossover') is not None, True)
+check("bearish price ALSO passes (no bound, as before)",
+      entry_signal_for('call', 600.0, 'ema_crossover') is not None, True)
 
 print("\n" + ("ALL PASSED" if not fails else f"{len(fails)} FAILURE(S):\n  " + "\n  ".join(fails)))
 sys.exit(1 if fails else 0)

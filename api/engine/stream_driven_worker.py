@@ -558,45 +558,49 @@ class StreamDrivenWorker:
 
     @staticmethod
     def _adoptable_broker_options(
-        db, strategy_id: int, underlying: str, tradier_positions, direction: str
+        db, user_id: int, strategy_id: int, underlying: str, tradier_positions
     ):
-        """Broker option positions on `underlying` that THIS strategy may adopt.
+        """Broker option positions on `underlying` this strategy may adopt.
 
-        Both recovery paths used to take `held[0]` — any option whose symbol
-        starts with the underlying, regardless of side and regardless of which
-        strategy is actually running it. That was survivable only while one
-        strategy per underlying existed. Now that a call-side and a put-side
-        strategy on one symbol is a supported configuration, it is a live hazard,
-        so two filters are applied:
+        Returns (adoptable, declined). `declined` is NOT cosmetic — see the
+        callers: an empty `adoptable` with declined > 0 means "the broker holds
+        something we chose not to manage", which must never be treated as "the
+        broker is flat". Conflating the two zeroes a row for a position that is
+        still live at the broker, leaving a real 0DTE contract with no stop
+        loss, no take profit and no forced EOD exit.
 
-        SIDE — only contracts matching this strategy's direction. Adopting the
-        other side makes a call strategy "hold" a put, which defeats the
-        opposite-side entry gate after the fact and mis-signs every exit
-        decision taken off that row.
+        Only ONE filter is applied, deliberately:
 
-        OWNERSHIP — skip a contract another strategy already has an open
-        Position row for. Two rows against one broker holding double-count
-        unrealized P&L into the account-wide daily-loss gate, and let each
-        strategy close contracts the other owns, leaving the loser to book a
-        phantom exit at a guessed price.
+        OWNERSHIP — skip a contract another of THIS USER's strategies already
+        has an open Position row for. Two rows against one broker holding
+        double-count unrealized P&L into the account-wide daily-loss gate and
+        let each strategy close contracts the other owns. Scoped by user_id
+        because OCC symbols are global: two accounts running SPY 0DTE land on
+        the same contract string routinely, and an unscoped query would let one
+        user's row block another user's engine from managing its own position.
+
+        There is deliberately NO side filter. Adoption is how the engine regains
+        the ability to CLOSE something it already owns, so it is an exit-enabling
+        path and rule 4 applies: direction gates what we OPEN — the chain scan
+        and the opposite-side entry gate — never what we may manage. Filtering
+        by side here meant that flipping Direction in the form while holding a
+        live call orphaned that call at the broker with no recovery path.
         """
-        out = []
+        adoptable, declined = [], 0
         for p in tradier_positions:
             sym = str(p.get("symbol", ""))
-            if not sym.startswith(underlying) or sym == underlying:
+            parsed = parse_occ_symbol(sym)
+            # Match on the parsed OCC root, not a prefix: startswith("SPY")
+            # also matches SPYG and SPYD contracts.
+            if parsed is not None:
+                if parsed.root != underlying:
+                    continue
+            elif not sym.startswith(underlying) or sym == underlying:
                 continue
             if float(p.get("quantity", 0)) <= 0:
                 continue
-            parsed = parse_occ_symbol(sym)
-            if parsed is not None:
-                side = 'call' if parsed.right == 'C' else 'put'
-                if side != direction:
-                    logger.info(
-                        f"Strategy {strategy_id}: not adopting {sym} — it is a "
-                        f"{side} and this strategy trades {direction}s"
-                    )
-                    continue
             claimed = db.query(Position).filter(
+                Position.user_id == user_id,
                 Position.option_symbol == sym,
                 Position.strategy_id != strategy_id,
                 Position.qty > 0,
@@ -606,9 +610,10 @@ class StreamDrivenWorker:
                     f"Strategy {strategy_id}: not adopting {sym} — strategy "
                     f"{claimed.strategy_id} already holds it (qty={claimed.qty})"
                 )
+                declined += 1
                 continue
-            out.append(p)
-        return out
+            adoptable.append(p)
+        return adoptable, declined
 
     @staticmethod
     def _flatten_other_contracts(db, strategy_id: int, keep_position_id) -> int:
@@ -653,12 +658,13 @@ class StreamDrivenWorker:
             client = self._tradier_client_for(strategy_id, db)
             tradier_positions = await asyncio.to_thread(client.get_positions)
 
-            # Option contracts for our underlying that this strategy may adopt
-            # — filtered by side and by whether another strategy owns them.
+            # Option contracts for our underlying that this strategy may adopt.
             strat = db.query(Strategy).filter(Strategy.id == strategy_id).first()
-            direction = resolve_direction(strat.params_json if strat else None)
-            held = self._adoptable_broker_options(
-                db, strategy_id, underlying, tradier_positions, direction
+            if strat is None:
+                logger.error(f"Strategy {strategy_id}: row vanished — skipping sync")
+                return
+            held, declined = self._adoptable_broker_options(
+                db, strat.user_id, strategy_id, underlying, tradier_positions
             )
 
             if held:
@@ -695,6 +701,16 @@ class StreamDrivenWorker:
                 logger.info(
                     f"Strategy {strategy_id}: synced from Tradier — "
                     f"{occ_symbol} qty={qty} entry=${entry_price:.2f} (position id={db_pos.id})"
+                )
+
+            elif declined:
+                # The broker HOLDS something here; we just declined to manage it
+                # (another strategy owns the row). Falling through to the zeroing
+                # branch would mark our rows closed against a live broker
+                # position — no SL, no TP, no EOD exit. Leave state untouched.
+                logger.warning(
+                    f"Strategy {strategy_id}: broker holds {declined} contract(s) on "
+                    f"{underlying} claimed by another strategy — leaving DB rows alone"
                 )
 
             else:
@@ -771,9 +787,9 @@ class StreamDrivenWorker:
                 tradier_positions = await asyncio.to_thread(client.get_positions)
                 underlying = state.underlying_symbol
                 strat = db.query(Strategy).filter(Strategy.id == strategy_id).first()
-                direction = resolve_direction(strat.params_json if strat else None)
-                held = self._adoptable_broker_options(
-                    db, strategy_id, underlying, tradier_positions, direction
+                held, _declined = self._adoptable_broker_options(
+                    db, strat.user_id if strat else 0, strategy_id, underlying,
+                    tradier_positions
                 )
                 if held:
                     tradier_pos = held[0]

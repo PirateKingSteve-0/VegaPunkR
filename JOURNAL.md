@@ -8567,3 +8567,51 @@ Two things the first version got wrong, both worth remembering:
 The earlier "exit is never blocked" case was vacuous — real exits go through `close_position`, which
 never reaches the gate. It now exercises `close_position` directly with an opposite-side position
 held by another strategy.
+
+### 9. Second guard pass — the C4 fix was worse than the bug
+
+Re-reviewing the fix commit caught that **C4's fix traded a double-counting hazard for two ways to
+lose management of a live position.** Both are now fixed; recording them because the mistake is
+instructive.
+
+`_adoptable_broker_options` filtered adoptable broker positions by SIDE. But adoption is how the
+engine regains the ability to **close** something it already owns — it is an exit-enabling path, and
+"exits are sacred" applies:
+
+- **N2** — hold a live long call, flip Direction to Puts in the form (one click), restart. The call
+  is filtered out, `held` comes back empty, and `_startup_sync` falls into the `else` branch that
+  zeroes every open row and logs `POSITION_MANUALLY_CLOSED` — against a position the broker still
+  holds. No SL, no TP, no EOD exit. `_reconcile_position` then refuses to adopt it back for the same
+  reason, so there is no recovery path at all.
+- **N1** — the ownership query was not scoped to `user_id`. OCC symbols are global, so another
+  user's open row could "claim" a contract and produce the same empty-`held` → zeroing outcome for a
+  position this user really holds.
+
+The root cause of both is that **`_startup_sync` could not distinguish "the broker is flat" from
+"the broker holds something we declined to adopt."** Fixes:
+
+1. The side filter is gone. Direction gates what we OPEN — the chain scan and the opposite-side entry
+   gate — never what we may manage.
+2. The ownership filter is scoped by `user_id`, and matches on the parsed OCC root rather than
+   `startswith` (which also matched SPYG/SPYD).
+3. The helper returns `(adoptable, declined)`, and the caller has a new `elif declined:` branch that
+   logs and leaves DB rows alone. An empty `adoptable` with `declined > 0` is never treated as flat.
+
+Also from that pass:
+
+- **N3** — the opposite-side gate had no self-healing path. Every path that zeroes `qty` is
+  per-strategy and runs only while that strategy's worker is alive, so a stale open row on a
+  *deactivated* strategy would block the other side from every entry indefinitely. The gate now
+  ignores rows belonging to an inactive strategy.
+- **N4** — the C1 fix had quietly widened the trigger. Old: `'above' in es and 'ema' in es` — both
+  tokens required. New: `'ema' in es` alone, so a hand-written `entry_signal: "ema_crossover"` went
+  from imposing *no* price-vs-EMA bound to requiring price > EMA. Restored via `_names_a_bound()`,
+  which requires the indicator name AND a direction word; only which WAY the bound points now comes
+  from `resolve_direction`. The eight shipped templates were verified bit-identical either way.
+- **N5** — the gate treated an unparseable `option_symbol` as a call, so an equity entry on SPY was
+  blocked whenever any SPY put was open. It now skips the gate entirely when there is no contract.
+
+> **Lesson, and it is the same one as July 13 and August 25:** the first fix was written from the
+> shape of the problem ("a call strategy shouldn't adopt a put") without asking what the code path
+> was *for*. Adoption exists to let us exit. Any filter added to an exit-enabling path has to be
+> justified against rule 4 before it is written, not after it is reviewed.

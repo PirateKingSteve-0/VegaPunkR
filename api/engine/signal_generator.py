@@ -41,6 +41,22 @@ FORCED_EOD_EXIT_FLOOR_MINUTES = 15
 VALID_DIRECTIONS = ('call', 'put')
 
 
+def _names_a_bound(entry_signal: str, indicator: str) -> bool:
+    """Does `entry_signal` ask for a price-vs-`indicator` bound at all?
+
+    Requires BOTH the indicator name and a direction word, exactly as the
+    pre-direction code did (`'above' in es and 'ema' in es`). Dropping the
+    direction-word half would silently ADD a constraint to any hand-written
+    entry_signal that names an indicator without one — "ema_crossover" imposed
+    no price-vs-EMA bound before and must not start imposing one now.
+
+    Which WAY the bound points is no longer read from here; that comes from
+    resolve_direction. This only answers whether the bound exists.
+    """
+    es = (entry_signal or '').lower()
+    return indicator in es and ('above' in es or 'below' in es)
+
+
 def resolve_direction(params: Optional[Dict]) -> str:
     """Return 'call' or 'put' for a strategy's params_json.
 
@@ -310,7 +326,7 @@ class SignalGenerator:
                 # `direction` decides which side of it we need.
                 entry_signal = params.get('entry_signal', 'price_above_9ema_and_vwap')
 
-                if 'ema' in entry_signal.lower():
+                if _names_a_bound(entry_signal, 'ema'):
                     if wants_upside and current_price <= ema_value:
                         logger.debug(f"{symbol}: Price ${current_price:.2f} not above EMA ${ema_value:.2f}")
                         return None
@@ -329,7 +345,7 @@ class SignalGenerator:
                 # not gate the entry even when use_vwap is on. Unchanged.
                 entry_signal = params.get('entry_signal', '')
 
-                if 'vwap' in entry_signal.lower():
+                if _names_a_bound(entry_signal, 'vwap'):
                     if wants_upside and current_price <= vwap_value:
                         logger.debug(f"{symbol}: Price ${current_price:.2f} not above VWAP ${vwap_value:.2f}")
                         return None

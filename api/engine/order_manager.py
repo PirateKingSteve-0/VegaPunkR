@@ -687,20 +687,35 @@ class OrderManager:
                 # old side armed until it disarms. Reading params there would
                 # have let a "call" strategy holding an armed put pass a gate
                 # checking calls, and open the second side.
-                want = resolve_direction(strategy.params_json)
+                # No parseable contract means no side to conflict over — an
+                # equity ticker or a None here is not a call, and treating it as
+                # one blocked equity entries whenever any put was open.
                 armed = parse_occ_symbol(option_symbol or "")
-                if armed is not None:
-                    want = 'call' if armed.right == 'C' else 'put'
+                want = ('call' if armed.right == 'C' else 'put') if armed else None
                 opposed = self.db.query(Position).filter(
                     Position.user_id == user.id,
                     Position.symbol == symbol,
                     Position.strategy_id != strategy.id,
                     Position.qty > 0,
-                ).all()
+                ).all() if want else []
                 for other in opposed:
                     parsed = parse_occ_symbol(other.option_symbol or "")
                     if parsed is None:
                         continue  # equity or unparseable — not a side conflict
+                    # Only a LIVE strategy's row may block us. Every path that
+                    # zeroes qty is per-strategy and runs only while that
+                    # strategy's worker is alive, so a stale open row on a
+                    # deactivated strategy would otherwise block this one from
+                    # every entry forever, with no code path able to clear it.
+                    owner = self.db.query(Strategy).filter(
+                        Strategy.id == other.strategy_id
+                    ).first()
+                    if owner is not None and not owner.is_active:
+                        logger.info(
+                            f"Ignoring stale {symbol} row from inactive strategy "
+                            f"{other.strategy_id} ({other.option_symbol})"
+                        )
+                        continue
                     held = 'call' if parsed.right == 'C' else 'put'
                     if held == want:
                         continue
