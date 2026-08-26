@@ -587,8 +587,13 @@ class StreamDrivenWorker:
         live call orphaned that call at the broker with no recovery path.
         """
         adoptable, declined = [], 0
+        # Uppercase both sides. `instruments` is stored verbatim from the API
+        # with no normalisation, so a strategy created with "spy" would match
+        # nothing here — and a no-match with declined == 0 walks straight into
+        # the caller's zeroing branch against a live broker position.
+        underlying = (underlying or "").upper()
         for p in tradier_positions:
-            sym = str(p.get("symbol", ""))
+            sym = str(p.get("symbol", "")).upper()
             parsed = parse_occ_symbol(sym)
             # Match on the parsed OCC root, not a prefix: startswith("SPY")
             # also matches SPYG and SPYD contracts.
@@ -604,6 +609,14 @@ class StreamDrivenWorker:
                 Position.option_symbol == sym,
                 Position.strategy_id != strategy_id,
                 Position.qty > 0,
+            ).join(Strategy, Strategy.id == Position.strategy_id).filter(
+                # Only a strategy that is STILL RUNNING can be trusted to exit
+                # what it claims. If the claimant was deactivated — including by
+                # the 20-consecutive-error auto-stop, which fires exactly when a
+                # live position has just lost its worker — declining here would
+                # leave a real contract with no exit management in any process.
+                # Adoption is the exit-enabling path, so it errs toward adopting.
+                Strategy.is_active.is_(True)
             ).first()
             if claimed is not None:
                 logger.warning(
@@ -658,91 +671,94 @@ class StreamDrivenWorker:
             client = self._tradier_client_for(strategy_id, db)
             tradier_positions = await asyncio.to_thread(client.get_positions)
 
-            # Option contracts for our underlying that this strategy may adopt.
             strat = db.query(Strategy).filter(Strategy.id == strategy_id).first()
             if strat is None:
                 logger.error(f"Strategy {strategy_id}: row vanished — skipping sync")
                 return
-            held, declined = self._adoptable_broker_options(
-                db, strat.user_id, strategy_id, underlying, tradier_positions
-            )
 
-            if held:
-                tradier_pos = held[0]
-                occ_symbol = tradier_pos["symbol"]
-                qty = int(float(tradier_pos.get("quantity", 1)))
-                cost_basis = float(tradier_pos.get("cost_basis", 0))
-                entry_price = cost_basis / (qty * 100) if qty > 0 else 0.0
-
-                # Find-or-CREATE the row for the contract the broker actually
-                # holds. Previously this grabbed whatever row the strategy had and
-                # rewrote its option_symbol — and when no row existed at all it
-                # gave up ("cannot resume automatically"), leaving a real broker
-                # position unmanaged. Both are fixed by keying on the contract.
-                db_pos = self._position_for_contract(db, strategy_id, underlying, occ_symbol)
-                if db_pos is None:
-                    logger.error(
-                        f"Strategy {strategy_id}: cannot resolve strategy row — "
-                        f"skipping startup sync for {occ_symbol}"
-                    )
-                    return
-
-                db_pos.qty = qty
-                if entry_price > 0:
-                    db_pos.avg_entry_price = entry_price
-                    if not db_pos.current_price:
-                        db_pos.current_price = entry_price
-
-                # The broker holds exactly this contract, so nothing else is open.
-                self._flatten_other_contracts(db, strategy_id, db_pos.id)
-
-                db.commit()
-                state.option_symbol = occ_symbol
-                logger.info(
-                    f"Strategy {strategy_id}: synced from Tradier — "
-                    f"{occ_symbol} qty={qty} entry=${entry_price:.2f} (position id={db_pos.id})"
+            # Held across the ownership read AND the insert — see _adoption_lock.
+            async with _adoption_lock(strat.user_id, underlying):
+                # Option contracts for our underlying that this strategy may adopt.
+                held, declined = self._adoptable_broker_options(
+                    db, strat.user_id, strategy_id, underlying, tradier_positions
                 )
 
-            elif declined:
-                # The broker HOLDS something here; we just declined to manage it
-                # (another strategy owns the row). Falling through to the zeroing
-                # branch would mark our rows closed against a live broker
-                # position — no SL, no TP, no EOD exit. Leave state untouched.
-                logger.warning(
-                    f"Strategy {strategy_id}: broker holds {declined} contract(s) on "
-                    f"{underlying} claimed by another strategy — leaving DB rows alone"
-                )
+                if held:
+                    tradier_pos = held[0]
+                    occ_symbol = tradier_pos["symbol"]
+                    qty = int(float(tradier_pos.get("quantity", 1)))
+                    cost_basis = float(tradier_pos.get("cost_basis", 0))
+                    entry_price = cost_basis / (qty * 100) if qty > 0 else 0.0
 
-            else:
-                # No position in Tradier — zero out every open row, not just one.
-                open_rows = db.query(Position).filter(
-                    Position.strategy_id == strategy_id,
-                    Position.qty > 0,
-                ).all()
-                for db_pos in open_rows:
-                    closed_contract = db_pos.option_symbol
-                    logger.info(
-                        f"Strategy {strategy_id}: DB shows {closed_contract} open but "
-                        "Tradier has none — clearing (was manually closed)"
-                    )
-                    db_pos.qty = 0
-                    db_pos.unrealized_pnl = 0.0
+                    # Find-or-CREATE the row for the contract the broker actually
+                    # holds. Previously this grabbed whatever row the strategy had and
+                    # rewrote its option_symbol — and when no row existed at all it
+                    # gave up ("cannot resume automatically"), leaving a real broker
+                    # position unmanaged. Both are fixed by keying on the contract.
+                    db_pos = self._position_for_contract(db, strategy_id, underlying, occ_symbol)
+                    if db_pos is None:
+                        logger.error(
+                            f"Strategy {strategy_id}: cannot resolve strategy row — "
+                            f"skipping startup sync for {occ_symbol}"
+                        )
+                        return
 
-                    log_event(
-                        db=db,
-                        user_id=db_pos.user_id,
-                        event_type="POSITION_MANUALLY_CLOSED",
-                        title=f"Position closed manually: {closed_contract or underlying}",
-                        symbol=db_pos.symbol,
-                        strategy_id=strategy_id,
-                        severity="warning",
-                        event_data={
-                            "option_symbol": closed_contract,
-                            "detected_at": "startup_sync",
-                        },
-                    )
-                if open_rows:
+                    db_pos.qty = qty
+                    if entry_price > 0:
+                        db_pos.avg_entry_price = entry_price
+                        if not db_pos.current_price:
+                            db_pos.current_price = entry_price
+
+                    # The broker holds exactly this contract, so nothing else is open.
+                    self._flatten_other_contracts(db, strategy_id, db_pos.id)
+
                     db.commit()
+                    state.option_symbol = occ_symbol
+                    logger.info(
+                        f"Strategy {strategy_id}: synced from Tradier — "
+                        f"{occ_symbol} qty={qty} entry=${entry_price:.2f} (position id={db_pos.id})"
+                    )
+
+                elif declined:
+                    # The broker HOLDS something here; we just declined to manage it
+                    # (another strategy owns the row). Falling through to the zeroing
+                    # branch would mark our rows closed against a live broker
+                    # position — no SL, no TP, no EOD exit. Leave state untouched.
+                    logger.warning(
+                        f"Strategy {strategy_id}: broker holds {declined} contract(s) on "
+                        f"{underlying} claimed by another strategy — leaving DB rows alone"
+                    )
+
+                else:
+                    # No position in Tradier — zero out every open row, not just one.
+                    open_rows = db.query(Position).filter(
+                        Position.strategy_id == strategy_id,
+                        Position.qty > 0,
+                    ).all()
+                    for db_pos in open_rows:
+                        closed_contract = db_pos.option_symbol
+                        logger.info(
+                            f"Strategy {strategy_id}: DB shows {closed_contract} open but "
+                            "Tradier has none — clearing (was manually closed)"
+                        )
+                        db_pos.qty = 0
+                        db_pos.unrealized_pnl = 0.0
+
+                        log_event(
+                            db=db,
+                            user_id=db_pos.user_id,
+                            event_type="POSITION_MANUALLY_CLOSED",
+                            title=f"Position closed manually: {closed_contract or underlying}",
+                            symbol=db_pos.symbol,
+                            strategy_id=strategy_id,
+                            severity="warning",
+                            event_data={
+                                "option_symbol": closed_contract,
+                                "detected_at": "startup_sync",
+                            },
+                        )
+                    if open_rows:
+                        db.commit()
 
         except Exception as e:
             logger.warning(f"Startup Tradier sync failed for strategy {strategy_id}: {e}")
@@ -787,9 +803,13 @@ class StreamDrivenWorker:
                 tradier_positions = await asyncio.to_thread(client.get_positions)
                 underlying = state.underlying_symbol
                 strat = db.query(Strategy).filter(Strategy.id == strategy_id).first()
+                if strat is None:
+                    logger.error(
+                        f"Strategy {strategy_id}: row vanished — skipping adoption"
+                    )
+                    return
                 held, _declined = self._adoptable_broker_options(
-                    db, strat.user_id if strat else 0, strategy_id, underlying,
-                    tradier_positions
+                    db, strat.user_id, strategy_id, underlying, tradier_positions
                 )
                 if held:
                     tradier_pos = held[0]
@@ -1357,6 +1377,32 @@ class StreamDrivenWorker:
                 f"OI={oi} need >={min_oi}) — disarming and reselecting"
             )
             await self._disarm_contract(strategy_id, state, stream_mgr, router)
+
+
+_adoption_locks: dict = {}
+
+
+def _adoption_lock(user_id: int, underlying: str) -> asyncio.Lock:
+    """Serialise adopt-and-commit per (user, underlying).
+
+    The ownership check in _adoptable_broker_options is an unlocked SELECT with
+    no unique constraint behind it, and StreamDrivenWorker.start launches every
+    strategy's task in one loop. So a call-side and a put-side strategy on the
+    same underlying run _startup_sync concurrently: both await get_positions,
+    both see no claim on a contract the broker holds, and both create a Position
+    row for it. Two rows against one real holding double-count unrealized P&L
+    into the account-wide daily-loss halt, and leave whichever strategy loses
+    the race to book a phantom exit at a guessed price.
+
+    In-process only, matching the engine's single-process deployment. A second
+    process would need a partial unique index on (user_id, option_symbol) WHERE
+    qty > 0, or a pg advisory lock.
+    """
+    key = (user_id, (underlying or "").upper())
+    lock = _adoption_locks.get(key)
+    if lock is None:
+        lock = _adoption_locks[key] = asyncio.Lock()
+    return lock
 
 
 _worker: "StreamDrivenWorker | None" = None

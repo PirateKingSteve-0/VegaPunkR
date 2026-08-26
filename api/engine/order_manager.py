@@ -10,7 +10,7 @@ import asyncio
 import logging
 import uuid
 from typing import Dict, Optional, Tuple
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 from sqlalchemy.orm import Session
 
 from models import User, Strategy, Trade, Position
@@ -687,10 +687,24 @@ class OrderManager:
                 # old side armed until it disarms. Reading params there would
                 # have let a "call" strategy holding an armed put pass a gate
                 # checking calls, and open the second side.
-                # No parseable contract means no side to conflict over — an
-                # equity ticker or a None here is not a call, and treating it as
-                # one blocked equity entries whenever any put was open.
+                # No contract at all means no side to conflict over — an
+                # equity entry is not a call, and treating it as one blocked
+                # equity entries whenever any put was open.
+                #
+                # But a NON-EMPTY symbol we cannot parse is different: we are
+                # about to buy something and cannot establish which side it is.
+                # Most-restrictive-bound wins, so that blocks rather than
+                # silently disabling the gate.
                 armed = parse_occ_symbol(option_symbol or "")
+                if option_symbol and armed is None:
+                    msg = (
+                        f"Entry blocked for {symbol}: option_symbol "
+                        f"{option_symbol!r} is not a parseable OCC contract, so "
+                        "the opposite-side check cannot be evaluated."
+                    )
+                    logger.warning(msg)
+                    self.db.rollback()
+                    return OrderResult(success=False, message=msg)
                 want = ('call' if armed.right == 'C' else 'put') if armed else None
                 opposed = self.db.query(Position).filter(
                     Position.user_id == user.id,
@@ -702,17 +716,21 @@ class OrderManager:
                     parsed = parse_occ_symbol(other.option_symbol or "")
                     if parsed is None:
                         continue  # equity or unparseable — not a side conflict
-                    # Only a LIVE strategy's row may block us. Every path that
-                    # zeroes qty is per-strategy and runs only while that
-                    # strategy's worker is alive, so a stale open row on a
-                    # deactivated strategy would otherwise block this one from
-                    # every entry forever, with no code path able to clear it.
-                    owner = self.db.query(Strategy).filter(
-                        Strategy.id == other.strategy_id
-                    ).first()
-                    if owner is not None and not owner.is_active:
+                    # Ignore a row only when the contract itself proves it is
+                    # stale — an EXPIRED contract cannot still be held, so it
+                    # can never be a real side conflict.
+                    #
+                    # An earlier version keyed this on `owner.is_active`, which
+                    # is backwards. Deactivation does not close positions, and
+                    # strategy_executor sets is_active=False automatically after
+                    # 20 consecutive errors — precisely when a live position has
+                    # just lost its worker. Treating that as "stale" would open
+                    # the second side against a real, unmanaged first leg, which
+                    # is the exact outcome this gate exists to prevent. is_active
+                    # correlates with MORE danger here, not less.
+                    if parsed.expiry < date.today():
                         logger.info(
-                            f"Ignoring stale {symbol} row from inactive strategy "
+                            f"Ignoring expired {symbol} row from strategy "
                             f"{other.strategy_id} ({other.option_symbol})"
                         )
                         continue

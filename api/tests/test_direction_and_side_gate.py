@@ -245,18 +245,19 @@ got, declined = StreamDrivenWorker._adoptable_broker_options(
 check("another USER's row does not block adoption of our own position",
       [p["symbol"] for p in got], [CALL])
 
-print("\nN3: a stale row on an INACTIVE strategy must not block entries forever")
+print("\nF2: staleness is the CONTRACT's expiry, never the owner's is_active flag")
+EXPIRED_PUT = "SPY200101P00745000"          # Jan 2020 — cannot still be held
 
 
-def gate_with_owner_active(is_active):
+def gate_with(held_contract, owner_active):
     db, u = fresh()
     other = Strategy(user_id=u.id, name="other", strategy_type="momentum",
-                     max_positions=1, params_json={}, is_active=is_active)
+                     max_positions=1, params_json={}, is_active=owner_active)
     mine = Strategy(user_id=u.id, name="mine", strategy_type="momentum",
                     max_positions=1, params_json={'direction': 'call'}, is_active=True)
     db.add_all([other, mine]); db.flush()
     db.add(Position(user_id=u.id, strategy_id=other.id, symbol="SPY",
-                    option_symbol=PUT, qty=3, avg_entry_price=2.0,
+                    option_symbol=held_contract, qty=3, avg_entry_price=2.0,
                     current_price=2.0, unrealized_pnl=0.0))
     db.commit()
     sig = Signal(signal_type='entry', action='buy', symbol="SPY", confidence=1.0,
@@ -267,14 +268,48 @@ def gate_with_owner_active(is_active):
         estimated_price=2.0)).message or "")
 
 
-check("an ACTIVE opposite-side strategy still blocks",
-      BLOCK in gate_with_owner_active(True), True)
-check("a DEACTIVATED strategy's stale row does not",
-      BLOCK in gate_with_owner_active(False), False)
+check("a live opposite-side row blocks (owner active)",
+      BLOCK in gate_with(PUT, True), True)
+# strategy_executor auto-stops a strategy after 20 consecutive errors, which is
+# exactly when a LIVE position has just lost its worker. It must still block.
+check("...and STILL blocks when the owner was auto-deactivated",
+      BLOCK in gate_with(PUT, False), True)
+check("an EXPIRED contract cannot be held, so it does not block",
+      BLOCK in gate_with(EXPIRED_PUT, True), False)
 
-print("\nN5: no parseable contract means no side conflict")
-check("equity/None option_symbol is not treated as a call",
-      BLOCK in gate_msg(PUT, 'call', buying=None), False)
+print("\nF3: adoption must NOT defer to a dead strategy's claim")
+db4, u6 = fresh()
+live = Strategy(user_id=u6.id, name="live", strategy_type="momentum",
+                params_json={}, is_active=True)
+dead = Strategy(user_id=u6.id, name="dead", strategy_type="momentum",
+                params_json={}, is_active=False)
+mine4 = Strategy(user_id=u6.id, name="mine", strategy_type="momentum",
+                 params_json={}, is_active=True)
+db4.add_all([live, dead, mine4]); db4.flush()
+db4.add(Position(user_id=u6.id, strategy_id=live.id, symbol="SPY", option_symbol=CALL,
+                 qty=1, avg_entry_price=2.0, current_price=2.0, unrealized_pnl=0.0))
+db4.add(Position(user_id=u6.id, strategy_id=dead.id, symbol="SPY", option_symbol=PUT,
+                 qty=1, avg_entry_price=2.0, current_price=2.0, unrealized_pnl=0.0))
+db4.commit()
+got, declined = StreamDrivenWorker._adoptable_broker_options(
+    db4, u6.id, mine4.id, "SPY", [{"symbol": CALL, "quantity": 1},
+                                  {"symbol": PUT, "quantity": 1}])
+check("declines the ACTIVE strategy's contract",
+      CALL not in [p["symbol"] for p in got], True)
+check("but ADOPTS the dead strategy's, so it can still be exited",
+      PUT in [p["symbol"] for p in got], True)
+check("declined counts only the live claim", declined, 1)
+
+print("\nF7: instruments are stored verbatim — casing must not orphan a position")
+got, declined = StreamDrivenWorker._adoptable_broker_options(
+    db4, u6.id, mine4.id, "spy", [{"symbol": PUT, "quantity": 1}])
+check("lowercase underlying still matches the contract",
+      [p["symbol"] for p in got], [PUT])
+
+print("\nF5: an unparseable contract must fail CLOSED, not open")
+msg = gate_msg(PUT, 'call', buying="NOT-AN-OCC-SYMBOL")
+check("a non-empty unparseable option_symbol blocks the entry",
+      "not a parseable OCC contract" in msg, True)
 
 print("\nN4: an entry_signal with no direction word imposes no bound")
 # 'ema_crossover' names the indicator but no bound. Before direction existed

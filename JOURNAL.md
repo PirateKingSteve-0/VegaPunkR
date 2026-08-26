@@ -8615,3 +8615,61 @@ Also from that pass:
 > shape of the problem ("a call strategy shouldn't adopt a put") without asking what the code path
 > was *for*. Adoption exists to let us exit. Any filter added to an exit-enabling path has to be
 > justified against rule 4 before it is written, not after it is reviewed.
+
+### 10. Third guard pass — the discriminator was backwards in both places
+
+Pass 3 confirmed N1/N2/N4/N5 genuinely closed (N2 verified on **both** recovery paths — the
+fallback-priced Trade at `_reconcile_position` cannot fire against a declined contract, because that
+path rebuilds `held` unfiltered and keys on the exact contract). It then found the N3 fix was itself
+a rule-3 violation, and that the same `is_active` distinction was **missing** where it would have
+helped:
+
+- **F2** — the gate ignored rows owned by an `is_active=False` strategy, on the theory that such a
+  row must be stale. It isn't. Deactivation does not close positions, and
+  `strategy_executor.py:228` sets `is_active = False` **automatically after 20 consecutive errors** —
+  which is precisely the moment a live position loses its worker. So the one signal I used to mean
+  "safe to ignore" actually correlates with *more* danger. Replaced with the contract's own expiry:
+  an expired contract cannot still be held, which is unambiguous.
+- **F3** — meanwhile the adoption filter deferred to *any* other strategy's claim, including a dead
+  one. A put strategy holding a live contract, then auto-stopped, would have its contract declined
+  by the surviving strategy — leaving a real 0DTE option with no exit management in any process,
+  with the engine logging that it chose not to manage it. Adoption now only defers to a claim from
+  a strategy that is still running.
+
+The two are mirror images, and I had them inverted: **direction and liveness gate what we OPEN;
+adoption errs toward taking responsibility so something can be EXITED.**
+
+Also fixed:
+
+- **F1** — removing the side filter re-opened a narrower version of C4. The ownership check is an
+  unlocked `SELECT` with no unique constraint behind it, and `start()` launches every strategy's
+  task in one loop, so a call-side and a put-side strategy `_startup_sync` concurrently, both see no
+  claim, and both create a row for the same broker holding. Serialised with an in-process
+  `_adoption_lock(user_id, underlying)` held across the ownership read *and* the insert. In-process
+  only — a second process would need a partial unique index on `(user_id, option_symbol) WHERE
+  qty > 0`, noted in TODO.
+- **F5** — the N5 fix made the gate fail *open*: it skipped whenever `parse_occ_symbol` returned
+  None, including for a non-empty symbol that simply doesn't parse. Skipping is right for an equity
+  ticker or None; for an unparseable contract we are about to buy something whose side we cannot
+  establish, so most-restrictive-bound says block.
+- **F7** — `instruments` is stored verbatim with no normalisation
+  (`routers/strategies.py:135`), so a strategy created with `"spy"` matched no broker position, and
+  a no-match with `declined == 0` walks straight into the zeroing branch against a live contract.
+  Both sides of the root comparison are now uppercased.
+- **F8** — `_reconcile_position` passed `user_id=0` when the strategy row was missing, which matches
+  nothing and therefore *disabled* the ownership filter rather than failing safe. Now returns early,
+  matching `_startup_sync`.
+
+### 11. Known, NOT fixed — pre-existing, needs a decision
+
+**F4 — `held[0]` plus `_flatten_other_contracts` can orphan a second contract.** Both recovery paths
+adopt only `held[0]` and discard the rest, then `_flatten_other_contracts` zeroes every other open
+row for the strategy, logging "broker does not hold it" — a claim it never verifies. Hand-buy a
+second strike in the Tradier portal and restart: one contract is adopted, the other's row is zeroed
+with no `Trade` booked and no event logged, and it becomes permanently invisible to the engine — no
+SL, no TP, no EOD exit, and its P&L silently deleted rather than realised.
+
+Pre-existing and untouched by this work, but it sits on the code path rewritten here and it is the
+last remaining route to a live position with no exit management. **Left alone deliberately:** the
+fix (only flatten rows the broker does not hold) changes behaviour that was not part of this task.
+See TODO.

@@ -204,3 +204,38 @@ I would like to add a button/feature that allows us to pause trading for the day
 - [x] Reservation-ledger code audit + sandbox concurrency probe + entry-drift logging (A1 forward-progress). Audited `_preview_or_abort` and the reservation helpers — release-path try/finally is sound, no `await` between cash check and reservation acquire (same-loop concurrent signals atomically serialized), `cost` field correctly used per Tradier docs, sells correctly skip the gate. Wrote `api/debug/probe_buy_reservations.py` — fires N concurrent `_preview_or_abort` calls via `asyncio.gather` and asserts only `floor(effective_cash / required_per_order)` succeed. Default mode is preview-only (no real orders placed). Wired `ORDER_PREVIEW_DRIFT` event on every option buy (signal_price vs preview_per_contract) — observation only, no cancel logic. A1 still pending the actual sandbox probe run. B2 cancel-on-drift decision pending data + A1. See journal 2026-05-09 (Part 4). _(2026-05-09, Part 4)_
 - [x] Per-strategy equity curve charts on the strategies page. New `GET /performance/equity-curves` returns `[{strategy_id, name, points: [{t, cum_pnl, trade_pnl}]}]` — running sum of `Trade.pnl` over closing trades (`exit_timestamp` + `pnl` not-null), ordered ascending, realized only (open-position unrealized intentionally excluded so the curve is stable). New "Equity" column on the strategies table renders an inline Chart.js sparkline (no axes, no tooltip) plus the lifetime-cumulative dollar amount, color-keyed via `themeService.chartColors()` so it follows theme/CB toggles live. Click → `EquityCurveDialogComponent` with full Chart.js line, hover tooltip (trade #, full timestamp, this-trade PnL, cumulative), and four stat tiles (total realized, best trade, worst trade, win rate). Strategies with zero closed trades show "—" — the canvas only renders for non-empty curves. Route ordering matters: `/equity-curves` is registered before `/{metrics_id}` so the path-param doesn't capture the literal. _(2026-05-09, Part 5)_
 - [x] Broker routing fix — live trading mode now uses Tradier Live instead of Schwab (E1). Modified `TradierClient.__init__()` to accept optional `env` parameter (defaults to `settings.TRADIER_ENV` for backward compatibility). Updated `TradingClientManager` to route both `paper` and `live` modes to Tradier (sandbox vs live respectively), removing Schwab from the normal client selector path. All trading methods (`place_order`, `preview_order`, `get_account`, `get_history`, `get_positions`) now use Tradier for both modes. Schwab integration remains mounted but is no longer reachable through standard trading flows. Fully backward compatible — existing code continues to work. _(2026-07-08)_
+
+---
+
+## H. Recovery-path hardening (from the 2026-08-26 put-support guard passes)
+
+### H1. `held[0]` + `_flatten_other_contracts` orphans a second contract *(pre-existing, unfixed)*
+
+Both recovery paths (`_startup_sync`, `_reconcile_position`) adopt only `held[0]` and discard
+`held[1:]`. `_flatten_other_contracts` then zeroes every other open row for the strategy, logging
+"broker does not hold it" without verifying that against the broker — false whenever `len(held) > 1`.
+
+Reachable by hand-buying a second strike in the Tradier portal, or by any path that leaves two
+contracts open. The discarded contract's row is zeroed with **no `Trade` booked and no
+`POSITION_MANUALLY_CLOSED` event**, so it becomes invisible: no stop loss, no take profit, no forced
+EOD exit, and its P&L is deleted rather than realised.
+
+**Fix shape:** pass the full adoptable set into `_flatten_other_contracts` and zero only rows whose
+contract the broker does *not* hold. Deliberately not done on 2026-08-26 — it changes behaviour
+outside the scope of that task and wants a deliberate decision.
+
+### H2. Adoption serialisation is in-process only
+
+`_adoption_lock(user_id, underlying)` (`stream_driven_worker.py`) serialises the adopt-and-commit
+critical section so two strategies on one underlying cannot both create a `Position` row for the
+same broker holding. It is an `asyncio.Lock`, so it only covers the single-process deployment.
+A second engine process would need a partial unique index on `(user_id, option_symbol) WHERE qty > 0`
+or a `pg_advisory_xact_lock`. Same class of gap as A2's reservation-ledger concern.
+
+### H3. `elif declined:` leaves `state.option_symbol` unset
+
+When adoption declines a live claim, the strategy arms a *fresh* contract while its own open row
+names a different one. Exit pricing is safe (`_check_exit_signals` compares the streamed symbol to
+`position.option_symbol` and falls back to REST on mismatch), but that REST fallback then runs on
+every 1s eval tick — ~60 quote calls/minute for a position that could have been streamed. The
+declined branch could arm the strategy's own open contract instead.
