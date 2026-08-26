@@ -1522,7 +1522,13 @@ def _held_symbol(p, underlying=None):
         return None
     if underlying is None:
         return sym
-    u = (underlying or "").upper()
+    u = underlying.upper()
+    if not u:
+        # An EMPTY underlying is not "match anything" — that is what None means.
+        # Without this, `startswith("")` is True for every symbol, so a blank
+        # underlying would make every non-OCC broker holding adoptable. Fail
+        # closed: a caller that lost its ticker adopts nothing.
+        return None
     parsed = parse_occ_symbol(sym)
     if parsed is not None:
         return sym if parsed.root == u else None

@@ -8810,3 +8810,27 @@ this range blocks a supervised live session. The two things to settle before liv
 pre-existing: the auto-stop orphan above, and **H2** — `_adoption_lock` is in-process, so a second
 API worker or an overlapping restart reopens double-adoption regardless of anything here. The cheap
 insurance for a live session is the partial unique index on `(user_id, option_symbol) WHERE qty > 0`.
+
+### 16. Seventh pass — clean, and the stopping point
+
+First pass in the cycle with no blocking findings. `_held_symbol` was
+differential-tested against the two predicates it replaced across the full cross product of symbols
+× quantities × underlyings: **zero adoption mismatches**, with the bare-ticker exclusion and the
+uppercase root comparison both confirmed preserved. The G-2 restructure verified on all four points
+(every duplicate still zeroed, `qty` captured pre-mutation, nothing touches the ORM object after
+commit — `transfers` holds plain dicts — and the events fire on the same session).
+
+One latent flag closed: `_held_symbol`'s `underlying=None` means "any held position", but an
+**empty string** would have made `startswith("")` true for every symbol, so a caller that lost its
+ticker would adopt every non-OCC broker holding. Unreachable today —
+`_adoptable_broker_options` normalises to `""` ten lines above the call, and nothing passes a blank
+ticker — but it failed *open*, so it now returns None explicitly.
+
+**Accepted residual, recorded deliberately:** if the process dies between `db.commit()` and the
+`transfers` event loop, the ownership transfer happens with no audit event. That is strictly better
+than the alternative it replaced (a `log_event` rollback destroying the adoption itself), so it is
+the right trade — but the gap is real.
+
+**Final state of `72a52a6..HEAD`:** safe on DEV/paper with the call/put pair. 44 assertions across
+four engine test files. Nothing in the range blocks a supervised live session; the two things to
+settle first are both pre-existing and both now visible in `scripts/morning_check.py` or TODO H2.

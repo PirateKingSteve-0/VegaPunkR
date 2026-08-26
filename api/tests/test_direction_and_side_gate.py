@@ -416,5 +416,13 @@ res = run_startup_sync(
 check("a non-OCC broker holding is not zeroed as 'not held'",
       ("SPYG", 5) in res["mine"], True)
 
+# An empty underlying must adopt NOTHING. `None` means "any held position"
+# (the do-not-zero set); "" is a caller that lost its ticker, and
+# startswith("") would otherwise match everything.
+got, _ = StreamDrivenWorker._adoptable_broker_options(
+    db4, u6.id, mine4.id, "", [{"symbol": "SPYG", "quantity": 5},
+                               {"symbol": CALL, "quantity": 1}])
+check("an empty underlying adopts nothing (fails closed)", got, [])
+
 print("\n" + ("ALL PASSED" if not fails else f"{len(fails)} FAILURE(S):\n  " + "\n  ".join(fails)))
 sys.exit(1 if fails else 0)
