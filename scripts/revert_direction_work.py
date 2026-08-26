@@ -21,15 +21,21 @@ from sqlalchemy import create_engine, text
 BACKUP = os.path.join(os.path.dirname(__file__), 'backups',
                       'strategies_pre_direction_2026-08-26.json')
 
-GIT_HINT = """
-Code revert (run separately, from the repo root):
+# 72a52a6 is the last commit before any put-support work.
+BASE = "72a52a6"
 
-    git revert --no-edit b526943 8c6a794     # undo both put-support commits
+GIT_HINT = f"""
+Code revert (run separately, from the repo root). {BASE} is the last commit
+before any of the put-support work:
+
+    git revert --no-commit {BASE}..HEAD
+    git commit -m "REVERT - put support"
     git push origin dev
 
 Or, to inspect first:
 
-    git diff 72a52a6..HEAD -- api/engine/
+    git log --oneline {BASE}..HEAD
+    git diff {BASE}..HEAD -- api/engine/
 """
 
 
