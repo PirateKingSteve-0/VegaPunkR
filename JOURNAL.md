@@ -8771,3 +8771,42 @@ individual finding. What that session needs to cover, specifically:
 
 **Still open:** H2 — `_adoption_lock` is an in-process `asyncio.Lock`. A second API process, or a
 restart overlapping the old one, reopens double-adoption regardless of any of this.
+
+### 15. Sixth pass — and the structural fix for the recurrence
+
+Pass 6 verified F-1/F-2/F-3 correct (the second re-indentation was AST-diffed rather than eyeballed;
+statement sequence identical), confirmed `83d5107`'s transaction-ordering fix, and confirmed the
+TODO H1 correction is factually right.
+
+It then found the pattern **one more time** — and this time the fix is structural rather than
+another patch:
+
+- **G-1** — `_broker_option_symbols` (the do-not-zero set) required `parse_occ_symbol`, while
+  `_adoptable_broker_options` accepted non-OCC symbols through a `startswith` fallback. Anything in
+  that gap was adoptable but absent from `broker_holds`, so its row was zeroed with "broker does not
+  hold it". Same false claim, third variation.
+
+Every recurrence in this work has been **a producer and a consumer disagreeing about the same set**.
+So the two now share one definition, `_held_symbol(p, underlying=None)`, and the docstring says why
+they must never be written separately again. That is the actual fix; more review passes were not
+going to converge on their own.
+
+- **G-2** — the ownership-transfer `log_event` sat mid-transaction. `83d5107` had made its internal
+  commit carry a *consistent* state, but `log_event` also calls `db.rollback()` on failure, which
+  would have discarded the adoption writes and the flushed new `Position` row while execution
+  continued with `db_pos.id` back to `None`. Events are now collected and emitted **after** the
+  outer `db.commit()`, which is what `event_logger`'s own module docstring asks for.
+- **G-3** — the stale pre-fix comment above the reconcile lock was removed; it described behaviour
+  that no longer existed, which is the failure F-2 was about.
+
+**Operational finding, pre-existing and worth an alert rather than a code change:** a strategy
+auto-stopped while holding leaves a live contract with no exit manager in *any* process —
+`strategy_executor.py:186` returns early on `not is_active` and the worker loop exits, so no SL, no
+TP, no EOD. The other strategy will not adopt it either, because `held.sort` correctly prefers its
+own contract. `scripts/morning_check.py` now flags exactly this as check 5.
+
+**Verdict carried forward:** `72a52a6..HEAD` is safe on DEV/paper with the call/put pair. Nothing in
+this range blocks a supervised live session. The two things to settle before live are both
+pre-existing: the auto-stop orphan above, and **H2** — `_adoption_lock` is in-process, so a second
+API worker or an overlapping restart reopens double-adoption regardless of anything here. The cheap
+insurance for a live session is the partial unique index on `(user_id, option_symbol) WHERE qty > 0`.

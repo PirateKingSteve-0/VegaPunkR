@@ -593,16 +593,9 @@ class StreamDrivenWorker:
         # the caller's zeroing branch against a live broker position.
         underlying = (underlying or "").upper()
         for p in tradier_positions:
-            sym = str(p.get("symbol", "")).upper()
-            parsed = parse_occ_symbol(sym)
-            # Match on the parsed OCC root, not a prefix: startswith("SPY")
-            # also matches SPYG and SPYD contracts.
-            if parsed is not None:
-                if parsed.root != underlying:
-                    continue
-            elif not sym.startswith(underlying) or sym == underlying:
-                continue
-            if float(p.get("quantity", 0)) <= 0:
+            # Same predicate the do-not-zero set is built from — see _held_symbol.
+            sym = _held_symbol(p, underlying)
+            if sym is None:
                 continue
             claimed = db.query(Position).filter(
                 Position.user_id == user_id,
@@ -747,8 +740,16 @@ class StreamDrivenWorker:
                     # only be a dead claimant's — a live one would have been
                     # declined above. Two rows against one broker holding
                     # double-count unrealized P&L into the account-wide
-                    # daily-loss halt, so clear it here, before the adoption is
-                    # committed.
+                    # daily-loss halt, so clear it before the adoption commits.
+                    #
+                    # The events are collected and emitted AFTER db.commit(),
+                    # not here: log_event runs its own db.commit(), and on
+                    # failure its own db.rollback() — which mid-transaction
+                    # would discard the adoption writes and the flushed new
+                    # Position row, leaving execution to continue with
+                    # db_pos.id back to None. event_logger's module docstring
+                    # asks for exactly this ordering.
+                    transfers = []
                     for dupe in db.query(Position).filter(
                         Position.user_id == strat.user_id,
                         Position.option_symbol == occ_symbol,
@@ -759,38 +760,16 @@ class StreamDrivenWorker:
                             f"Strategy {strategy_id}: adopting {occ_symbol} from "
                             f"inactive strategy {dupe.strategy_id} — clearing its row"
                         )
-                        # Zero the row BEFORE log_event, which does its own
-                        # db.commit() (event_logger.py). Logging first would
-                        # commit the adoption with the duplicate row still open
-                        # — persisting, however briefly, the exact double-count
-                        # state this loop exists to prevent. Zeroing first means
-                        # that commit carries both writes.
-                        prior_qty = dupe.qty
+                        transfers.append({
+                            "user_id": dupe.user_id,
+                            "symbol": dupe.symbol,
+                            "from_strategy_id": dupe.strategy_id,
+                            # Captured before the write below, so the event
+                            # records what actually moved rather than 0.
+                            "qty": dupe.qty,
+                        })
                         dupe.qty = 0
                         dupe.unrealized_pnl = 0.0
-                        log_event(
-                            db=db,
-                            user_id=dupe.user_id,
-                            event_type="POSITION_OWNERSHIP_TRANSFERRED",
-                            title=f"Position moved between strategies: {occ_symbol}",
-                            detail=(
-                                f"Strategy {dupe.strategy_id} is inactive and still "
-                                f"held a row for {occ_symbol}; strategy {strategy_id} "
-                                "adopted the broker position and its row was cleared. "
-                                "P&L attribution moves to the adopting strategy."
-                            ),
-                            symbol=dupe.symbol,
-                            strategy_id=strategy_id,
-                            severity="warning",
-                            event_data={
-                                "option_symbol": occ_symbol,
-                                "from_strategy_id": dupe.strategy_id,
-                                "to_strategy_id": strategy_id,
-                                # Captured before the write above, so this is the
-                                # qty that was actually transferred, not 0.
-                                "qty": prior_qty,
-                            },
-                        )
 
                     # Zero only rows the broker does NOT hold.
                     self._flatten_other_contracts(
@@ -799,6 +778,31 @@ class StreamDrivenWorker:
                     )
 
                     db.commit()
+
+                    for t in transfers:
+                        log_event(
+                            db=db,
+                            user_id=t["user_id"],
+                            event_type="POSITION_OWNERSHIP_TRANSFERRED",
+                            title=f"Position moved between strategies: {occ_symbol}",
+                            detail=(
+                                f"Strategy {t['from_strategy_id']} is inactive and "
+                                f"still held a row for {occ_symbol}; strategy "
+                                f"{strategy_id} adopted the broker position and its "
+                                "row was cleared. P&L attribution moves to the "
+                                "adopting strategy."
+                            ),
+                            symbol=t["symbol"],
+                            strategy_id=strategy_id,
+                            severity="warning",
+                            event_data={
+                                "option_symbol": occ_symbol,
+                                "from_strategy_id": t["from_strategy_id"],
+                                "to_strategy_id": strategy_id,
+                                "qty": t["qty"],
+                            },
+                        )
+
                     state.option_symbol = occ_symbol
                     logger.info(
                         f"Strategy {strategy_id}: synced from Tradier — "
@@ -912,11 +916,6 @@ class StreamDrivenWorker:
                         f"Strategy {strategy_id}: row vanished — skipping adoption"
                     )
                     return
-                # Same lock as _startup_sync. Neither critical section contains
-                # an await today, so in one event loop both are already atomic
-                # and this buys nothing — it is here so the two paths stay
-                # symmetric. The day an await appears inside either block, an
-                # asymmetric guard would protect only one of them.
                 # Same lock as _startup_sync, spanning the ownership read
                 # THROUGH the insert and commit — not just the read. A guard that
                 # covers only the SELECT buys nothing the GIL does not already
@@ -1499,24 +1498,47 @@ class StreamDrivenWorker:
             await self._disarm_contract(strategy_id, state, stream_mgr, router)
 
 
-def _broker_option_symbols(tradier_positions) -> set:
-    """Every option contract the broker reports a long position in.
+def _held_symbol(p, underlying=None):
+    """Uppercased symbol of a held broker position, or None if not held.
 
-    This is deliberately the RAW broker response, not the adoptable subset.
-    `_flatten_other_contracts` uses it to decide which rows are safe to zero,
-    and its premise is "the broker is the authority" — the authority is what
-    the broker says it holds, never the filtered list of what we chose to
-    manage. Passing the adoptable subset meant a contract DECLINED because
-    another live strategy claims it was absent from the set, so our own row for
-    it was zeroed with the log line "broker does not hold it" — the exact false
-    claim the broker_holds guard exists to eliminate.
+    ONE predicate, deliberately shared by both sides of the adoption logic:
+    `_adoptable_broker_options` (what this strategy may take on) and
+    `_broker_option_symbols` (what `_flatten_other_contracts` must not zero).
+
+    They used to be written separately and drifted apart — adoption fell back
+    to a `startswith` prefix match for non-OCC symbols while the broker_holds
+    set required `parse_occ_symbol`. Anything in that gap was adoptable but
+    absent from broker_holds, so its row was zeroed with the log line "broker
+    does not hold it": the exact false claim broker_holds exists to eliminate.
+    Every recurrence of that bug in this work came from a producer and a
+    consumer disagreeing about the same set, so they now share one definition.
+
+    `underlying=None` means "any held position", which is what the
+    do-not-zero set wants — being broader there can only spare a row, never
+    wrongly clear one.
     """
-    out = set()
-    for p in tradier_positions or []:
-        sym = str(p.get("symbol", ""))
-        if parse_occ_symbol(sym) and float(p.get("quantity", 0)) > 0:
-            out.add(sym)
-    return out
+    sym = str(p.get("symbol", "")).upper()
+    if not sym or float(p.get("quantity", 0)) <= 0:
+        return None
+    if underlying is None:
+        return sym
+    u = (underlying or "").upper()
+    parsed = parse_occ_symbol(sym)
+    if parsed is not None:
+        return sym if parsed.root == u else None
+    return sym if (sym.startswith(u) and sym != u) else None
+
+
+def _broker_option_symbols(tradier_positions) -> set:
+    """Everything the broker reports holding — the do-not-zero set.
+
+    Deliberately the RAW broker response, not the adoptable subset:
+    `_flatten_other_contracts`'s premise is "the broker is the authority", and
+    the authority is what the broker says it holds, never the filtered list of
+    what we chose to manage.
+    """
+    return {sym for sym in
+            (_held_symbol(p) for p in (tradier_positions or [])) if sym}
 
 
 _adoption_locks: dict = {}

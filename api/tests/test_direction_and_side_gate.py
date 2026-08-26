@@ -405,5 +405,16 @@ res = run_startup_sync(
 check("a DECLINED but broker-held contract keeps its row",
       (PUT, 1) in res["mine"], True)
 
+# G-1: the do-not-zero set and the adoptable set must use ONE predicate.
+# A non-OCC holding reachable via the startswith fallback used to be adoptable
+# but absent from broker_holds, so its row was zeroed as "not held".
+res = run_startup_sync(
+    broker_positions=[{"symbol": CALL, "quantity": 1, "cost_basis": 200.0},
+                      {"symbol": "SPYG", "quantity": 5, "cost_basis": 500.0}],
+    rows=[("mine", CALL, 1), ("mine", "SPYG", 5)],
+    strategies={"mine": True})
+check("a non-OCC broker holding is not zeroed as 'not held'",
+      ("SPYG", 5) in res["mine"], True)
+
 print("\n" + ("ALL PASSED" if not fails else f"{len(fails)} FAILURE(S):\n  " + "\n  ".join(fails)))
 sys.exit(1 if fails else 0)

@@ -107,6 +107,20 @@ def main():
           "\n".join(f"{BAD} {s} qty={broker[s]} — live contract with NO stop loss, "
                     f"take profit or EOD exit" for s in sorted(missing)))
 
+    # 5. The realistic overnight hazard. strategy_executor auto-stops a strategy
+    # after 20 consecutive errors WITHOUT closing its position, and a stopped
+    # worker runs no SL/TP/EOD. A broker holding owned by an inactive strategy
+    # is the one state where a real contract has no exit manager in any process.
+    inactive = {s[0] for s in strategies if not s[2]}
+    print("\n5. broker holding owned by an INACTIVE strategy")
+    orphans = [r for r in rows if r[0] in inactive and r[1] in broker]
+    if orphans:
+        for r in orphans:
+            print(f"{BAD} {r[1]} qty={r[2]} owned by strategy {r[0]}, which is "
+                  f"stopped — nothing is running its stop loss or EOD exit")
+    else:
+        print(f"{OK} none")
+
 
 if __name__ == '__main__':
     main()
