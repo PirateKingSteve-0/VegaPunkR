@@ -68,6 +68,10 @@ export class StrategyFormComponent implements OnInit {
     this.strategyForm = this.fb.group({
       name: ['', [Validators.required, Validators.minLength(3)]],
       strategy_type: [StrategyType.MOMENTUM, [Validators.required]],
+      // Which side of the option chain to BUY. Both sides are opened with
+      // buy_to_open and closed with sell_to_close — 'put' means buying puts,
+      // never selling calls. Mirrors resolve_direction() in the engine.
+      direction: ['call', [Validators.required]],
       timeframe: ['1h', [Validators.required]],
       max_positions: [5, [Validators.required, Validators.min(1)]],
       stop_loss_percentage: [2, [Validators.min(0.1), Validators.max(20)]],
@@ -106,6 +110,18 @@ export class StrategyFormComponent implements OnInit {
         this.strategyForm.patchValue({
           name: strategy.name,
           strategy_type: strategy.strategy_type,
+          // Mirror resolve_direction() in api/engine/signal_generator.py:
+          // explicit `direction` wins, else infer from the entry_signal wording,
+          // else 'call'. Defaulting flatly to 'call' here would mean opening a
+          // legacy "below" strategy and pressing Save silently pinned it to
+          // calls while its entry trigger stayed bearish — the form would have
+          // written a direction the user never chose.
+          direction: p['direction']
+            ?? (String(p['entry_signal'] ?? '').toLowerCase().includes('above')
+                  ? 'call'
+                  : String(p['entry_signal'] ?? '').toLowerCase().includes('below')
+                      ? 'put'
+                      : 'call'),
           timeframe: strategy.timeframe,
           max_positions: strategy.max_positions,
           stop_loss_percentage: strategy.stop_loss_percentage,
@@ -168,6 +184,7 @@ export class StrategyFormComponent implements OnInit {
     // existing params_json server-side, so unspecified keys (delta_min,
     // ema_period, etc.) are preserved.
     const params_json = {
+      direction: formValue.direction,
       stop_loss_percentage: formValue.stop_loss_percentage,
       take_profit_percentage: formValue.take_profit_percentage,
       max_hold_time_minutes: formValue.max_hold_time_minutes,

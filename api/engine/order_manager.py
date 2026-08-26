@@ -15,10 +15,10 @@ from sqlalchemy.orm import Session
 
 from models import User, Strategy, Trade, Position
 from engine.trading_client_manager import TradingClientManager
-from engine.signal_generator import Signal
+from engine.signal_generator import Signal, resolve_direction
 from engine.event_logger import log_event
 from notifications.discord import notify_position_opened, notify_position_closed
-from utils.symbol_helpers import is_option_symbol
+from utils.symbol_helpers import is_option_symbol, parse_occ_symbol
 
 logger = logging.getLogger(__name__)
 
@@ -647,6 +647,91 @@ class OrderManager:
                     )
                     return OrderResult(success=False, message=msg)
                 self.db.rollback()  # release the lock before the broker call
+
+                # PHASE-2 GATE: never hold both sides of the same underlying.
+                #
+                # The lockout above is per-STRATEGY. Running a call-side and a
+                # put-side strategy on SPY gives each its own lockout, so both
+                # could open at once — an unintended straddle that pays two
+                # spreads and is directionally flat. This blocks the second one.
+                #
+                # Scoped to the OPPOSITE side only. Two same-direction
+                # strategies on one symbol behaved this way before today and
+                # this change must not quietly narrow that; the new risk is the
+                # call/put pair, and that is all this closes.
+                #
+                # Entries only — an exit must never be blocked by this. We are
+                # already past the `signal_type == 'entry'` test.
+                #
+                # Deliberately NOT locked with FOR UPDATE. The race this would
+                # have to win is two flat workers evaluating on the same tick,
+                # where there is no row yet to lock — a row lock buys nothing
+                # and invites a cross-worker deadlock, since each worker already
+                # holds a lock on its own strategy's row. Closing it properly
+                # needs pg_advisory_xact_lock(user_id, symbol) or SERIALIZABLE.
+                #
+                # Be honest about the blind window: a Position row is written
+                # only after terminal fill confirmation, so this gate cannot see
+                # the other strategy's order for the WHOLE round trip (preview →
+                # place → await-fill), and _unconfirmed_orders is keyed
+                # (user_id, strategy_id) so it cannot see it either. If both
+                # sides do open, the per-strategy lockout freezes each into
+                # exit-only and the straddle is HELD until both legs exit — up
+                # to the EOD floor, paying two spreads and two lots of 0DTE
+                # theta. This gate makes that unlikely, not impossible.
+                # Derive the side from the CONTRACT WE ARE ABOUT TO BUY, not
+                # from params. `option_symbol` is what actually goes to the
+                # broker; params are only what the strategy intends. The two can
+                # disagree — the worker arms a contract once and re-validates it
+                # on expiry/delta/OI, so a direction edit mid-session leaves the
+                # old side armed until it disarms. Reading params there would
+                # have let a "call" strategy holding an armed put pass a gate
+                # checking calls, and open the second side.
+                want = resolve_direction(strategy.params_json)
+                armed = parse_occ_symbol(option_symbol or "")
+                if armed is not None:
+                    want = 'call' if armed.right == 'C' else 'put'
+                opposed = self.db.query(Position).filter(
+                    Position.user_id == user.id,
+                    Position.symbol == symbol,
+                    Position.strategy_id != strategy.id,
+                    Position.qty > 0,
+                ).all()
+                for other in opposed:
+                    parsed = parse_occ_symbol(other.option_symbol or "")
+                    if parsed is None:
+                        continue  # equity or unparseable — not a side conflict
+                    held = 'call' if parsed.right == 'C' else 'put'
+                    if held == want:
+                        continue
+                    msg = (
+                        f"Entry skipped: strategy {other.strategy_id} already holds a "
+                        f"{held} on {symbol} ({other.option_symbol}, qty={other.qty}) "
+                        f"and this strategy trades {want}s. Refusing to hold both sides."
+                    )
+                    logger.info(msg)
+                    log_event(
+                        db=self.db,
+                        user_id=user.id,
+                        event_type="ENTRY_SKIPPED_OPPOSITE_SIDE",
+                        title=f"Entry skipped: {symbol} held on the other side",
+                        detail=msg,
+                        symbol=symbol,
+                        strategy_id=strategy.id,
+                        severity="info",
+                        event_data={
+                            "want": want,
+                            "held": held,
+                            "held_by_strategy_id": other.strategy_id,
+                            "held_contract": other.option_symbol,
+                        },
+                    )
+                    return OrderResult(success=False, message=msg)
+                # Close the transaction this SELECT opened. The lockout above
+                # rolls back deliberately so the session is not idle-in-
+                # transaction across preview + place + await-fill; without this
+                # the pass-through path silently undoes that.
+                self.db.rollback()
 
             # An unconfirmed order means we may ALREADY be holding contracts the DB
             # cannot see. Buying again stacks a second position on an invisible first

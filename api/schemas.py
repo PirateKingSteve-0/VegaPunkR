@@ -178,6 +178,32 @@ def _validate_time_exit_params(params: Optional[Dict[str, Any]]) -> Optional[Dic
     return params
 
 
+def _validate_direction(params: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """Reject a `direction` the engine would silently reinterpret.
+
+    resolve_direction() falls back to 'call' on anything it does not recognise,
+    which is the right runtime behaviour — an unreadable param must not stop a
+    strategy dead. But storing 'calls' or 'bullish' and then trading calls by
+    accident is exactly the see-one-thing/run-another gap the EOD-floor
+    validator above exists to close. Absent is fine and means 'call'.
+    """
+    if not isinstance(params, dict) or 'direction' not in params:
+        return params
+
+    from engine.signal_generator import VALID_DIRECTIONS
+
+    raw = params['direction']
+    if not isinstance(raw, str) or raw.strip().lower() not in VALID_DIRECTIONS:
+        raise ValueError(
+            f"direction must be one of {sorted(VALID_DIRECTIONS)} (got {raw!r}). "
+            f"It selects which side of the option chain to buy. Both sides are "
+            f"opened with buy_to_open and closed with sell_to_close — 'put' "
+            f"means buying puts, not selling calls."
+        )
+    params['direction'] = raw.strip().lower()
+    return params
+
+
 class StrategyBase(BaseModel):
     """Base strategy schema."""
     name: str
@@ -201,7 +227,7 @@ class StrategyCreate(StrategyBase):
     @field_validator("params_json")
     @classmethod
     def _check_time_exit(cls, v):
-        return _validate_time_exit_params(v)
+        return _validate_direction(_validate_time_exit_params(v))
 
 
 class StrategyUpdate(BaseModel):
@@ -220,7 +246,7 @@ class StrategyUpdate(BaseModel):
     @field_validator("params_json")
     @classmethod
     def _check_time_exit(cls, v):
-        return _validate_time_exit_params(v)
+        return _validate_direction(_validate_time_exit_params(v))
 
 
 class StrategyResponse(StrategyBase):

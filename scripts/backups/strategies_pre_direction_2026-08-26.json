@@ -1,0 +1,48 @@
+{
+  "db": "DEV",
+  "note": "state before direction was set / put twin created",
+  "strategy_3": {
+    "user_id": 1,
+    "name": "SPY 0DTE Scalping Testing",
+    "strategy_type": "scalping_0dte",
+    "timeframe": "1m",
+    "max_positions": 1,
+    "stop_loss_percentage": 15.0,
+    "take_profit_percentage": 30.0,
+    "is_paper_trading": true,
+    "instruments": [
+      "SPY"
+    ],
+    "params_json": {
+      "use_vwap": true,
+      "delta_max": 0.85,
+      "delta_min": 0.6,
+      "ema_period": 9,
+      "option_type": "0DTE",
+      "entry_signal": "price_above_9ema_and_vwap",
+      "max_contracts": 3,
+      "stop_loss_pct": 15.0,
+      "trailing_stop": true,
+      "tick_direction": "either",
+      "tick_threshold": 800,
+      "take_profit_pct": 30.0,
+      "min_open_interest": 3000,
+      "max_bid_ask_spread": 0.2,
+      "risk_per_trade_pct": 1.5,
+      "use_tick_indicator": false,
+      "avoid_economic_news": true,
+      "check_market_regime": true,
+      "confirmation_required": true,
+      "max_hold_time_minutes": 0,
+      "max_position_size_usd": 500,
+      "min_volume_multiplier": 2.0,
+      "volume_spike_required": true,
+      "trailing_stop_distance": 10,
+      "entry_after_open_minutes": 30,
+      "trailing_stop_activation": 15,
+      "exit_before_close_minutes": 15,
+      "stop_loss_percentage": 15,
+      "take_profit_percentage": 30
+    }
+  }
+}

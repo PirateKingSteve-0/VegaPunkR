@@ -35,6 +35,47 @@ _market_hours = MarketHours()
 FORCED_EOD_EXIT_FLOOR_MINUTES = 15
 
 
+# Which side of the option chain a strategy trades. This is the ONLY place
+# direction is decided; the contract selector and the entry-signal path both
+# call this so they cannot disagree about what we are about to buy.
+VALID_DIRECTIONS = ('call', 'put')
+
+
+def resolve_direction(params: Optional[Dict]) -> str:
+    """Return 'call' or 'put' for a strategy's params_json.
+
+    Direction is a property of the CONTRACT WE SELECT, never of the order side.
+    A long put is opened with buy_to_open and closed with sell_to_close exactly
+    like a long call — bearish intent is expressed by buying a put, not by
+    selling. See the note in check_entry_signal.
+
+    Explicit `direction` wins. Absent it, infer from the `entry_signal` phrasing
+    so the shipped templates ("price_above_9ema_and_vwap") keep resolving to
+    'call' with no migration. Anything unrecognised falls back to 'call', which
+    is what every strategy did before this existed.
+    """
+    params = params or {}
+    explicit = str(params.get('direction', '') or '').strip().lower()
+    if explicit in VALID_DIRECTIONS:
+        return explicit
+    if explicit:
+        logger.warning(
+            f"Unknown direction {explicit!r} in params_json — defaulting to 'call'"
+        )
+        return 'call'
+
+    pattern = str(params.get('entry_signal', '') or '').lower()
+    # 'above' is tested FIRST, matching the order the pre-direction code used.
+    # A pattern naming both bounds therefore reads as bullish, exactly as it did
+    # before this function existed. Do not reorder these two tests: it would
+    # silently invert the side traded by any range-phrased strategy.
+    if 'above' in pattern:
+        return 'call'
+    if 'below' in pattern:
+        return 'put'
+    return 'call'
+
+
 def _parse_hhmm(value: Optional[str]) -> Optional[Tuple[int, int]]:
     """Parse "HH:MM" into (hour, minute), or return None if invalid/empty."""
     if not value or ":" not in value:
@@ -193,6 +234,21 @@ class SignalGenerator:
         params = strategy.params_json
         indicators = {}
 
+        # Which way this strategy needs price to break. Resolved ONCE here and
+        # used both for the comparisons below and for the contract the worker
+        # arms, so the trigger and the instrument can never disagree.
+        #
+        # This used to be read off the `entry_signal` wording independently of
+        # `direction`, which meant a strategy set to Puts still required price
+        # ABOVE the 9EMA/VWAP — it bought puts into upward momentum. The form
+        # exposes `direction` and not `entry_signal`, so that was the DEFAULT
+        # outcome of choosing Puts, not an edge case.
+        #
+        # `entry_signal` still selects WHICH indicators gate the entry (naming
+        # 'ema' and/or 'vwap'); only the direction of the comparison moved.
+        direction = resolve_direction(params)
+        wants_upside = direction == 'call'
+
         # 0. Entry-time gate — a lower AND an upper bound on when we may open.
         #
         # LOWER: later of market_open + entry_after_open_minutes (opening-noise
@@ -250,16 +306,15 @@ class SignalGenerator:
             if ema_value is not None:
                 indicators['ema'] = ema_value
 
-                # Check entry signal pattern
+                # `entry_signal` decides whether EMA gates the entry at all;
+                # `direction` decides which side of it we need.
                 entry_signal = params.get('entry_signal', 'price_above_9ema_and_vwap')
 
-                # Price vs EMA check
-                if 'above' in entry_signal.lower() and 'ema' in entry_signal.lower():
-                    if current_price <= ema_value:
+                if 'ema' in entry_signal.lower():
+                    if wants_upside and current_price <= ema_value:
                         logger.debug(f"{symbol}: Price ${current_price:.2f} not above EMA ${ema_value:.2f}")
                         return None
-                elif 'below' in entry_signal.lower() and 'ema' in entry_signal.lower():
-                    if current_price >= ema_value:
+                    if not wants_upside and current_price >= ema_value:
                         logger.debug(f"{symbol}: Price ${current_price:.2f} not below EMA ${ema_value:.2f}")
                         return None
 
@@ -270,15 +325,15 @@ class SignalGenerator:
             if vwap_value is not None:
                 indicators['vwap'] = vwap_value
 
+                # Default '' on purpose: with no entry_signal named, VWAP does
+                # not gate the entry even when use_vwap is on. Unchanged.
                 entry_signal = params.get('entry_signal', '')
 
-                # Price vs VWAP check
-                if 'above' in entry_signal.lower() and 'vwap' in entry_signal.lower():
-                    if current_price <= vwap_value:
+                if 'vwap' in entry_signal.lower():
+                    if wants_upside and current_price <= vwap_value:
                         logger.debug(f"{symbol}: Price ${current_price:.2f} not above VWAP ${vwap_value:.2f}")
                         return None
-                elif 'below' in entry_signal.lower() and 'vwap' in entry_signal.lower():
-                    if current_price >= vwap_value:
+                    if not wants_upside and current_price >= vwap_value:
                         logger.debug(f"{symbol}: Price ${current_price:.2f} not below VWAP ${vwap_value:.2f}")
                         return None
 
@@ -366,22 +421,30 @@ class SignalGenerator:
         # All conditions passed - generate entry signal
         confidence = self._calculate_signal_confidence(indicators, params)
 
-        # Determine action based on entry signal
-        entry_signal_pattern = params.get('entry_signal', 'price_above_9ema_and_vwap')
-        action = 'buy'  # Default to buy for long positions
-
-        # Parse entry signal for direction
-        if 'above' in entry_signal_pattern.lower():
-            action = 'buy'  # Bullish
-        elif 'below' in entry_signal_pattern.lower():
-            action = 'sell'  # Bearish
+        # An ENTRY is always a buy.
+        #
+        # This used to read `action = 'sell'` when the entry_signal named
+        # 'below', meaning to express bearishness. That was wrong at the level
+        # of the mental model: `action` becomes the Tradier side, and
+        # trading_client_manager maps 'sell' to sell_to_close. A bearish entry
+        # therefore tried to CLOSE a call we did not own, and it slipped the
+        # RBAC gate in execute_signal, which only checks side == 'buy'.
+        #
+        # Bearish intent is a PUT, bought to open. Direction picks the contract
+        # (resolve_direction, used by the worker's chain scan); the order side
+        # stays buy-to-open on entry and sell-to-close on exit for both.
+        action = 'buy'
+        indicators['direction'] = direction
 
         signal = Signal(
             signal_type='entry',
             action=action,
             symbol=symbol,
             confidence=confidence,
-            reason=f"Entry conditions met: {', '.join(indicators.keys())}",
+            reason=(
+                f"Entry conditions met ({direction}): "
+                f"{', '.join(k for k in indicators if k != 'direction')}"
+            ),
             price=current_price,
             indicators=indicators
         )

@@ -23,7 +23,8 @@ from engine.tradier_stream_manager import get_stream_manager
 from engine.event_logger import log_event
 from notifications.discord import notify_position_closed
 from utils.market_hours import is_market_open
-from utils.symbol_helpers import is_option_symbol
+from utils.symbol_helpers import is_option_symbol, parse_occ_symbol
+from engine.signal_generator import resolve_direction
 
 logger = logging.getLogger(__name__)
 
@@ -556,6 +557,60 @@ class StreamDrivenWorker:
         return pos
 
     @staticmethod
+    def _adoptable_broker_options(
+        db, strategy_id: int, underlying: str, tradier_positions, direction: str
+    ):
+        """Broker option positions on `underlying` that THIS strategy may adopt.
+
+        Both recovery paths used to take `held[0]` — any option whose symbol
+        starts with the underlying, regardless of side and regardless of which
+        strategy is actually running it. That was survivable only while one
+        strategy per underlying existed. Now that a call-side and a put-side
+        strategy on one symbol is a supported configuration, it is a live hazard,
+        so two filters are applied:
+
+        SIDE — only contracts matching this strategy's direction. Adopting the
+        other side makes a call strategy "hold" a put, which defeats the
+        opposite-side entry gate after the fact and mis-signs every exit
+        decision taken off that row.
+
+        OWNERSHIP — skip a contract another strategy already has an open
+        Position row for. Two rows against one broker holding double-count
+        unrealized P&L into the account-wide daily-loss gate, and let each
+        strategy close contracts the other owns, leaving the loser to book a
+        phantom exit at a guessed price.
+        """
+        out = []
+        for p in tradier_positions:
+            sym = str(p.get("symbol", ""))
+            if not sym.startswith(underlying) or sym == underlying:
+                continue
+            if float(p.get("quantity", 0)) <= 0:
+                continue
+            parsed = parse_occ_symbol(sym)
+            if parsed is not None:
+                side = 'call' if parsed.right == 'C' else 'put'
+                if side != direction:
+                    logger.info(
+                        f"Strategy {strategy_id}: not adopting {sym} — it is a "
+                        f"{side} and this strategy trades {direction}s"
+                    )
+                    continue
+            claimed = db.query(Position).filter(
+                Position.option_symbol == sym,
+                Position.strategy_id != strategy_id,
+                Position.qty > 0,
+            ).first()
+            if claimed is not None:
+                logger.warning(
+                    f"Strategy {strategy_id}: not adopting {sym} — strategy "
+                    f"{claimed.strategy_id} already holds it (qty={claimed.qty})"
+                )
+                continue
+            out.append(p)
+        return out
+
+    @staticmethod
     def _flatten_other_contracts(db, strategy_id: int, keep_position_id) -> int:
         """Zero every OPEN position row for this strategy except `keep_position_id`.
 
@@ -598,14 +653,13 @@ class StreamDrivenWorker:
             client = self._tradier_client_for(strategy_id, db)
             tradier_positions = await asyncio.to_thread(client.get_positions)
 
-            # Find any option contract for our underlying held in Tradier
-            # OCC symbols start with the underlying ticker
-            held = [
-                p for p in tradier_positions
-                if str(p.get("symbol", "")).startswith(underlying)
-                and str(p.get("symbol", "")) != underlying  # exclude stock itself
-                and float(p.get("quantity", 0)) > 0
-            ]
+            # Option contracts for our underlying that this strategy may adopt
+            # — filtered by side and by whether another strategy owns them.
+            strat = db.query(Strategy).filter(Strategy.id == strategy_id).first()
+            direction = resolve_direction(strat.params_json if strat else None)
+            held = self._adoptable_broker_options(
+                db, strategy_id, underlying, tradier_positions, direction
+            )
 
             if held:
                 tradier_pos = held[0]
@@ -716,12 +770,11 @@ class StreamDrivenWorker:
                 client = self._tradier_client_for(strategy_id, db)
                 tradier_positions = await asyncio.to_thread(client.get_positions)
                 underlying = state.underlying_symbol
-                held = [
-                    p for p in tradier_positions
-                    if str(p.get("symbol", "")).startswith(underlying)
-                    and str(p.get("symbol", "")) != underlying
-                    and float(p.get("quantity", 0)) > 0
-                ]
+                strat = db.query(Strategy).filter(Strategy.id == strategy_id).first()
+                direction = resolve_direction(strat.params_json if strat else None)
+                held = self._adoptable_broker_options(
+                    db, strategy_id, underlying, tradier_positions, direction
+                )
                 if held:
                     tradier_pos = held[0]
                     occ = tradier_pos["symbol"]
@@ -913,13 +966,20 @@ class StreamDrivenWorker:
     async def _select_option_contract(
         self, strategy: Strategy, underlying: str
     ) -> Optional[SelectedContract]:
-        """Select best 0DTE option contract via Tradier options chain API."""
+        """Select best 0DTE option contract via Tradier options chain API.
+
+        Which side of the chain is scanned comes from the strategy's
+        `direction` param ('call' or 'put'); see resolve_direction.
+        """
         try:
             from datetime import date
             from tradier_integration.client import get_tradier_client
 
             client = get_tradier_client()
             params = strategy.params_json
+            # Same resolver the entry-signal path uses, so the contract we arm
+            # and the signal that fires can never disagree about direction.
+            direction = resolve_direction(params)
             delta_min = params.get("delta_min", 0.40)
             delta_max = params.get("delta_max", 0.90)
             min_oi = params.get("min_open_interest", 0)
@@ -944,18 +1004,21 @@ class StreamDrivenWorker:
                 logger.warning(f"Empty option chain for {underlying} {expiry}")
                 return None
 
-            # Filter calls within delta range with sufficient liquidity
+            # Filter contracts on the chosen side within delta range, with
+            # sufficient liquidity. Delta is compared on |delta| below, so a
+            # put's negative delta lands in the same 0.40–0.90 band as a call's
+            # — the band means "how far in the money", not "which direction".
             candidates = []
             rejected_delta = 0
             rejected_oi = 0
             rejected_no_ask = 0
             rejected_spread = 0
-            calls_seen = 0
+            scanned = 0
 
             for contract in chain:
-                if contract.get("option_type", "").lower() != "call":
+                if contract.get("option_type", "").lower() != direction:
                     continue
-                calls_seen += 1
+                scanned += 1
                 sym = contract.get("symbol", "?")
                 strike = contract.get("strike", "?")
 
@@ -998,10 +1061,10 @@ class StreamDrivenWorker:
                 )
 
             if not candidates:
-                # Compute delta range across all calls for diagnostics
+                # Compute delta range across the scanned side for diagnostics
                 all_deltas = []
                 for c in chain:
-                    if c.get("option_type", "").lower() != "call":
+                    if c.get("option_type", "").lower() != direction:
                         continue
                     g = c.get("greeks") or {}
                     d = g.get("delta")
@@ -1013,7 +1076,7 @@ class StreamDrivenWorker:
                     delta_vals = [d for d, _, _ in all_deltas]
                     logger.warning(
                         f"No suitable contracts for {underlying} {expiry} — "
-                        f"{calls_seen} calls scanned: "
+                        f"{scanned} {direction}s scanned: "
                         f"{rejected_delta} wrong delta (need {delta_min}–{delta_max}), "
                         f"{rejected_no_ask} no ask, "
                         f"{rejected_spread} spread too wide (>{max_spread_pct:.0%}), "
@@ -1024,7 +1087,7 @@ class StreamDrivenWorker:
                 else:
                     logger.warning(
                         f"No suitable contracts for {underlying} {expiry} — "
-                        f"{calls_seen} calls scanned: "
+                        f"{scanned} {direction}s scanned: "
                         f"{rejected_delta} wrong delta (need {delta_min}–{delta_max}), "
                         f"{rejected_no_ask} no ask, "
                         f"{rejected_spread} spread too wide (>{max_spread_pct:.0%}), "
@@ -1035,7 +1098,7 @@ class StreamDrivenWorker:
             candidates.sort(key=lambda x: x[0], reverse=True)
             best = candidates[0][1]
             logger.info(
-                f"Selected contract for {underlying}: {best.symbol} "
+                f"Selected {direction} for {underlying}: {best.symbol} "
                 f"delta={best.delta:.3f} OI={best.open_interest}"
             )
             return best
@@ -1215,6 +1278,28 @@ class StreamDrivenWorker:
             logger.warning(f"Drift check: {sym} has expired — disarming")
             await self._disarm_contract(strategy_id, state, stream_mgr, router)
             return
+
+        # A wrong-SIDE contract passes every criterion below — expiry, |delta|
+        # and OI are all side-agnostic — so it has to be checked separately.
+        # `direction` is editable in the UI and db.refresh(strategy) picks the
+        # edit up within 30s, which would otherwise leave the old side armed:
+        # the form, the signal reason and the opposite-side gate would all say
+        # "put" while the next entry bought the call.
+        #
+        # Safe to disarm here because this method only runs when the strategy is
+        # armed and FLAT (see the `elif state.needs_drift_check()` call site);
+        # it is never reached while a position is open.
+        want = resolve_direction(strategy.params_json)
+        parsed = parse_occ_symbol(sym)
+        if parsed is not None:
+            side = 'call' if parsed.right == 'C' else 'put'
+            if side != want:
+                logger.info(
+                    f"Drift check: {sym} is a {side} but the strategy now trades "
+                    f"{want}s — disarming and reselecting"
+                )
+                await self._disarm_contract(strategy_id, state, stream_mgr, router)
+                return
 
         # Stamp up front so a failing quote endpoint retries on the interval rather
         # than on every tick.

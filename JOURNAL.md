@@ -8435,3 +8435,135 @@ A PASS on checks 1/2/3/5/7 with `trades_since_cp = 0` means only that the engine
   multi-DB refactor), and the rest of the suite needs a local Postgres on 5433 that no longer exists
   post-RDS-migration. **There is currently no runnable regression suite.** Everything this session was
   verified with targeted scripts instead.
+
+---
+
+## Session Date: August 26, 2026 — Puts: direction as a first-class strategy property
+
+**Scope: `api/engine/` (signal_generator, stream_driven_worker, order_manager), `api/schemas.py`,
+the strategy form.** The engine could only ever buy calls. This makes the side of the chain a
+strategy property and adds a gate so a call/put pair on one underlying can't hold both sides.
+
+### 1. The reframe that made this cheap
+
+The engine is options-native, not equities — every order is an OCC contract. It was calls-only in
+three places, but only one of them was a real obstacle:
+
+| Location | Was | Needed changing? |
+|---|---|---|
+| `_select_option_contract` | `if option_type != "call": continue` | **Yes** |
+| `trading_client_manager` side map | `buy_to_open` / `sell_to_close` | No |
+| `strategy_executor` | `position_side = 'long'` | No |
+
+**A long put is still bought to open and sold to close.** It is a long position; its premium rises
+when the underlying falls. So the side map and `position_side` were already correct. Even the delta
+filter needed nothing — `abs(float(delta))` already lands a put's −0.55 in the same 0.40–0.90 band.
+Engine-guard independently verified the exit path: pricing is entirely in option premium off the
+held contract, `peak_price`/`trough_price` are premium high-water marks, and there is no
+intrinsic-value or strike-vs-spot math anywhere. The long-branch trailing stop is direction-correct
+for puts as written.
+
+### 2. The latent bug this displaced
+
+`check_entry_signal` mapped a `below`-phrased `entry_signal` to `action='sell'`, meaning to express
+bearishness. `action` becomes the Tradier side, and `sell` maps to `sell_to_close` — so a bearish
+entry tried to CLOSE a call we did not own, and slipped the RBAC gate in `execute_signal`, which
+only checks `side == 'buy'`. Latent only because no shipped template contains "below".
+
+**Direction belongs to the contract, not the order side.** Entries are now unconditionally
+`action='buy'`; `resolve_direction()` decides which side of the chain to arm.
+
+### 3. Engine-guard found the design half-done — C1 was the important one
+
+The first cut passed its own tests and was still wrong in the way that mattered. `direction` chose
+the *contract* while `entry_signal` still drove the *comparison operators*, and the form exposes
+`direction` but not `entry_signal`. So selecting "Puts" in the UI produced a strategy that bought
+puts when price broke **above** the 9EMA/VWAP — long puts into upward momentum, held to SL or the
+EOD floor. That was the default outcome of using the feature, not an edge case.
+
+`resolve_direction()` now drives the comparisons too. `entry_signal` still selects *which*
+indicators gate the entry (naming 'ema' / 'vwap'); only the direction of the comparison moved.
+
+Also fixed from that review:
+- **C2** — the opposite-side gate read `params['direction']` instead of the `option_symbol` it was
+  about to submit. Those disagree whenever the armed contract is stale, which would let a "call"
+  strategy holding an armed put pass a gate checking calls and open the second side.
+- **C3** — `_check_contract_drift` validated expiry, |delta| and OI, all side-agnostic. A direction
+  edit mid-session left the old side armed while the form, the log line and the gate all reported
+  the new one.
+- **C4** — both recovery paths adopted `held[0]` from any broker position `startswith(underlying)`,
+  with no filter on side or on which strategy owns it. Pre-existing, but a call/put pair turns it
+  from latent into likely: a call strategy adopting a put strategy's position double-counts
+  unrealized P&L into the account daily-loss gate and lets each close contracts the other owns.
+
+### 4. What the gate actually buys — stated honestly
+
+The Phase-2 gate blocks an entry when another strategy holds the opposite side of the same
+underlying. It is **best-effort, not airtight**, and the first version of this comment oversold it:
+
+- A `Position` row is written only after terminal fill confirmation, so the gate is blind for the
+  whole round trip (preview → place → await-fill), and `_unconfirmed_orders` is keyed
+  `(user_id, strategy_id)` so it can't see the other strategy's in-flight order either.
+- If both sides do open, the per-strategy lockout freezes each into exit-only and the straddle is
+  **held until both legs exit** — up to the EOD floor, paying two spreads and two lots of 0DTE
+  theta. Not "one tick", which is what the original comment claimed.
+
+Closing it deterministically needs `pg_advisory_xact_lock(user_id, symbol)` or SERIALIZABLE. A row
+lock would buy nothing (there is no row yet to lock) and would add cross-worker deadlock risk.
+
+Scoped to the **opposite** side only: two same-direction strategies on one symbol behaved this way
+before today, and narrowing that was not asked for.
+
+### 5. One strategy is still one direction
+
+Deliberate. The worker arms a contract *before* any signal fires and streams it alongside the
+underlying; `ContractState` holds exactly one `option_symbol`. A bidirectional single strategy would
+need both a call and a put armed and quoting, then a pick at fire time — a real change to the state
+machine. Two single-direction strategies plus the opposite-side gate gets the same outcome today.
+
+What is still missing is the arbiter: when both sides signal, it is first-come-first-served, and the
+loser is locked out until the winner closes.
+
+### 6. Verified against the live chain
+
+Not by inspection. Ran `_select_option_contract` for both DEV strategies against Tradier:
+
+```
+id=3 wants CALL -> SPY260826C00763000  CALL  delta=0.725 OI=991
+id=4 wants PUT  -> SPY260826P00769000  PUT   delta=0.719 OI=1237
+```
+
+Symmetric, correct side each time, and the rejection logs now read "179 puts scanned" rather than
+"179 calls scanned" for the put strategy.
+
+> **Finding worth acting on separately:** with the *stored* params both sides select **nothing**.
+> `delta_min 0.6 / delta_max 0.85` rejected 175 of 179 contracts, and all 4 survivors failed
+> `min_open_interest: 3000` (actual OI 991 and 1237). The deep-ITM delta band naturally selects
+> strikes with far lower OI than ATM, so that pair of constraints may be mutually unsatisfiable much
+> of the time. **This affects the existing call strategy identically — it is not new.** The live
+> chain numbers above were only obtained by relaxing `min_open_interest` in memory.
+
+### 7. DEV database changes (PROD untouched)
+
+- `id=3` SPY 0DTE Scalping Testing — `direction: "call"` written explicitly. Behaviourally a no-op;
+  it already resolved to `call` by inference.
+- `id=4` SPY 0DTE Scalping Testing (PUTS) — created, `is_active=false`, paper. Same params as id=3
+  with `direction: "put"` and `entry_signal: "price_below_9ema_and_vwap"`.
+- Pre-change state saved to `scripts/backups/strategies_pre_direction_2026-08-26.json`.
+
+PROD `id=3` (live broker, `is_active=false`) was deliberately not touched.
+
+### 8. Tests
+
+`api/tests/test_direction_and_side_gate.py` — 22 assertions, in-memory SQLite, no network.
+Two things the first version got wrong, both worth remembering:
+
+- Every signal assertion returned `None` until the ET clock was frozen mid-session. The entry-time
+  gate runs before anything else and silently rejects everything outside market hours.
+- The C3 assertion passed **for the wrong reason**: the test contract was past-dated, so the drift
+  check disarmed on expiry before ever reaching the side check. Contracts in this file are now
+  far-future on purpose.
+
+The earlier "exit is never blocked" case was vacuous — real exits go through `close_position`, which
+never reaches the gate. It now exercises `close_position` directly with an opposite-side position
+held by another strategy.

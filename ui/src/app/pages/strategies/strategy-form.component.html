@@ -37,6 +37,20 @@
             </mat-form-field>
 
             <mat-form-field appearance="outline">
+              <mat-label>Direction</mat-label>
+              <mat-select formControlName="direction">
+                <mat-option value="call">Calls (bullish)</mat-option>
+                <mat-option value="put">Puts (bearish)</mat-option>
+              </mat-select>
+              <mat-hint>
+                Which side of the chain to buy. Both are bought to open and sold
+                to close — Puts means buying puts, not selling calls.
+              </mat-hint>
+            </mat-form-field>
+          </div>
+
+          <div class="form-row">
+            <mat-form-field appearance="outline">
               <mat-label>Timeframe</mat-label>
               <mat-select formControlName="timeframe">
                 <mat-option value="1m">1 Minute</mat-option>
