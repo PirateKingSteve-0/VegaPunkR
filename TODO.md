@@ -209,20 +209,21 @@ I would like to add a button/feature that allows us to pause trading for the day
 
 ## H. Recovery-path hardening (from the 2026-08-26 put-support guard passes)
 
-### H1. `held[0]` + `_flatten_other_contracts` orphans a second contract *(pre-existing, unfixed)*
+### H1. ~~`held[0]` + `_flatten_other_contracts` orphans a second contract~~ *(fixed 2026-08-26)*
 
-Both recovery paths (`_startup_sync`, `_reconcile_position`) adopt only `held[0]` and discard
-`held[1:]`. `_flatten_other_contracts` then zeroes every other open row for the strategy, logging
-"broker does not hold it" without verifying that against the broker — false whenever `len(held) > 1`.
+`_flatten_other_contracts` now takes `broker_holds` and zeroes only rows the broker does **not**
+report, and both recovery paths pass the adoptable set in. `_startup_sync` additionally sorts `held`
+so a contract this strategy already has an open row for is adopted ahead of one it does not — the
+choice no longer depends on Tradier's response ordering.
 
-Reachable by hand-buying a second strike in the Tradier portal, or by any path that leaves two
-contracts open. The discarded contract's row is zeroed with **no `Trade` booked and no
-`POSITION_MANUALLY_CLOSED` event**, so it becomes invisible: no stop loss, no take profit, no forced
-EOD exit, and its P&L is deleted rather than realised.
+Was deferred as out-of-scope on 2026-08-26, then fixed the same day because the F3 change (adoption
+no longer defers to a *dead* strategy's claim) moved the trigger from "hand-buy a second strike in
+the portal" to "any strategy auto-stops while holding", which the 20-consecutive-error auto-stop
+makes routine.
 
-**Fix shape:** pass the full adoptable set into `_flatten_other_contracts` and zero only rows whose
-contract the broker does *not* hold. Deliberately not done on 2026-08-26 — it changes behaviour
-outside the scope of that task and wants a deliberate decision.
+**Residual:** a strategy can now legitimately hold two open rows when the broker holds two
+contracts. `open_pos` still picks one, so the second is visible and exitable via reconcile but is
+not actively managed for SL/TP. Single-contract operation (`max_positions: 1`) is unaffected.
 
 ### H2. Adoption serialisation is in-process only
 

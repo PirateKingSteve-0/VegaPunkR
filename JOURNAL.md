@@ -8673,3 +8673,45 @@ Pre-existing and untouched by this work, but it sits on the code path rewritten 
 last remaining route to a live position with no exit management. **Left alone deliberately:** the
 fix (only flatten rows the broker does not hold) changes behaviour that was not part of this task.
 See TODO.
+
+### 12. Fourth guard pass — and why H1 stopped being deferrable
+
+Pass 4 confirmed all six F-fixes correct, including the two structural risks worth checking
+mechanically rather than by eye: the `_startup_sync` re-indentation (AST-verified that
+`if held:` → `elif declined:` → `else:` still bind correctly, so N2 is not reintroduced) and the
+absence of any lock-order inversion between `_adoption_lock` and the row-level `with_for_update()`
+locks — no task is ever suspended at an `await` while holding a Postgres row lock.
+
+It then found **G1**, which is the second time this work has been bitten by the same mechanism:
+**a change that looks local to one filter alters what a downstream consumer sees.**
+
+The F3 fix (adoption no longer defers to a *dead* strategy's claim) means `held` can now contain two
+contracts. Both callers take `held[0]` and discard the rest, and `_flatten_other_contracts` then
+zeroed every other open row while logging "broker does not hold it" — a claim it never checked.
+So with a dead claimant present, `held[0]` was decided by Tradier's response ordering, and the wrong
+draw silently zeroed a **live** contract's row: no `Trade`, no event, no SL, no TP, no EOD exit.
+
+This was TODO H1, deliberately deferred earlier the same day as pre-existing and out of scope. F3
+moved its trigger from "hand-buy a second strike in the portal" to "any strategy auto-stops while
+holding" — and `strategy_executor.py:227` auto-stops after 20 consecutive errors. Deferring it was
+defensible when it was rare; it stopped being defensible once this work made it routine. Fixed:
+
+- `_flatten_other_contracts` takes `broker_holds` and zeroes only rows the broker does not report.
+  Both recovery paths pass it. Rows the broker holds are logged and left alone.
+- `_startup_sync` sorts `held` so a contract this strategy already has an open row for is adopted
+  first, removing the dependence on response ordering.
+- **G2** — adopting a contract from a dead claimant now zeroes that claimant's row in the same
+  transaction. Two rows against one broker holding double-counted into `risk_manager`'s user-wide
+  unrealized sum, firing the account daily-loss halt at roughly half the intended drawdown.
+
+Also from that pass: **L1** the expiry check now uses the ET market day rather than the process's
+local date (the repo rule; it was previously deployment-dependent), **L2** `_reconcile_position`
+takes the same `_adoption_lock` as `_startup_sync` so the two paths stay symmetric, and **L3** the
+unparseable-contract block emits an event like every other gate instead of only a log line.
+
+> **The pattern across four passes.** Every defect I introduced came from adding a filter without
+> asking what consumed its output. C4 filtered adoption without asking that adoption exists to
+> enable exits. N3 used `is_active` without asking when that flag gets set. F3 changed `held`'s
+> contents without asking what `held[0]` and `_flatten_other_contracts` do with them. The engine
+> rule "reason about side effects before code" is specifically about the *consumer*, not the
+> function being edited.

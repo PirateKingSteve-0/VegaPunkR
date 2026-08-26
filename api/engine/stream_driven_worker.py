@@ -629,19 +629,40 @@ class StreamDrivenWorker:
         return adoptable, declined
 
     @staticmethod
-    def _flatten_other_contracts(db, strategy_id: int, keep_position_id) -> int:
-        """Zero every OPEN position row for this strategy except `keep_position_id`.
+    def _flatten_other_contracts(
+        db, strategy_id: int, keep_position_id, broker_holds=None
+    ) -> int:
+        """Zero this strategy's OPEN rows that the broker does not hold.
 
         The broker is the authority on what we hold. With per-contract rows, a
         stale open row for a contract the broker no longer shows would give the
         worker's `open_pos` lookup two candidates and it would manage the wrong
         one. Returns how many rows were zeroed.
+
+        `broker_holds` is the set of OCC symbols the broker actually reports.
+        It is what stops this from zeroing a LIVE position: the callers adopt
+        only `held[0]` and this used to zero every other row unconditionally,
+        while logging "broker does not hold it" — a claim it never checked. A
+        second contract really open at the broker was therefore zeroed with no
+        Trade booked and no event logged, making it invisible to the engine: no
+        stop loss, no take profit, no forced EOD exit, and its P&L deleted
+        rather than realised. Passing None preserves the old behaviour and
+        should only be done where the broker's holdings are genuinely unknown.
         """
         stale = db.query(Position).filter(
             Position.strategy_id == strategy_id,
             Position.qty > 0,
             Position.id != (keep_position_id or -1),
         ).all()
+        if broker_holds is not None:
+            keep = {str(x).upper() for x in broker_holds}
+            skipped = [r for r in stale if (r.option_symbol or "").upper() in keep]
+            for row in skipped:
+                logger.warning(
+                    f"Strategy {strategy_id}: NOT zeroing row {row.id} "
+                    f"({row.option_symbol}) — the broker still holds it"
+                )
+            stale = [r for r in stale if (r.option_symbol or "").upper() not in keep]
         for row in stale:
             logger.warning(
                 f"Strategy {strategy_id}: zeroing stale open row id={row.id} "
@@ -684,6 +705,19 @@ class StreamDrivenWorker:
                 )
 
                 if held:
+                    # Prefer a contract this strategy already has an open row
+                    # for. Otherwise held[0] is whatever order Tradier happened
+                    # to return, and adopting someone else's contract while our
+                    # own live one sits further down the list is how a real
+                    # position loses its exit management.
+                    ours = {
+                        (r.option_symbol or "").upper()
+                        for r in db.query(Position).filter(
+                            Position.strategy_id == strategy_id,
+                            Position.qty > 0,
+                        ).all()
+                    }
+                    held.sort(key=lambda p: str(p.get("symbol", "")).upper() not in ours)
                     tradier_pos = held[0]
                     occ_symbol = tradier_pos["symbol"]
                     qty = int(float(tradier_pos.get("quantity", 1)))
@@ -709,8 +743,29 @@ class StreamDrivenWorker:
                         if not db_pos.current_price:
                             db_pos.current_price = entry_price
 
-                    # The broker holds exactly this contract, so nothing else is open.
-                    self._flatten_other_contracts(db, strategy_id, db_pos.id)
+                    # Any OTHER strategy's open row for this same contract can
+                    # only be a dead claimant's — a live one would have been
+                    # declined above. Two rows against one broker holding
+                    # double-count unrealized P&L into the account-wide
+                    # daily-loss halt, so clear it in the same transaction.
+                    for dupe in db.query(Position).filter(
+                        Position.user_id == strat.user_id,
+                        Position.option_symbol == occ_symbol,
+                        Position.strategy_id != strategy_id,
+                        Position.qty > 0,
+                    ).all():
+                        logger.warning(
+                            f"Strategy {strategy_id}: adopting {occ_symbol} from "
+                            f"inactive strategy {dupe.strategy_id} — clearing its row"
+                        )
+                        dupe.qty = 0
+                        dupe.unrealized_pnl = 0.0
+
+                    # Zero only rows the broker does NOT hold.
+                    self._flatten_other_contracts(
+                        db, strategy_id, db_pos.id,
+                        broker_holds={str(h.get("symbol", "")) for h in held},
+                    )
 
                     db.commit()
                     state.option_symbol = occ_symbol
@@ -808,9 +863,15 @@ class StreamDrivenWorker:
                         f"Strategy {strategy_id}: row vanished — skipping adoption"
                     )
                     return
-                held, _declined = self._adoptable_broker_options(
-                    db, strat.user_id, strategy_id, underlying, tradier_positions
-                )
+                # Same lock as _startup_sync. Neither critical section contains
+                # an await today, so in one event loop both are already atomic
+                # and this buys nothing — it is here so the two paths stay
+                # symmetric. The day an await appears inside either block, an
+                # asymmetric guard would protect only one of them.
+                async with _adoption_lock(strat.user_id, underlying):
+                    held, _declined = self._adoptable_broker_options(
+                        db, strat.user_id, strategy_id, underlying, tradier_positions
+                    )
                 if held:
                     tradier_pos = held[0]
                     occ = tradier_pos["symbol"]
@@ -835,7 +896,12 @@ class StreamDrivenWorker:
                         if not adopted.current_price:
                             adopted.current_price = entry_price
                     adopted.opened_at = datetime.utcnow()
-                    self._flatten_other_contracts(db, strategy_id, adopted.id)
+                    # Zero only rows the broker does NOT hold — see the note on
+                    # _flatten_other_contracts.
+                    self._flatten_other_contracts(
+                        db, strategy_id, adopted.id,
+                        broker_holds={str(h.get("symbol", "")) for h in held},
+                    )
                     db.commit()
                     state.option_symbol = occ
                     logger.warning(

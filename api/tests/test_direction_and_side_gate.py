@@ -318,5 +318,81 @@ check("bullish price passes", entry_signal_for('call', 900.0, 'ema_crossover') i
 check("bearish price ALSO passes (no bound, as before)",
       entry_signal_for('call', 600.0, 'ema_crossover') is not None, True)
 
+print("\nG1/G2: a live contract must never be zeroed by adoption")
+
+
+class _FakeClient:
+    def __init__(self, positions): self._p = positions
+    def get_positions(self): return self._p
+
+
+class _State:
+    option_symbol = None
+    underlying_symbol = "SPY"
+
+
+def run_startup_sync(broker_positions, rows, strategies):
+    """rows: list of (strategy_key, occ, qty). strategies: {key: is_active}."""
+    db, u = fresh()
+    objs = {}
+    for key, active in strategies.items():
+        st = Strategy(user_id=u.id, name=key, strategy_type="momentum",
+                      params_json={}, max_positions=1, is_active=active,
+                      instruments=["SPY"])
+        db.add(st); objs[key] = st
+    db.flush()
+    for key, occ, qty in rows:
+        db.add(Position(user_id=u.id, strategy_id=objs[key].id, symbol="SPY",
+                        option_symbol=occ, qty=qty, avg_entry_price=2.0,
+                        current_price=2.0, unrealized_pnl=0.0))
+    db.commit()
+    w = StreamDrivenWorker.__new__(StreamDrivenWorker)
+    w._tradier_client_for = lambda sid, d: _FakeClient(broker_positions)
+    asyncio.run(StreamDrivenWorker._startup_sync(
+        w, objs["mine"].id, "SPY", _State(), db))
+    out = {}
+    for key, st in objs.items():
+        out[key] = sorted(
+            (r.option_symbol, r.qty)
+            for r in db.query(Position).filter(Position.strategy_id == st.id).all())
+    return out
+
+
+# G1: our own live CALL must survive, even though Tradier lists the PUT first
+# and a dead strategy's claim now makes that PUT adoptable.
+res = run_startup_sync(
+    broker_positions=[{"symbol": PUT, "quantity": 1, "cost_basis": 200.0},
+                      {"symbol": CALL, "quantity": 1, "cost_basis": 200.0}],
+    rows=[("mine", CALL, 1), ("dead", PUT, 1)],
+    strategies={"mine": True, "dead": False})
+check("our live CALL row is NOT zeroed by broker response ordering",
+      (CALL, 1) in res["mine"], True)
+
+# G1b: a second contract the broker really holds is not silently zeroed.
+res = run_startup_sync(
+    broker_positions=[{"symbol": CALL, "quantity": 1, "cost_basis": 200.0},
+                      {"symbol": PUT, "quantity": 1, "cost_basis": 200.0}],
+    rows=[("mine", CALL, 1), ("mine", PUT, 1)],
+    strategies={"mine": True})
+check("both broker-held rows stay open (no silent orphan)",
+      sorted(res["mine"]), sorted([(CALL, 1), (PUT, 1)]))
+
+# G1c: a row the broker does NOT hold is still zeroed — the original purpose.
+res = run_startup_sync(
+    broker_positions=[{"symbol": CALL, "quantity": 1, "cost_basis": 200.0}],
+    rows=[("mine", CALL, 1), ("mine", PUT, 1)],
+    strategies={"mine": True})
+check("a row the broker does not hold is still cleared", (PUT, 0) in res["mine"], True)
+
+# G2: adopting from a dead claimant must clear that claimant's row, or the
+# account-wide daily-loss gate counts one broker holding twice.
+res = run_startup_sync(
+    broker_positions=[{"symbol": PUT, "quantity": 1, "cost_basis": 200.0}],
+    rows=[("dead", PUT, 1)],
+    strategies={"mine": True, "dead": False})
+check("we adopt the dead strategy's contract", (PUT, 1) in res["mine"], True)
+check("...and its stale row is cleared, so P&L is not double-counted",
+      res["dead"], [(PUT, 0)])
+
 print("\n" + ("ALL PASSED" if not fails else f"{len(fails)} FAILURE(S):\n  " + "\n  ".join(fails)))
 sys.exit(1 if fails else 0)

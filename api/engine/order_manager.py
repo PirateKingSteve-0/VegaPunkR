@@ -16,6 +16,7 @@ from sqlalchemy.orm import Session
 from models import User, Strategy, Trade, Position
 from engine.trading_client_manager import TradingClientManager
 from engine.signal_generator import Signal, resolve_direction
+from engine.signal_generator import _market_hours
 from engine.event_logger import log_event
 from notifications.discord import notify_position_opened, notify_position_closed
 from utils.symbol_helpers import is_option_symbol, parse_occ_symbol
@@ -703,6 +704,17 @@ class OrderManager:
                         "the opposite-side check cannot be evaluated."
                     )
                     logger.warning(msg)
+                    log_event(
+                        db=self.db,
+                        user_id=user.id,
+                        event_type="ENTRY_BLOCKED_BAD_CONTRACT",
+                        title=f"Entry blocked: unparseable contract on {symbol}",
+                        detail=msg,
+                        symbol=symbol,
+                        strategy_id=strategy.id,
+                        severity="error",
+                        event_data={"option_symbol": option_symbol},
+                    )
                     self.db.rollback()
                     return OrderResult(success=False, message=msg)
                 want = ('call' if armed.right == 'C' else 'put') if armed else None
@@ -728,7 +740,11 @@ class OrderManager:
                     # the second side against a real, unmanaged first leg, which
                     # is the exact outcome this gate exists to prevent. is_active
                     # correlates with MORE danger here, not less.
-                    if parsed.expiry < date.today():
+                    # ET market day, not the process's local date. Expiry is a
+                    # market-calendar fact, and keying it on the deployment's
+                    # timezone means the gate behaves differently depending on
+                    # where it runs.
+                    if parsed.expiry < _market_hours.get_current_et_time().date():
                         logger.info(
                             f"Ignoring expired {symbol} row from strategy "
                             f"{other.strategy_id} ({other.option_symbol})"
