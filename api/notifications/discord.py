@@ -27,9 +27,30 @@ logger = logging.getLogger(__name__)
 
 WEBHOOK_TIMEOUT_S = 5.0
 
-_COLOR_GREEN = 0x2ECC71
-_COLOR_RED = 0xE74C3C
-_COLOR_BLUE = 0x3498DB
+# Semantic tones. Colour and title marker are looked up together from one
+# place, so a message can never carry a green bar and a red dot: pick the tone
+# that describes the outcome and the styling follows.
+#
+# The palette deliberately mirrors the UI's P&L language (green = profit, red =
+# loss). That is why an *open* is blue, not green — it has no outcome yet, and
+# colouring it green reads as "this made money".
+SUCCESS = "success"
+LOSS = "loss"
+FLAT = "flat"
+INFO = "info"
+WARNING = "warning"
+
+_TONES: Dict[str, Tuple[int, str]] = {
+    SUCCESS: (0x2ECC71, "🟢"),
+    LOSS:    (0xE74C3C, "🔴"),
+    FLAT:    (0x95A5A6, "⚪"),
+    INFO:    (0x3498DB, "🔵"),
+    WARNING: (0xF1C40F, "🟡"),
+}
+
+# Below this, a close is a scratch rather than a win. Sub-cent P&L shown green
+# is a win the account never actually banked.
+_FLAT_EPSILON = 0.005
 
 _VALID_HOSTS = (
     "https://discord.com/api/webhooks/",
@@ -86,21 +107,44 @@ def _table(rows: list) -> str:
     return f"```\n{body}\n```"
 
 
-def _embed(title: str, color: int, rows: list, strategy_name: Optional[str]) -> Dict[str, Any]:
+def _embed(
+    title: str,
+    tone: str,
+    rows: Optional[list] = None,
+    strategy_name: Optional[str] = None,
+    text: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Build the one embed shape every VegaPunkR message uses.
+
+    Every send goes through here, so styling cannot drift between message
+    types: the marker and the colour bar both come from `tone`, and the body is
+    the aligned monospace table unless a message has no rows to tabulate.
+    """
+    color, marker = _TONES.get(tone, _TONES[INFO])
     embed: Dict[str, Any] = {
-        "title": title,
+        "title": f"{marker}  {title}",
         "color": color,
-        "description": _table(rows),
     }
+    if rows:
+        embed["description"] = _table(rows)
+    elif text:
+        embed["description"] = text
     if strategy_name:
         embed["footer"] = {"text": strategy_name}
     return embed
 
 
-def _post_async(webhook_url: str, payload: Dict[str, Any]) -> None:
+def _post_async(webhook_url: str, embed: Dict[str, Any]) -> None:
+    """Fire one styled embed, off-thread.
+
+    Takes an embed rather than a raw payload on purpose — there is no way to
+    post an unstyled message through this module without going via `_embed`.
+    """
     def _send() -> None:
         try:
-            requests.post(webhook_url, json=payload, timeout=WEBHOOK_TIMEOUT_S)
+            requests.post(
+                webhook_url, json={"embeds": [embed]}, timeout=WEBHOOK_TIMEOUT_S
+            )
         except Exception as e:
             logger.warning(f"discord_notifier: webhook post failed: {e}")
 
@@ -128,18 +172,21 @@ def notify_position_opened(
 
     rows = [
         ("Qty", f"{qty} {unit}{'s' if qty != 1 else ''}"),
-        ("Premium", f"${price:.2f}"),
+        # "Premium" is an options term; an equity fill has a share price.
+        ("Premium" if multiplier == 100 else "Price", f"${price:.2f}"),
         ("-", ""),
         # The number that actually left the account.
         ("Cost", _money(cost)),
     ]
 
+    # INFO, not SUCCESS: an entry has no P&L outcome yet. Green here read as
+    # "this trade made money" next to a close embed that means exactly that.
     _post_async(
         webhook,
-        {"embeds": [_embed(
-            f"🟢  Opened · {format_contract(option_symbol, symbol)}",
-            _COLOR_GREEN, rows, strategy_name,
-        )]},
+        _embed(
+            f"Opened · {format_contract(option_symbol, symbol)}",
+            INFO, rows, strategy_name,
+        ),
     )
 
 
@@ -174,9 +221,12 @@ def notify_position_closed(
     if not is_valid_discord_webhook(webhook):
         return
 
-    is_win = pnl >= 0
-    color = _COLOR_GREEN if is_win else _COLOR_RED
-    emoji = "🟢" if is_win else "🔴"
+    if abs(pnl) < _FLAT_EPSILON:
+        tone = FLAT
+    elif pnl > 0:
+        tone = SUCCESS
+    else:
+        tone = LOSS
 
     multiplier = _contract_multiplier(option_symbol, symbol)
     proceeds = price * qty * multiplier
@@ -206,10 +256,10 @@ def notify_position_closed(
 
     _post_async(
         webhook,
-        {"embeds": [_embed(
-            f"{emoji}  Closed · {format_contract(option_symbol, symbol)}",
-            color, rows, strategy_name,
-        )]},
+        _embed(
+            f"Closed · {format_contract(option_symbol, symbol)}",
+            tone, rows, strategy_name,
+        ),
     )
 
 
@@ -217,18 +267,26 @@ def send_test_message(webhook_url: str) -> Tuple[bool, str]:
     """Synchronous send used by the 'send test' button. Returns (ok, message)."""
     if not is_valid_discord_webhook(webhook_url):
         return False, "Webhook URL must be a Discord webhook URL."
+    # Goes through _embed like every other message, so what the button previews
+    # is genuinely what a trade alert will look like — same table, same footer,
+    # same colour bar. It used to be a bare title+description, which made the
+    # test message the one Discord message that did not match the styling.
+    embed = _embed(
+        "VegaPunkR test message",
+        INFO,
+        rows=[
+            ("Status", "Webhook reachable"),
+            ("-", ""),
+            ("Opens", "🔵  blue — no outcome yet"),
+            ("Wins", "🟢  green"),
+            ("Losses", "🔴  red"),
+        ],
+        strategy_name="Test notification",
+    )
     try:
         r = requests.post(
             webhook_url,
-            json={
-                "embeds": [
-                    {
-                        "title": "✅ VegaPunkR test message",
-                        "description": "Discord notifications are wired up correctly.",
-                        "color": _COLOR_BLUE,
-                    }
-                ]
-            },
+            json={"embeds": [embed]},
             timeout=WEBHOOK_TIMEOUT_S,
         )
         if r.status_code in (200, 204):

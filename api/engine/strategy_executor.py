@@ -627,7 +627,11 @@ class StrategyExecutor:
         return self.execution_states[strategy_id]
 
     async def _fetch_option_price(self, option_symbol: str) -> float:
-        """Fetch option mid price from Tradier REST when stream quote is unavailable."""
+        """Current option price from Tradier REST when the stream quote is unusable.
+
+        Returns the mid of a two-sided quote, the bid of a one-sided one, or
+        0.0 when there is no bid at all. NEVER returns `last` — see below.
+        """
         try:
             import asyncio as _asyncio
             from tradier_integration.client import get_tradier_client
@@ -652,9 +656,33 @@ class StrategyExecutor:
                     quotes = quotes[0] if quotes else {}
                 bid = float(quotes.get("bid") or 0)
                 ask = float(quotes.get("ask") or 0)
-                if ask > 0:
+                if bid > 0 and ask > 0:
                     return (bid + ask) / 2
-                return float(quotes.get("last") or 0)
+                if bid > 0:
+                    # One-sided book. The bid IS the exit price for a long we
+                    # are selling, so this is usable — not a degraded guess.
+                    return bid
+                # NO fallback to `last`.
+                #
+                # `last` is the price of the most recent TRADE, not the market.
+                # ITM 0DTE strikes trade sporadically, so it can be minutes or
+                # hours stale, and this value is fed straight into
+                # check_exit_signal's pnl_pct against a fresh entry price. On
+                # 2026-08-26 that fired 13 of 16 exits on a fiction: stop losses
+                # claiming -24% that realised -0.4%, and take profits claiming
+                # +30% that realised -1.9%, all on SPY260826C00765000 with real
+                # spreads under 1%. Trade 2929 back-solves to an exit price of
+                # 2.01 — exactly where the contract had traded ten minutes
+                # earlier. Median hold was 2.1 seconds, because a stale print
+                # from a different price regime clears a ±15-30% threshold on
+                # the very first tick after entry.
+                #
+                # Returning 0 makes the caller skip the tick (it already handles
+                # that), which defers the exit decision to a tick with a real
+                # quote. The forced-EOD path is explicitly exempt: it sends a
+                # MARKET order and needs no quote, so a 0DTE can still never be
+                # carried overnight for want of a price.
+                return 0.0
 
             price = await _asyncio.to_thread(_get_quote)
             if price > 0:

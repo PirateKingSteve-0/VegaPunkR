@@ -8834,3 +8834,84 @@ the right trade — but the gap is real.
 **Final state of `72a52a6..HEAD`:** safe on DEV/paper with the call/put pair. 44 assertions across
 four engine test files. Nothing in the range blocks a supervised live session; the two things to
 settle first are both pre-existing and both now visible in `scripts/morning_check.py` or TODO H2.
+
+---
+
+## Session Date: August 26, 2026 (Part 2) — Exits were firing on stale `last` prints
+
+**Scope: one function, `strategy_executor._fetch_option_price`.** Found while asking a simple
+question — "how did we do today?" — about a live paper session.
+
+### 1. The symptom
+
+16 round-trips on `SPY260826C00765000`, 2 winners, −$168, median hold **2.1 seconds**. The exit
+reasons did not match the fills:
+
+```
+2909  entry 2.49 -> exit 2.48   realised  −0.4%   claimed −24.19%  "Stop loss hit"
+2929  entry 1.54 -> exit 1.51   realised  −1.9%   claimed +30.46%  "Take profit hit"
+2921  entry 1.99 -> exit 2.00   realised  +0.5%   claimed −24.00%  "Stop loss hit"
+```
+
+A take-profit that lost money and a stop-loss that made money. **13 of 16 exits** fired on a price
+15–30% away from the fill, in both directions, with real spreads under 1% all day.
+
+### 2. The cause
+
+`check_exit_signal` computes `pnl_pct = (current_price - entry_price) / entry_price`.
+`entry_price` was correct throughout; `current_price` was not.
+
+`_check_exit_signals` prefers the streamed bid, then mid, then falls back to REST. The REST helper
+ended:
+
+```python
+if ask > 0:
+    return (bid + ask) / 2
+return float(quotes.get("last") or 0)     # <-- the bug
+```
+
+**`last` is the most recent TRADE, not the market.** ITM 0DTE strikes trade sporadically, so a
+one-sided book — routine — returned a print that could be minutes or hours old, and that value went
+straight into the threshold comparison against a fresh entry.
+
+That explains every part of the symptom at once: errors in **both** directions (stale high fires TP,
+stale low fires SL), magnitudes of 15–30% (what 0DTE premium moves in ten minutes), and 2-second
+holds (the stale value is available on the very first tick after entry, so no real move is needed).
+
+Trade 2929 reconstructs exactly: entry 1.54 with a stale `last` of 2.01 gives **+30.52%** against a
+logged **+30.46%**. The contract had genuinely traded at 1.99–2.10 ten minutes earlier
+(trades 2919, 2921).
+
+### 3. The fix
+
+Two-sided quote → mid. One-sided with a bid → the **bid** (that is the exit price for a long we are
+selling, not a degraded guess). No bid → **0.0**, never `last`.
+
+The caller already handles 0 by skipping the tick, deferring the decision to a tick with a real
+quote. The forced-EOD path is explicitly exempt — it sends a MARKET order and needs no quote — so a
+0DTE still can never be carried overnight for want of a price.
+
+### 4. Why the existing guards missed it
+
+- `_price_is_plausible_premium` (`stream_driven_worker.py:1288`) is **not applied** to this path, and
+  would not have caught it anyway: it rejects order-of-magnitude contamination (the underlying
+  leaking through, the $223k Saturday close). A stale premium is still plausible in magnitude.
+- The `quote_is_for_this_position` guard above it targets the **2026-07-14** failure — held 749C,
+  priced off 747C, "Take profit hit: 89.67%" then sold for −1.6%. That guard works. Today is the
+  same symptom from a different cause: the right contract at the **wrong time** rather than the
+  wrong contract.
+
+> Third variation on one theme now: **an exit decision priced off something that is not the current
+> market.** First the underlying's price (Aug 1, $223k phantom). Then another contract's quote
+> (Jul 14). Now the same contract's stale print. Every exit-pricing path needs to answer "is this
+> the price I can sell into *right now*", and neither "is it an option premium" nor "is it the right
+> contract" is sufficient on its own.
+
+### 5. Caveat on today's numbers
+
+Trades 2907–2933 ran on pre-restart code. The two after the 08:54 restart (2935, 2937) show much
+smaller gaps. Two samples is not evidence the per-contract work helped; the fix here is independent
+of that and addresses the mechanism directly.
+
+`api/tests/test_exit_price_no_stale_last.py` — stubs `requests.get`, pins mid / bid / 0.0, and
+reconstructs trade 2929 numerically.
