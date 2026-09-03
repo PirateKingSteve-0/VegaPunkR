@@ -424,5 +424,43 @@ got, _ = StreamDrivenWorker._adoptable_broker_options(
                                {"symbol": CALL, "quantity": 1}])
 check("an empty underlying adopts nothing (fails closed)", got, [])
 
+print("\nTHE 2026-08-27 RACE: a flat scalper still OWNS its contract")
+# Strategy 3 cycled ~100x on one call with ~30s flat between round trips. The
+# broker lagged one of its closes, so the put strategy saw a holding that no
+# strategy had an OPEN row for, adopted a call it never bought, and booked a
+# phantom -$36. Being between round trips must not hand your contract away.
+db5, u7 = fresh()
+scalper = Strategy(user_id=u7.id, name="scalper", strategy_type="momentum",
+                   params_json={'direction': 'call'}, is_active=True)
+other = Strategy(user_id=u7.id, name="other", strategy_type="momentum",
+                 params_json={'direction': 'put'}, is_active=True)
+db5.add_all([scalper, other]); db5.flush()
+# scalper just CLOSED — row exists, qty=0. Broker has not caught up.
+db5.add(Position(user_id=u7.id, strategy_id=scalper.id, symbol="SPY",
+                 option_symbol=CALL, qty=0, avg_entry_price=0.84,
+                 current_price=0.84, unrealized_pnl=0.0))
+db5.commit()
+got, declined = StreamDrivenWorker._adoptable_broker_options(
+    db5, u7.id, other.id, "SPY", [{"symbol": CALL, "quantity": 3}])
+check("a flat-but-active strategy's contract is not adoptable",
+      [p["symbol"] for p in got], [])
+check("...and it counts as declined, so the caller leaves rows alone", declined, 1)
+
+# The owner itself must still be able to reclaim it.
+got, _ = StreamDrivenWorker._adoptable_broker_options(
+    db5, u7.id, scalper.id, "SPY", [{"symbol": CALL, "quantity": 3}])
+check("the owning strategy CAN still reclaim its own contract",
+      [p["symbol"] for p in got], [CALL])
+
+# A genuine orphan — no strategy has any row — is still adoptable.
+db6, u8 = fresh()
+solo = Strategy(user_id=u8.id, name="solo", strategy_type="momentum",
+                params_json={'direction': 'put'}, is_active=True)
+db6.add(solo); db6.commit()
+got, _ = StreamDrivenWorker._adoptable_broker_options(
+    db6, u8.id, solo.id, "SPY", [{"symbol": CALL, "quantity": 3}])
+check("a true orphan (no row anywhere) is still adopted",
+      [p["symbol"] for p in got], [CALL])
+
 print("\n" + ("ALL PASSED" if not fails else f"{len(fails)} FAILURE(S):\n  " + "\n  ".join(fails)))
 sys.exit(1 if fails else 0)

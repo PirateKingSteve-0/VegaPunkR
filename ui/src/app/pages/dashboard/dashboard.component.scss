@@ -367,3 +367,35 @@
     opacity: 0.35;
   }
 }
+
+/* "Done for the day" toolbar control. Neutral until the halt is active, then
+   it takes on the warning key so a stopped account is obvious from any page.
+   Hairline border, no shadow — it sits in the toolbar, it doesn't float. */
+.halt-toolbar-button {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-2);
+  margin-right: var(--sp-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-pill);
+  color: var(--text-muted);
+
+  .halt-toolbar-label {
+    font-size: var(--fs-xs);
+    font-weight: var(--fw-medium);
+  }
+
+  &:hover { background: var(--surface-hover); }
+}
+
+.halt-toolbar-button--active {
+  border-color: var(--color-loss);
+  background: var(--color-loss-bg-soft);
+  color: var(--color-loss-strong);
+}
+
+/* The label is the first thing to go on a narrow toolbar — the icon and its
+   tooltip still carry the meaning. */
+@media (max-width: 800px) {
+  .halt-toolbar-button .halt-toolbar-label { display: none; }
+}

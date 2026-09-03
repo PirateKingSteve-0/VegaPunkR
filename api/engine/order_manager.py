@@ -419,27 +419,37 @@ class OrderManager:
             # so this is a transport hiccup, not an expected path.
             return True, None, "preview not available for trading mode", None
 
-        # Entry-price drift observation. Compares the per-contract price the
-        # signal triggered on against the per-contract price the broker preview
-        # quotes at fill time. Observation only — does NOT gate the order. The
-        # data feeds a future decision on whether to add a "cancel if drift
-        # exceeds X" rule (TODO #4); we log the distribution first instead of
-        # picking a threshold blind. Skipped for sells (handled by exit-side
-        # analysis in TODO #6) and for non-option orders.
+        # Price-drift observation, both sides of the trade. Compares the
+        # per-contract price the signal triggered on against the per-contract
+        # price the broker preview quotes at fill time. Observation only — does
+        # NOT gate the order. Entry data feeds the future "cancel if drift
+        # exceeds X" decision (TODO B2); exit data is its twin (TODO B1). We log
+        # the distribution first instead of picking a threshold blind.
+        #
+        # Sells were skipped here until 2026-08-31 purely because the exit call
+        # site did not pass a `signal_price`; it does now. `side` is already in
+        # event_data, so the two populations stay separable in analysis.
+        #
+        # `order_cost` sign on a SELL is not documented — docs/tradier/trading/
+        # preview_order.md shows only a buy example. We therefore take the
+        # magnitude for the per-contract figure and record the raw value in
+        # event_data, so the convention can be read off the first real sells
+        # rather than assumed here.
         if (
-            side == "buy"
-            and option_symbol
+            option_symbol
             and signal_price is not None
             and signal_price > 0
             and qty > 0
         ):
-            order_cost = float(preview.get("order_cost") or 0.0)
+            order_cost_raw = float(preview.get("order_cost") or 0.0)
+            order_cost = abs(order_cost_raw)
             if order_cost > 0:
                 preview_per_contract = order_cost / (qty * 100.0)
                 drift_pct = (preview_per_contract - signal_price) / signal_price
                 drift_dollars = (preview_per_contract - signal_price) * qty * 100.0
                 drift_msg = (
-                    f"Entry preview drift {symbol} ({option_symbol}): "
+                    f"{'Entry' if side == 'buy' else 'Exit'} preview drift "
+                    f"{symbol} ({option_symbol}): "
                     f"signal=${signal_price:.4f} preview=${preview_per_contract:.4f} "
                     f"drift={drift_pct:+.2%} (${drift_dollars:+.2f} on {qty} contracts)"
                 )
@@ -448,7 +458,10 @@ class OrderManager:
                     db=self.db,
                     user_id=user.id,
                     event_type="ORDER_PREVIEW_DRIFT",
-                    title=f"Preview drift: {option_symbol} {drift_pct:+.2%}",
+                    title=(
+                        f"{'Entry' if side == 'buy' else 'Exit'} drift: "
+                        f"{option_symbol} {drift_pct:+.2%}"
+                    ),
                     detail=drift_msg,
                     symbol=symbol,
                     strategy_id=strategy.id,
@@ -462,6 +475,9 @@ class OrderManager:
                         "side": side,
                         "option_symbol": option_symbol,
                         "order_cost": order_cost,
+                        # Signed as the broker returned it — the sell convention
+                        # is undocumented and this is how we find out.
+                        "order_cost_raw": order_cost_raw,
                     },
                 )
 
@@ -1507,6 +1523,7 @@ class OrderManager:
         position: Position,
         reason: str = "Manual close",
         option_symbol: Optional[str] = None,
+        signal_price: Optional[float] = None,
     ) -> OrderResult:
         """
         Close an entire position
@@ -1569,6 +1586,9 @@ class OrderManager:
             side=side,
             option_symbol=option_symbol,
             order_type='market',
+            # Exit-side drift observation (TODO B1). None on the forced-exit
+            # path that fires without a price — there is nothing to compare.
+            signal_price=signal_price,
         )
         if not preview_ok:
             return OrderResult(success=False, message=f"Close aborted: {preview_msg}")

@@ -111,7 +111,7 @@
                 <mat-error>Minimum is 0.1%</mat-error>
               }
               @if (strategyForm.get('stop_loss_percentage')?.hasError('max')) {
-                <mat-error>Maximum is 20%</mat-error>
+                <mat-error>Maximum is 100%</mat-error>
               }
             </mat-form-field>
 
@@ -119,12 +119,62 @@
               <mat-label>Take Profit</mat-label>
               <input matInput type="number" formControlName="take_profit_percentage" step="0.1">
               <span matSuffix>%</span>
+              @if (strategyForm.get('trailing_stop')?.value) {
+                <mat-hint>Ignored once the trailing stop arms — the trail governs the exit</mat-hint>
+              }
               @if (strategyForm.get('take_profit_percentage')?.hasError('min')) {
                 <mat-error>Minimum is 0.1%</mat-error>
               }
               @if (strategyForm.get('take_profit_percentage')?.hasError('max')) {
-                <mat-error>Maximum is 50%</mat-error>
+                <mat-error>Maximum is 100%</mat-error>
               }
+            </mat-form-field>
+          </div>
+
+          <div class="form-row">
+            <mat-form-field appearance="outline">
+              <mat-label>Risk Per Trade</mat-label>
+              <input matInput type="number" formControlName="risk_per_trade_pct" step="0.1">
+              <span matSuffix>%</span>
+              <mat-hint>
+                Sizing uses the LOWER of this and your profile's max trade size —
+                raising only one has no effect.
+              </mat-hint>
+            </mat-form-field>
+
+            <mat-form-field appearance="outline">
+              <mat-label>Max Contracts</mat-label>
+              <input matInput type="number" formControlName="max_contracts" step="1" min="1">
+              <mat-hint>Hard ceiling per entry, applied after the risk maths.</mat-hint>
+            </mat-form-field>
+          </div>
+        </div>
+
+        <!-- Contract Selection -->
+        <div class="form-section">
+          <h2>Contract Selection</h2>
+          <p class="section-hint">
+            Which option gets armed. A higher delta is deeper in-the-money — more
+            premium per contract and, in practice, far less open interest than
+            at-the-money. If nothing clears these three together, no contract arms
+            and the strategy trades nothing.
+          </p>
+
+          <div class="form-row">
+            <mat-form-field appearance="outline">
+              <mat-label>Delta Min</mat-label>
+              <input matInput type="number" formControlName="delta_min" step="0.05" min="0.01" max="1">
+            </mat-form-field>
+
+            <mat-form-field appearance="outline">
+              <mat-label>Delta Max</mat-label>
+              <input matInput type="number" formControlName="delta_max" step="0.05" min="0.01" max="1">
+            </mat-form-field>
+
+            <mat-form-field appearance="outline">
+              <mat-label>Min Open Interest</mat-label>
+              <input matInput type="number" formControlName="min_open_interest" step="100" min="0">
+              <mat-hint>Liquidity floor. Contracts below this are skipped.</mat-hint>
             </mat-form-field>
           </div>
         </div>

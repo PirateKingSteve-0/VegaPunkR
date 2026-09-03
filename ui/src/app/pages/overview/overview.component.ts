@@ -7,7 +7,10 @@ import { Subscription } from 'rxjs';
 import { distinctUntilChanged, skip } from 'rxjs/operators';
 import { AccountService } from '../../services/account.service';
 import { SystemService } from '../../services/system.service';
+import { MatDialog, MatDialogModule } from '@angular/material/dialog';
 import { RiskService, AccountRiskStatus } from '../../services/risk.service';
+import { AuthService } from '../../services/auth.service';
+import { TradingHaltDialogComponent } from '../../components/trading-halt-dialog/trading-halt-dialog.component';
 
 @Component({
   selector: 'app-overview',
@@ -16,7 +19,8 @@ import { RiskService, AccountRiskStatus } from '../../services/risk.service';
     CommonModule,
     MatCardModule,
     MatIconModule,
-    MatButtonModule
+    MatButtonModule,
+    MatDialogModule
   ],
   templateUrl: './overview.component.html',
   styleUrls: ['./overview.component.scss'],
@@ -26,6 +30,8 @@ export class OverviewComponent implements OnInit, OnDestroy {
   private accountService = inject(AccountService);
   private systemService = inject(SystemService);
   private riskService = inject(RiskService);
+  private authService = inject(AuthService);
+  private dialog = inject(MatDialog);
   private settingsSubscription?: Subscription;
 
   // Reactive signals for stat values
@@ -78,6 +84,30 @@ export class OverviewComponent implements OnInit, OnDestroy {
 
   ngOnDestroy() {
     this.settingsSubscription?.unsubscribe();
+  }
+
+  /** Read-only roles get the control disabled rather than hidden — the halt is
+   *  safety state a viewer should still be able to see. The backend
+   *  (`require_can_write_own`) is the actual boundary. */
+  canWrite(): boolean {
+    const role = this.authService.currentUserValue?.role;
+    return role === 'user' || role === 'admin' || role === 'strategy_author';
+  }
+
+  openHaltDialog(): void {
+    const ref = this.dialog.open(TradingHaltDialogComponent, {
+      width: '520px',
+      maxWidth: '100vw',
+      autoFocus: false,
+    });
+    // Re-read rather than patching locally: a flatten also changes open
+    // positions and today's P&L, so the whole tile needs to be refetched.
+    ref.afterClosed().subscribe(result => {
+      if (result) {
+        this.loadAccountRisk();
+        this.loadAccountData();
+      }
+    });
   }
 
   loadAccountRisk() {

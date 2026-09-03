@@ -1,0 +1,97 @@
+<h2 mat-dialog-title class="halt-title">
+  <mat-icon>do_not_disturb_on</mat-icon>
+  Done trading for today?
+</h2>
+
+<mat-dialog-content class="halt-content">
+  <!-- Already stopped: this dialog becomes the way back. -->
+  <ng-container *ngIf="current()?.trading_halted; else choosing">
+    <div class="banner banner-warning halt-active-banner">
+      <mat-icon>pause_circle</mat-icon>
+      <div>
+        <div class="halt-active-title">
+          Trading is stopped for today<span *ngIf="current()?.trading_halt_mode as m"> ({{ m === 'flatten' ? 'positions closed' : 'positions riding' }})</span>.
+        </div>
+        <div class="halt-active-sub">
+          New entries are blocked until the next market day. Resuming does not
+          reopen anything that was closed.
+        </div>
+      </div>
+    </div>
+  </ng-container>
+
+  <ng-template #choosing>
+    <p class="halt-lede">
+      New entries stop for the rest of the market day either way. Choose what
+      happens to positions that are <strong>already open</strong>.
+    </p>
+
+    <button
+      type="button"
+      class="halt-option"
+      [class.halt-option--selected]="selected() === 'ride'"
+      [disabled]="submitting()"
+      (click)="choose('ride')">
+      <mat-icon class="halt-option-icon">shield</mat-icon>
+      <span class="halt-option-body">
+        <span class="halt-option-title">Let them run to stop or target</span>
+        <span class="halt-option-desc">
+          Open positions keep their stop-loss, take-profit, trailing stop and
+          the forced close before the bell. Nothing is sold right now.
+        </span>
+      </span>
+      <mat-icon class="halt-option-check">{{ selected() === 'ride' ? 'radio_button_checked' : 'radio_button_unchecked' }}</mat-icon>
+    </button>
+
+    <button
+      type="button"
+      class="halt-option halt-option--destructive"
+      [class.halt-option--selected]="selected() === 'flatten'"
+      [disabled]="submitting()"
+      (click)="choose('flatten')">
+      <mat-icon class="halt-option-icon">sell</mat-icon>
+      <span class="halt-option-body">
+        <span class="halt-option-title">Sell all open positions now</span>
+        <span class="halt-option-desc">
+          Closes everything at market on the next evaluation tick. This realises
+          whatever the positions are worth right now and ends any trailing stop.
+        </span>
+      </span>
+      <mat-icon class="halt-option-check">{{ selected() === 'flatten' ? 'radio_button_checked' : 'radio_button_unchecked' }}</mat-icon>
+    </button>
+
+    <div class="halt-note" *ngIf="selected() === 'flatten'">
+      <mat-icon>warning</mat-icon>
+      <span>Selling now turns any open paper loss into a realised one. Positions left to run still have their stop-loss active.</span>
+    </div>
+  </ng-template>
+
+  <div *ngIf="error()" class="banner banner-error halt-error">
+    <mat-icon>error</mat-icon>
+    {{ error() }}
+  </div>
+</mat-dialog-content>
+
+<mat-dialog-actions class="halt-actions">
+  <button mat-button (click)="cancel()" [disabled]="submitting()">Cancel</button>
+
+  <button
+    *ngIf="current()?.trading_halted"
+    mat-flat-button
+    color="primary"
+    (click)="resume()"
+    [disabled]="submitting()">
+    <mat-spinner *ngIf="submitting()" diameter="16"></mat-spinner>
+    <span>Resume trading today</span>
+  </button>
+
+  <button
+    *ngIf="!current()?.trading_halted"
+    mat-flat-button
+    color="primary"
+    (click)="confirm()"
+    [disabled]="!selected() || submitting()">
+    <mat-spinner *ngIf="submitting()" diameter="16"></mat-spinner>
+    <span>{{ selected() === 'flatten' ? 'Stop and sell all' : 'Stop for today' }}</span>
+  </button>
+</mat-dialog-actions>

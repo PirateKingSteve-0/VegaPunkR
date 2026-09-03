@@ -44,6 +44,16 @@ class ExecutionState:
         self.last_error: Optional[str] = None
 
 
+# How old a streamed bid/ask may be and still price an exit.
+#
+# SPY 0DTE quotes update many times a second, so anything beyond a few seconds
+# means the feed has gone quiet for this contract, not that the price is
+# steady. 30s is deliberately generous: the failure it exists to stop involved
+# quotes minutes stale, and a tighter bound would push routine ticks onto the
+# REST path and burn the market-data budget at the 1s eval interval.
+MAX_QUOTE_AGE_SECONDS = 30.0
+
+
 class StrategyExecutor:
     """
     Main strategy execution engine.
@@ -294,13 +304,59 @@ class StrategyExecutor:
         if _is_options:
             bid = market_data.get('bid', 0) or 0
             ask = market_data.get('ask', 0) or 0
-            if ask <= 0:
+            entry_option_symbol = market_data.get('option_symbol')
+
+            # A streamed quote is only usable for SIZING while it is current.
+            # option_bid/ask are written by a quote event and then held
+            # indefinitely — nothing expires them — so a contract that stops
+            # quoting freezes its price while the market moves on. The exit path
+            # has refused stale quotes since 2026-08-27 (_check_exit_signals);
+            # this is the same guard on the entry side, which was left exposed.
+            #
+            # Unlike the exit path there is no contract-identity check to make:
+            # at entry the armed contract IS the one being priced, so freshness
+            # is the whole question.
+            #
+            # Scope note — this deliberately changes behaviour in ONE case, the
+            # stale one. `arm()` clears the quote stamp and bid/ask together, so
+            # `quote_age_s is None` implies `ask == 0`, which the old code
+            # already skipped; that path is preserved exactly.
+            quote_age = market_data.get('quote_age_s')
+
+            if quote_age is None:
+                # Never quoted since arming — wait for the first quote, as before.
                 logger.debug(f"{symbol}: Option price not yet available, skipping entry")
                 return
-            sizing_price = (bid + ask) / 2
+
+            if quote_age > MAX_QUOTE_AGE_SECONDS:
+                if not entry_option_symbol:
+                    logger.debug(f"{symbol}: No armed contract to price, skipping entry")
+                    return
+                logger.warning(
+                    f"Stale stream quote for {entry_option_symbol} at entry: "
+                    f"{quote_age:.0f}s old (max {MAX_QUOTE_AGE_SECONDS}s) — sizing from REST"
+                )
+                # _fetch_option_price returns a two-sided mid, a one-sided bid,
+                # or 0. On a one-sided book the bid slightly understates what a
+                # BUY costs, which biases toward over-sizing — bounded by the
+                # 2x options safety factor and the max_contracts cap, and far
+                # smaller than the frozen-price error it replaces.
+                sizing_price = await self._fetch_option_price(entry_option_symbol)
+                if sizing_price <= 0:
+                    # No price anywhere. Skipping costs one 1s eval tick; sizing
+                    # from a frozen number costs a wrong size on a real order.
+                    logger.debug(f"{symbol}: No option price available, skipping entry")
+                    return
+            else:
+                if ask <= 0:
+                    logger.debug(f"{symbol}: Option price not yet available, skipping entry")
+                    return
+                sizing_price = (bid + ask) / 2
+
             logger.info(
-                f"ENTRY SIGNAL: {symbol} option={market_data.get('option_symbol')} "
-                f"mid=${sizing_price:.2f} reason={entry_signal.reason}"
+                f"ENTRY SIGNAL: {symbol} option={entry_option_symbol} "
+                f"price=${sizing_price:.2f} (quote_age={quote_age:.0f}s) "
+                f"reason={entry_signal.reason}"
             )
         else:
             sizing_price = current_price
@@ -398,9 +454,37 @@ class StrategyExecutor:
             # Exits were firing essentially at random. Only trust the stream when the
             # quote is FOR the contract we hold; otherwise go to REST for the truth.
             streamed_symbol = market_data.get('option_symbol')
+
+            # A streamed quote is only usable if it is FOR this contract AND
+            # still current. option_bid/ask are written by a quote event and
+            # then held indefinitely — nothing expires them — so a contract that
+            # stops quoting freezes its price while the market moves on. The
+            # exit path prefers the streamed bid, so that frozen number became
+            # the P&L basis for every TP/SL decision.
+            #
+            # 2026-08-27: take profits claiming +36.96% / +42.86% / +68.57% that
+            # realised -2.1% / -4.5% / +0.0%, on a contract decaying from ~0.59
+            # to ~0.35 through the session. The claimed figures back-solve to a
+            # bid around 0.58-0.64 — where it had genuinely quoted much earlier.
+            #
+            # Falling through to REST is correct here: _fetch_option_price
+            # returns a real two-sided mid, a real bid, or 0 (skip the tick).
+            quote_age = market_data.get('quote_age_s')
+            quote_is_fresh = quote_age is not None and quote_age <= MAX_QUOTE_AGE_SECONDS
             quote_is_for_this_position = (
-                streamed_symbol is not None and streamed_symbol == position.option_symbol
+                streamed_symbol is not None
+                and streamed_symbol == position.option_symbol
+                and quote_is_fresh
             )
+            if (
+                streamed_symbol == position.option_symbol
+                and quote_age is not None
+                and not quote_is_fresh
+            ):
+                logger.warning(
+                    f"Stale stream quote for {position.option_symbol}: "
+                    f"{quote_age:.0f}s old (max {MAX_QUOTE_AGE_SECONDS}s) — pricing exit from REST"
+                )
 
             if option_symbol:
                 if quote_is_for_this_position and bid > 0:
@@ -517,6 +601,11 @@ class StrategyExecutor:
                 position=position,
                 reason=exit_signal.reason,
                 option_symbol=close_option_symbol,
+                # `exit_price` is the price this exit decision was actually made
+                # on — the held contract's fresh streamed bid, or REST. Feeding
+                # it to the preview gives the exit-side twin of the entry drift
+                # measurement (TODO B1). Observation only; it gates nothing.
+                signal_price=exit_price,
             )
 
             if order_result.success:

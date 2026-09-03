@@ -260,3 +260,17 @@
     }
   }
 }
+
+/* Header twin of the toolbar control. Same state colouring so the two read as
+   one feature rather than two buttons that happen to share a name. */
+.halt-trigger {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-2);
+}
+
+.halt-trigger--active {
+  border-color: var(--color-loss);
+  background: var(--color-loss-bg-soft);
+  color: var(--color-loss-strong);
+}

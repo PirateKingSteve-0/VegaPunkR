@@ -118,6 +118,12 @@ class StrategyMarketState:
     delta: Optional[float] = None
     open_interest: Optional[int] = None
     drift_checked_at: Optional[datetime] = None
+    # When the streamed bid/ask last CHANGED hands. Without this, option_bid is
+    # written once by a quote event and then believed forever: the exit path
+    # prefers the streamed bid, so a contract that stops quoting freezes its
+    # price while the market moves on. On 2026-08-27 that fired take-profits
+    # claiming +36% / +42% / +68% that realised -2% to -4%.
+    option_quote_at: Optional[datetime] = None
 
     # Exactly what THIS strategy has subscribed on the shared WS session. The
     # refcount in TradierStreamManager is global, so unsubscribing a symbol we
@@ -156,6 +162,7 @@ class StrategyMarketState:
             if symbol == self.option_symbol:
                 self.option_bid = bid
                 self.option_ask = ask
+                self.option_quote_at = datetime.utcnow()
 
     def arm(self, sel: "SelectedContract"):
         """Adopt a freshly selected contract as the one we'd buy on the next entry
@@ -166,6 +173,7 @@ class StrategyMarketState:
         self.open_interest = sel.open_interest
         self.option_bid = 0.0
         self.option_ask = 0.0
+        self.option_quote_at = None
         self.drift_checked_at = datetime.utcnow()
 
     def disarm(self):
@@ -176,6 +184,7 @@ class StrategyMarketState:
         self.open_interest = None
         self.option_bid = 0.0
         self.option_ask = 0.0
+        self.option_quote_at = None
         self.drift_checked_at = None
 
     def needs_drift_check(self) -> bool:
@@ -191,6 +200,13 @@ class StrategyMarketState:
             "volume": self.tick_volume,
             "bid": self.option_bid,
             "ask": self.option_ask,
+            # Age of the bid/ask above, in seconds. None means "never quoted".
+            # The exit path uses this to refuse a frozen quote — see
+            # strategy_executor._check_exit_signals.
+            "quote_age_s": (
+                None if self.option_quote_at is None
+                else (datetime.utcnow() - self.option_quote_at).total_seconds()
+            ),
             "delta": self.delta,
             "open_interest": self.open_interest,
             "high": self.session_high,
@@ -597,11 +613,26 @@ class StreamDrivenWorker:
             sym = _held_symbol(p, underlying)
             if sym is None:
                 continue
+            # NOTE: no `Position.qty > 0` here, deliberately.
+            #
+            # Requiring an OPEN row made this test true only while the other
+            # strategy was holding — and a scalping strategy is flat between
+            # every round trip. On 2026-08-27 strategy 3 cycled ~100 times on
+            # SPY260827C00770000 with ~30s flat between cycles; the broker had
+            # not yet caught up with one of its closes, so the put strategy saw
+            # a holding "no active strategy owns", adopted a CALL it never
+            # bought, failed the close preview eight times and booked a phantom
+            # -$36. That window opened once per cycle.
+            #
+            # A row for this contract on a still-running strategy means that
+            # contract is THEIRS, open or flat. If the broker really is holding
+            # it, their own reconcile adopts it back into the row they already
+            # have. Adoption exists for contracts NOBODY tracks, and this keeps
+            # it pointed at that case.
             claimed = db.query(Position).filter(
                 Position.user_id == user_id,
                 Position.option_symbol == sym,
                 Position.strategy_id != strategy_id,
-                Position.qty > 0,
             ).join(Strategy, Strategy.id == Position.strategy_id).filter(
                 # Only a strategy that is STILL RUNNING can be trusted to exit
                 # what it claims. If the claimant was deactivated — including by
@@ -613,8 +644,8 @@ class StreamDrivenWorker:
             ).first()
             if claimed is not None:
                 logger.warning(
-                    f"Strategy {strategy_id}: not adopting {sym} — strategy "
-                    f"{claimed.strategy_id} already holds it (qty={claimed.qty})"
+                    f"Strategy {strategy_id}: not adopting {sym} — active strategy "
+                    f"{claimed.strategy_id} owns this contract (qty={claimed.qty})"
                 )
                 declined += 1
                 continue

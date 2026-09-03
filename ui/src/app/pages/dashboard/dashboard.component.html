@@ -7,6 +7,22 @@
     <span class="app-title">VegaPunkR</span>
     <span class="spacer"></span>
 
+    <!-- "Done for the day" — reachable from every page, not just Overview.
+         Shows the current state so a halt is visible wherever you are. -->
+    @if (canWrite()) {
+      <button
+        mat-button
+        class="halt-toolbar-button"
+        [class.halt-toolbar-button--active]="haltStatus()?.trading_halted"
+        (click)="openHaltDialog()"
+        [matTooltip]="haltStatus()?.trading_halted
+          ? 'Trading stopped for today — click to resume'
+          : 'Stop opening new positions for the rest of the day'">
+        <mat-icon>{{ haltStatus()?.trading_halted ? 'pause_circle' : 'do_not_disturb_on' }}</mat-icon>
+        <span class="halt-toolbar-label">{{ haltStatus()?.trading_halted ? 'Stopped for today' : 'Done for the day' }}</span>
+      </button>
+    }
+
     <!-- User Menu -->
     <button mat-icon-button [matMenuTriggerFor]="userMenu">
       <mat-icon>account_circle</mat-icon>

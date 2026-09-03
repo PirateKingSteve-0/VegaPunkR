@@ -1,8 +1,8 @@
 """
 Pydantic schemas for request/response validation.
 """
-from datetime import datetime
-from typing import Optional, List, Dict, Any
+from datetime import date, datetime
+from typing import Optional, List, Dict, Any, Literal
 from pydantic import BaseModel, EmailStr, Field, field_validator
 
 from notifications.discord import is_valid_discord_webhook
@@ -72,7 +72,10 @@ class UserBase(BaseModel):
     role: str = "user"
     risk_tolerance: str = "medium"
     account_size_usd: float = 0.0
-    max_trade_percentage: float = 0.02
+    # PERCENT, not a fraction: risk_manager.py:71 divides this by 100, so 2.0
+    # means 2%. The old 0.02 default gave a new user 0.02%, which sizes every
+    # options trade to zero contracts.
+    max_trade_percentage: float = 2.0
     daily_loss_limit_pct: float = Field(5.0, ge=0.5, le=20.0)
     timezone: str = "UTC"
     trading_window_enabled: bool = False
@@ -128,9 +131,32 @@ class UserResponse(UserBase):
     is_active: bool
     created_at: datetime
     updated_at: Optional[datetime] = None
+    # Read-only here on purpose: the halt is set through its own endpoints, not
+    # the generic PATCH /auth/me field loop. Deliberately absent from
+    # UserUpdate so a stray payload key can never stop or resume trading.
+    trading_halted_on: Optional[date] = None
+    trading_halt_mode: Optional[str] = None
 
     class Config:
         from_attributes = True
+
+
+class TradingHaltRequest(BaseModel):
+    """Body for POST /auth/me/trading-halt — "done trading for today".
+
+    `mode` decides only what happens to positions that are already open; both
+    modes stop new entries for the rest of the market day.
+    """
+    mode: Literal["ride", "flatten"] = "ride"
+
+
+class TradingHaltResponse(BaseModel):
+    """Current halt state, returned by both the set and the clear endpoint so
+    the caller never has to re-fetch to render the result."""
+    trading_halted: bool
+    trading_halt_mode: Optional[str] = None
+    trading_halted_on: Optional[date] = None
+    message: str
 
 
 class DiscordTestRequest(BaseModel):

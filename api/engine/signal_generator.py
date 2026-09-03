@@ -9,7 +9,7 @@ import numpy as np
 from collections import deque
 
 from models import Strategy, User
-from utils.market_hours import MarketHours
+from utils.market_hours import HALT_MODE_FLATTEN, MarketHours, trading_halt_state
 
 logger = logging.getLogger(__name__)
 
@@ -159,6 +159,27 @@ def forced_exit_time_et(
                 exit_reason = (
                     f"Account trading window ended at {account_end_et.strftime('%H:%M')} ET"
                 )
+
+    # "Done for the day", flatten mode: the forced exit is due right now.
+    #
+    # Expressed as a bound on the exit TIME rather than as a new branch in the
+    # executor so it reaches every existing consumer for free — the exit signal
+    # (check_exit_signal step 5), the unpriced-contract market close
+    # (strategy_executor), and the entry cutoff (check_entry_signal) — with no
+    # second copy of the rule and no new order path. The close it produces is
+    # the same well-worn forced-EOD close that runs every afternoon.
+    #
+    # Most-restrictive-bound holds: `current_et` is by definition no later than
+    # any other candidate, so this can only pull the exit earlier. The guard
+    # keeps a genuine EOD/window reason when we are already past that time —
+    # the more specific reason is the more useful one in the trade record.
+    #
+    # 'ride' mode deliberately does nothing here: it stops entries (the risk
+    # manager's job) and leaves exits exactly as they were.
+    halted, halt_mode = trading_halt_state(user)
+    if halted and halt_mode == HALT_MODE_FLATTEN and current_et < exit_time_et:
+        exit_time_et = current_et
+        exit_reason = "Trading stopped for the day: closing open positions at market"
 
     return exit_time_et, exit_reason
 
@@ -491,8 +512,8 @@ class SignalGenerator:
             current_price: Current market price
             entry_timestamp: When position was opened
             position_side: 'long' or 'short'
-            current_high: Today's high for trailing stop
-            current_low: Today's low for trailing stop
+            current_high: Position high-water mark since open (contract price)
+            current_low: Position low-water mark since open (contract price)
 
         Returns:
             Signal object if exit conditions met, None otherwise
@@ -511,20 +532,52 @@ class SignalGenerator:
             'current_price': current_price
         }
 
-        # 1. Take Profit check
-        take_profit_pct = params.get('take_profit_pct') or params.get('take_profit_percentage')
-        if take_profit_pct and pnl_pct >= take_profit_pct:
-            return Signal(
-                signal_type='exit',
-                action='sell' if position_side == 'long' else 'buy',
-                symbol=symbol,
-                confidence=1.0,
-                reason=f"Take profit hit: {pnl_pct:.2f}% >= {take_profit_pct}%",
-                price=current_price,
-                indicators=indicators
-            )
+        # The trail's ARMED state is computed before any exit branch because it
+        # decides whether the flat take-profit still applies. Two rules govern
+        # the upside and they are mutually exclusive above the activation
+        # threshold — see the ordering note below.
+        use_trailing_stop = params.get('trailing_stop', False)
+        activation_pct = params.get('trailing_stop_activation', 15)
+        trail_distance_pct = params.get('trailing_stop_distance', 10)
 
-        # 2. Stop Loss check
+        # Armed off the HIGH-WATER MARK, not the current price. The previous
+        # form tested live `pnl_pct >= activation_pct`, which meant the trail
+        # switched itself back OFF during the very pullback it exists to catch:
+        # with activation=15/distance=10 the stop level sits at
+        # peak * 0.90, but a peak of +15% puts that level at +3.5% — below the
+        # activation the branch re-checked — so nothing could fire until the
+        # peak reached 1.15/0.90 = +27.8%. Arming latches on the peak instead,
+        # so `trailing_stop_activation` means what its name says.
+        #
+        # `current_high`/`current_low` are position.peak_price/trough_price —
+        # the held CONTRACT's extremes since open (strategy_executor.py:544),
+        # never the underlying's daily range.
+        # Tolerance so the threshold is not decided by binary representation:
+        # (2.30 - 2.00) / 2.00 is 14.999999999999998, and a peak of exactly the
+        # activation percentage must arm.
+        _ARM_EPS = 1e-9
+
+        trail_armed = False
+        trailing_stop_price = None
+        if use_trailing_stop:
+            if position_side == 'long' and current_high:
+                peak_pnl_pct = ((current_high - entry_price) / entry_price) * 100
+                if peak_pnl_pct >= activation_pct - _ARM_EPS:
+                    trail_armed = True
+                    trailing_stop_price = current_high * (1 - trail_distance_pct / 100)
+            elif position_side == 'short' and current_low:
+                trough_pnl_pct = ((entry_price - current_low) / entry_price) * 100
+                if trough_pnl_pct >= activation_pct - _ARM_EPS:
+                    trail_armed = True
+                    trailing_stop_price = current_low * (1 + trail_distance_pct / 100)
+
+        if trail_armed:
+            indicators['trailing_armed'] = True
+            indicators['trailing_stop_price'] = trailing_stop_price
+
+        # 1. Stop Loss check — evaluated first so the downside bound is never
+        # gated behind anything else. Unchanged in behaviour; it cannot collide
+        # with take profit (a position cannot be both above +TP and below -SL).
         stop_loss_pct = params.get('stop_loss_pct') or params.get('stop_loss_percentage')
         if stop_loss_pct and pnl_pct <= -stop_loss_pct:
             return Signal(
@@ -537,40 +590,53 @@ class SignalGenerator:
                 indicators=indicators
             )
 
-        # 3. Trailing Stop check
-        use_trailing_stop = params.get('trailing_stop', False)
-        if use_trailing_stop:
-            activation_pct = params.get('trailing_stop_activation', 15)
-            trail_distance_pct = params.get('trailing_stop_distance', 10)
+        # 2. Trailing Stop check
+        if trail_armed:
+            hit = (
+                current_price <= trailing_stop_price if position_side == 'long'
+                else current_price >= trailing_stop_price
+            )
+            if hit:
+                comparator = '<=' if position_side == 'long' else '>='
+                return Signal(
+                    signal_type='exit',
+                    action='sell' if position_side == 'long' else 'buy',
+                    symbol=symbol,
+                    confidence=1.0,
+                    reason=(
+                        f"Trailing stop hit: ${current_price:.2f} {comparator} "
+                        f"${trailing_stop_price:.2f}"
+                    ),
+                    price=current_price,
+                    indicators=indicators
+                )
 
-            # Only activate trailing stop if we've reached activation threshold
-            if pnl_pct >= activation_pct:
-                if position_side == 'long' and current_high:
-                    # For longs: stop is trail_distance below the high
-                    trailing_stop_price = current_high * (1 - trail_distance_pct / 100)
-                    if current_price <= trailing_stop_price:
-                        return Signal(
-                            signal_type='exit',
-                            action='sell',
-                            symbol=symbol,
-                            confidence=1.0,
-                            reason=f"Trailing stop hit: ${current_price:.2f} <= ${trailing_stop_price:.2f}",
-                            price=current_price,
-                            indicators={**indicators, 'trailing_stop_price': trailing_stop_price}
-                        )
-                elif position_side == 'short' and current_low:
-                    # For shorts: stop is trail_distance above the low
-                    trailing_stop_price = current_low * (1 + trail_distance_pct / 100)
-                    if current_price >= trailing_stop_price:
-                        return Signal(
-                            signal_type='exit',
-                            action='buy',
-                            symbol=symbol,
-                            confidence=1.0,
-                            reason=f"Trailing stop hit: ${current_price:.2f} >= ${trailing_stop_price:.2f}",
-                            price=current_price,
-                            indicators={**indicators, 'trailing_stop_price': trailing_stop_price}
-                        )
+        # 3. Take Profit check — SUPPRESSED while the trail is armed.
+        #
+        # A flat target and a trail both claim the upside, and the flat target
+        # always won: it fires the instant price touches +TP on the way UP,
+        # when there has been no pullback for the trail to react to. Reordering
+        # the branches does not change that (at the +TP tick the trail is not
+        # hit, so it falls through to the target anyway) — the target has to
+        # stand down for the trail to govern at all. Live 2026-09-02:
+        # SPY260902C00760000 ran 3.27 -> 6.40 and the flat +25% took it at 4.09,
+        # twice, for $750 of settled cash; a 10% trail exits once at ~5.76.
+        # See TODO.md E1 / docs/live-test-results-2026-09-02.md F1.
+        #
+        # Below activation nothing changes, and unchecking `trailing_stop`
+        # restores the previous behaviour exactly (picked up within ~30s by
+        # db.refresh(strategy), stream_driven_worker.py:348).
+        take_profit_pct = params.get('take_profit_pct') or params.get('take_profit_percentage')
+        if take_profit_pct and not trail_armed and pnl_pct >= take_profit_pct:
+            return Signal(
+                signal_type='exit',
+                action='sell' if position_side == 'long' else 'buy',
+                symbol=symbol,
+                confidence=1.0,
+                reason=f"Take profit hit: {pnl_pct:.2f}% >= {take_profit_pct}%",
+                price=current_price,
+                indicators=indicators
+            )
 
         # 4. Max hold time exit
         max_hold_minutes = params.get('max_hold_time_minutes', None)

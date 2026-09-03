@@ -10,7 +10,12 @@ from sqlalchemy import func
 
 from models import User, Strategy, Position, Trade, RiskEvent
 from config import TradingMode
-from utils.market_hours import market_day_start_utc, user_day_start_utc
+from utils.market_hours import (
+    HALT_MODE_FLATTEN,
+    market_day_start_utc,
+    trading_halt_state,
+    user_day_start_utc,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -146,6 +151,19 @@ class RiskManager:
                 "Cannot execute paper strategy in live trading mode"
             )
 
+        # 2.4. Account-wide manual halt ("done trading today"). Checked before
+        # the loss caps because it is unconditional — if the user has called it
+        # a day we don't need to price anything to know the answer. Same
+        # entries-only shape as the loss cap: `side='sell'` is never blocked,
+        # so every open position stays closeable through the engine.
+        halt_check = self._check_user_trading_halt(user, side)
+        if not halt_check.approved:
+            self._log_account_risk_event(
+                user, strategy, "user_trading_halt",
+                halt_check.reason, "trade_rejected"
+            )
+            return halt_check
+
         # 2.5. Account-wide daily loss cap (entries-only halt across ALL of
         # the user's strategies). Most-restrictive bound: this gate is
         # checked before per-strategy limits so if the account is halted
@@ -222,6 +240,40 @@ class RiskManager:
             f"Pre-trade validation PASSED: {symbol} {side} {qty} @ ${estimated_price}"
         )
         return RiskCheckResult(True, "All risk checks passed")
+
+    def _check_user_trading_halt(self, user: User, side: str = "buy") -> RiskCheckResult:
+        """Account-wide manual halt for the current market day.
+
+        The user pressed "done for the day". Both halt modes reject new
+        entries; they differ only in what happens to positions already open,
+        and that half is handled where exits are decided
+        (`signal_generator.forced_exit_time_et`) — not here. This method's only
+        job is the entry side.
+
+        Entries-only, for the same reason the loss cap is: blocking `sell`
+        would strand open positions with no engine path out, which is strictly
+        worse than whatever made the user stop trading.
+
+        Composes with every other gate by being purely additive — it can only
+        reject a buy that would otherwise pass, never approve one that another
+        gate rejects."""
+        if side != "buy":
+            return RiskCheckResult(True)
+
+        halted, mode = trading_halt_state(user)
+        if not halted:
+            return RiskCheckResult(True)
+
+        detail = (
+            "open positions are being closed at market"
+            if mode == HALT_MODE_FLATTEN
+            else "open positions keep running their stop/target"
+        )
+        return RiskCheckResult(
+            False,
+            f"Trading halted for the day by user request ({mode}): {detail}. "
+            f"New entries are blocked until the next market day."
+        )
 
     def _check_user_daily_loss_limit(self, user: User, side: str = "buy") -> RiskCheckResult:
         """Account-wide daily loss cap. Sums realized PnL across all the
@@ -476,6 +528,13 @@ class RiskManager:
         else:
             risk_status = "OK"
 
+        # The manual halt is reported alongside `risk_status`, not folded into
+        # it. They are different facts — "the cap stopped you" and "you stopped
+        # yourself" — and the tile says something different for each. Folding
+        # the manual halt into risk_status would make a deliberate, healthy
+        # decision render as a risk breach.
+        halted, halt_mode = trading_halt_state(user)
+
         return {
             "today_pnl": today_pnl,
             "realized_pnl": realized,
@@ -486,7 +545,11 @@ class RiskManager:
             "daily_loss_remaining": daily_loss_remaining,
             "pct_consumed": pct_consumed,
             "risk_status": risk_status,
-            "entries_halted": risk_status == "HALTED",
+            "trading_halted": halted,
+            "trading_halt_mode": halt_mode,
+            # Either reason blocks entries, so this stays the one field a
+            # caller can ask "can we open anything right now".
+            "entries_halted": risk_status == "HALTED" or halted,
         }
 
     def check_live_trading_safeguards(self, user: User) -> Tuple[bool, str]:

@@ -119,9 +119,12 @@ export class ProfileDialogComponent implements OnInit {
         this.accountSizeUsd.set(acctSize);
         this.initialAccountSizeUsd.set(acctSize);
 
-        // Stored as a fraction (0.02); UI shows percent (2)
-        const maxTradeFrac = user.max_trade_percentage ?? 0.02;
-        const maxTradePct = +(maxTradeFrac * 100).toFixed(4);
+        // Stored as a PERCENT: risk_manager.py:71 reads this value and then
+        // divides by 100, so 2.0 means 2%. This used to treat it as a fraction
+        // — multiply by 100 on read, divide on write — which made the DB's 2.0
+        // display as 200%, and made typing 45 save 0.45 that the engine then
+        // read as 0.45%. Position sizing silently collapsed to zero contracts.
+        const maxTradePct = user.max_trade_percentage ?? 2;
         this.maxTradePercentage.set(maxTradePct);
         this.initialMaxTradePercentage.set(maxTradePct);
 
@@ -324,8 +327,8 @@ export class ProfileDialogComponent implements OnInit {
       update.account_size_usd = this.accountSizeUsd();
     }
     if (this.maxTradePercentage() !== this.initialMaxTradePercentage()) {
-      // Backend stores as a fraction
-      update.max_trade_percentage = +(this.maxTradePercentage() / 100).toFixed(6);
+      // Stored as a percent — see the note in the load path.
+      update.max_trade_percentage = this.maxTradePercentage();
     }
 
     const winChanged =

@@ -8915,3 +8915,509 @@ of that and addresses the mechanism directly.
 
 `api/tests/test_exit_price_no_stale_last.py` — stubs `requests.get`, pins mid / bid / 0.0, and
 reconstructs trade 2929 numerically.
+
+---
+
+## Session Date: August 27, 2026 — The adoption race: a flat scalper still owns its contract
+
+**Scope: one predicate, `_adoptable_broker_options`.** A defect introduced by the 2026-08-26
+put-support work, caught in live paper trading the next day.
+
+### 1. What happened
+
+Strategy 3 (calls) cycled **100 round trips** on `SPY260827C00770000`, ~5s holds with ~30s flat
+between them. Strategy 4 — the **put** strategy — adopted that **call** at 18:38:35, tried to close
+it, failed the broker preview eight times, and booked a phantom **−$36** as "Closed externally". It
+never bought a put all day.
+
+### 2. Why
+
+The ownership filter declined a contract only when another active strategy had an **open** row
+(`Position.qty > 0`). A scalper is flat between every round trip. Strategy 3 closed at 18:37:53, its
+row went to `qty=0`, the broker had not yet caught up — and in that gap strategy 4's reconcile saw a
+holding that "no active strategy owns" and took it. With ~30s flat per cycle, that window opened
+about a hundred times a day.
+
+The `qty > 0` condition was inherited from the version of the filter that only had to stop two
+strategies *simultaneously holding*. Once adoption became the exit-rescue path (2026-08-26, N2), the
+question it needed to answer changed from "is anyone holding this right now?" to "**does this
+contract belong to anyone?**" — and those differ precisely when the owner is between trades.
+
+### 3. The fix
+
+Drop `qty > 0`. A row for this contract on a still-**running** strategy means the contract is theirs,
+open or flat. If the broker really is holding it, that strategy's own reconcile adopts it back into
+the row it already has — verified by test. Adoption stays pointed at its actual purpose: contracts
+**nobody** tracks.
+
+`is_active` still gates it, so the auto-stop orphan case (owner dead, position live) still adopts.
+
+> Note this is NOT a reason to restore the side filter. A put strategy adopting a call is correct
+> when that call is genuinely orphaned — the alternative is a live contract with no exit manager.
+> The bug was the ownership test, not the absence of a direction test.
+
+### 4. Everything else seen today, not changed
+
+- **~~The stale-`last` exit fix is not running~~ — WRONG, see section 5.** `app.py:158` sets
+  `reload=True`; the Aug-26 process is the reloader *supervisor*, and the server child respawns on
+  every `.py` change. The fix WAS live all day, and the mismatch persisted anyway — which is what
+  led to the real cause.
+- **Entry-side twin of the same problem:** `ORDER_PREVIEW_DRIFT` fired at **+20% to +83%** all day —
+  the engine's sizing price versus what the broker's preview says the order actually costs. The
+  drift check is deliberately observe-only pending a threshold decision (TODO #4, "log the
+  distribution first instead of picking a threshold blind"). The distribution now exists. Left for
+  a deliberate call.
+- **The re-entry cooldown is fine** — 30-80s between close and next buy. The 5s figure is the *hold*
+  time, an effect of the stale-price exits, not a cooldown failure.
+
+Today: −$305 (strategy 3 −$269 over 100 round trips, 19 winners; strategy 4 −$36 phantom).
+
+### 5. The real cause: streamed quotes never expire
+
+Two things I got wrong today, both worth recording.
+
+**Wrong #1 — "the fix isn't deployed."** `api/app.py:158` sets `reload=True` with
+`reload_includes=["*.py"]`. The long-lived process is uvicorn's reloader **supervisor**; the actual
+server is a child that respawns on every source change. I read the supervisor's start time as the
+app's. Verified after the fact: editing an engine file respawned the child 33 seconds later.
+
+**Wrong #2 — the diagnosis.** Since the fix *was* live and 95 of 100 exits still mismatched, the
+stale-`last` REST fallback was not the mechanism. It was real and worth fixing, but it is the
+**second** choice in the exit path and is rarely reached.
+
+The actual cause is the **first** choice. `StrategyMarketState.option_bid` / `option_ask` are
+written when a WebSocket `quote` event arrives — and then believed forever. Nothing expires them.
+A contract that stops quoting freezes its price while the market moves, and `_check_exit_signals`
+*prefers* the streamed bid. So a frozen number was the P&L basis for every TP/SL decision.
+
+Today's numbers back-solve cleanly: take profits claiming **+36.96% / +42.86% / +68.57%** that
+realised **−2.1% / −4.5% / +0.0%**, on a contract decaying from ~0.59 to ~0.35 across the session.
+The claimed figures imply a bid of 0.58–0.64 — exactly where it had quoted much earlier.
+
+**Fix:** `option_quote_at` is stamped on every quote event, cleared by `arm()` and `disarm()`, and
+surfaced as `quote_age_s` in `to_market_data()`. `_check_exit_signals` now treats a streamed quote as
+usable only if it is for this contract **and** younger than `MAX_QUOTE_AGE_SECONDS` (30s), logging a
+warning and falling through to REST otherwise. The REST path is where yesterday's fix now earns its
+keep: it returns a real mid, a real bid, or 0 to skip the tick — never a stale print.
+
+> **Fourth variant of the same theme, and the sharpest one.** The three earlier cases were the wrong
+> *kind* of price (the underlying), the wrong *contract*, and the wrong *time* on the REST path. This
+> is the wrong time on the **preferred** path — and it hid behind the other three because each guard
+> that was added checked identity, never freshness. `drift_checked_at` existed for the contract-drift
+> check; nothing tracked quote age, in an engine whose every exit decision is a price comparison.
+
+---
+
+## Session Date: August 27, 2026 (Part 2) — Loose ends from the last two days
+
+Things established on 26–27 August that the entries above do not capture. No code changes here
+except where noted.
+
+### 1. Does direction actually have an edge? An 8-day replay says no
+
+The put work proved the *plumbing*. It said nothing about whether the signals are any good, so both
+strategies were replayed over real SPY 1-minute bars (Tradier `/markets/timesales`, `session_filter=open`)
+across 8 sessions: 08-14, 08-17, 08-18, 08-19, 08-20, 08-21, 08-24, 08-25. Each bar was fed to
+`check_entry_signal` with the ET clock frozen to that bar's timestamp, using the live strategy params
+(9EMA + VWAP, volume spike 2x, confirmation required, 30-min open blackout, 15-min EOD cutoff).
+
+**Mechanically correct — 114 signals, zero wrong-side.** Every CALL signal fired with price above the
+9EMA, every PUT below it. That is the C1 fix holding on real data at scale, not just in unit tests.
+
+**No directional edge, on either side:**
+
+| | signals | moved the right way | avg 15-min move |
+|---|---|---|---|
+| CALL | 40 | 13 (32%) | **−0.148 pts** |
+| PUT | 74 | 31 (42%) | **+0.100 pts** |
+
+Read the signs: after a *call* signal price fell on average; after a *put* signal it rose. Both sides
+are mildly **anti**-predictive — a mean-reversion signature under a momentum-shaped entry. Note also
+all 8 sessions closed net down (−0.34 to −3.50), a tape that should have flattered the put side, and
+it still averaged the wrong way.
+
+Caveats, so this is not over-read: 15 minutes is an arbitrary horizon and not how the strategy
+actually exits; the measure is the **underlying's** move, not option P&L; and 8 sessions is small.
+But it is evidence against the premise, and it was gathered before the exit-pricing bugs were
+understood — so it is independent of them.
+
+The replay script is not in the repo (scratchpad only). Worth rebuilding as a proper tool if
+parameter research starts in earnest.
+
+### 2. `delta_min/max` and `min_open_interest` are in structural tension
+
+Flagged on 08-26, quantified on 08-27. Neither strategy could arm a contract for most of the session:
+
+```
+CALLS in the 0.60-0.85 delta band (3 contracts):
+   strike=762  delta=0.846  OI=2048   spread=0.8%
+   strike=763  delta=0.784  OI=1382   spread=0.7%
+   strike=764  delta=0.699  OI=2517   spread=0.9%
+PUTS  (3 contracts):
+   strike=769  delta=0.823  OI=1063   spread=0.8%
+   strike=768  delta=0.739  OI=1859   spread=1.0%
+   strike=767  delta=0.636  OI=2699   spread=0.9%
+```
+
+All below `min_open_interest: 3000`. Meanwhile the deepest liquidity on the same chain sat
+at-the-money: `SPY260826P00765000` carried **OI 37,368** at delta 0.447 — an order of magnitude more
+than anything in the band.
+
+**This is structural, not a thin day.** Open interest concentrates around the money; a 0.60–0.85
+delta band selects in-the-money strikes, which always carry less. The two constraints therefore
+fight by construction, and whether the engine can trade at all on a given day depends on spot
+happening to sit near a strike satisfying both. Spreads were 0.8–1.0% throughout — liquidity is
+genuinely fine, it is specifically the OI *number* falling short.
+
+**Deliberately not changed.** The user's call: *"We set that for a reason and we can adjust strats
+with more research."* Correct call — lowering a risk parameter to manufacture trades is a bad reason.
+
+> Tradier's chain endpoint returns only *current* OI, so how often this pair admits a contract cannot
+> be reconstructed from history. Answering it needs forward sampling — log band membership and OI
+> every few minutes across a few sessions.
+
+### 3. Discord notifications: semantic tones (user's work)
+
+`api/notifications/discord.py` was refactored to look up colour **and** title marker together from a
+single `_TONES` table (`SUCCESS`/`LOSS`/`FLAT`/`INFO`/`WARNING` → colour + 🟢🔴⚪🔵🟡), replacing the
+three loose `_COLOR_*` constants. A message can no longer carry a green bar with a red dot: pick the
+tone that describes the outcome and the styling follows. Adds `_FLAT_EPSILON = 0.005` so a
+break-even close reads as flat rather than an arbitrary win or loss. Mirrors the UI's P&L language,
+which is why an *open* is blue rather than green — it has no outcome yet.
+
+Included in commit `1f1950c` by accident (see §5).
+
+### 4. The engine runs against the shared DEV database — from a process this session did not start
+
+Worth stating plainly because it shaped two wrong conclusions on 08-26. The API runs from this repo
+with `reload=True` against `DATABASE_DEV_URL`, which is the shared RDS instance. Consequences:
+
+- Editing an engine file **changes live behaviour within seconds** — the reloader respawns the server
+  child. There is no separate deploy step, and no staging boundary.
+- DB edits (a strategy's `params_json`, activating a strategy) are picked up by the running worker on
+  its next 60s refresh.
+- A `pgrep` for `uvicorn` finds nothing: the entrypoint is `python app.py`, and the workers are
+  reloader-spawned children. Checking for "is the engine running" needs `pgrep -f app.py`, and the
+  **child's** start time is the one that reflects the loaded code, not the supervisor's.
+
+### 5. Process notes
+
+- **`git add -A` bundled the user's uncommitted `discord.py` work into `1f1950c`**, a commit whose
+  message describes only the exit-pricing fix. Kept at the user's request rather than split. Stage
+  explicit paths.
+- **Commits and pushes both require asking first.** `origin/dev` deliberately still sits at
+  `b93e732`; `1f1950c` and everything after it is local-only, at the user's request, pending review.
+
+---
+
+## Session Date: August 31, 2026 — "Done for the day" (TODO item D)
+
+### 1. What was built
+
+A standalone halt so ending the session no longer means walking the strategies page and
+deactivating each one. Account-wide, one click, two outcomes.
+
+Clicking **Done for the day** asks exactly one question — what happens to positions that are
+*already open*, since new entries stop either way:
+
+- **`ride`** — entries stop; open positions keep their stop-loss, take-profit, trailing stop and
+  the forced-EOD close. Nothing is sold.
+- **`flatten`** — entries stop **and** everything is closed at market on the next eval tick.
+
+Reachable from the Overview session card and from the toolbar on every page; both read one shared
+signal in `RiskService`, so stopping from either surface updates both.
+
+### 2. The design decision that kept it small
+
+`flatten` is not a new code path. It is expressed as a **bound on the forced-exit time** inside
+`forced_exit_time_et` — when the halt is live in flatten mode, the forced exit is due *now*. Every
+existing consumer then does the work it already did: the exit signal (`check_exit_signal` step 5),
+the unpriced-contract market close (`strategy_executor.py:466`), and the entry cutoff
+(`check_entry_signal`). The close it produces is the same forced-EOD close that runs every
+afternoon and is the most-exercised exit in the system.
+
+So: **no new order path, and no router that places orders.** Worth stating because the obvious
+implementation — a `POST /positions/close-all` that loops `order_manager.close_position` — would
+have put order placement in a request handler, racing the worker's own 1s eval tick for the same
+position.
+
+`DELETE /positions/{id}` was a trap worth noting: it deletes the DB row and never sells anything.
+It is not a close.
+
+Most-restrictive-bound holds. `current_et` is by construction no later than any other candidate, so
+the halt can only pull the exit **earlier**. When we are already past the EOD bound the more
+specific EOD reason survives into the trade record — tested.
+
+### 3. One predicate, two readers
+
+`utils.market_hours.trading_halt_state(user)` is the only thing that reads the two columns
+together. The risk manager reads it to reject entries; the signal generator reads it to decide
+whether the forced exit is due. Written once so they cannot disagree about whether trading is
+stopped — the same shape as the shared held-position predicate in `96549e6`.
+
+It is duck-typed (`getattr`), so `market_hours` keeps its zero dependency on `models`.
+
+Two deliberate defaults:
+- **An unrecognised mode falls back to `ride`**, the non-destructive one. A bad string must never
+  be the thing that decides to market-sell the book.
+- **The stamp is a DATE, not a boolean.** `User.trading_halted_on` holds the ET market date, so the
+  halt expires by itself at the next ET midnight — the same boundary the daily-loss cap uses. A
+  boolean would need something to clear it, and the only processes running overnight are the ones
+  the halt exists to restrain.
+
+Entries-only, both modes. **Sells are never blocked** — a halted account must always retain a path
+out of what it holds. Gated on `require_can_write_own`, not `require_can_place_orders`: a role that
+may not open trades must still be able to stop them.
+
+The manual halt is reported *beside* `risk_status`, not folded into it. "The cap stopped you" and
+"you stopped yourself" are different facts and the tile says something different for each; folding
+them would render a deliberate, healthy decision as a risk breach. `entries_halted` is the OR, and
+stays the one field to ask "can we open anything right now".
+
+### 4. I took the API down for ~20 minutes, and the reason is worth writing down
+
+`api/app.py` sets `reload=True`. Editing `models.py` respawned the server child **immediately** —
+with two columns that did not exist in the database yet. Every `SELECT users.*` started failing;
+login returned 500 instead of 401. Both DEV and PROD.
+
+This is §4 of the 08-27 entry ("editing an engine file changes live behaviour within seconds")
+biting from the other direction. The known hazard was *behaviour* changing before it was reviewed.
+The one that actually landed was a **schema/model skew**: a model edit is live in seconds, but the
+migration is a separate manual step, so there is a window where the running code queries columns
+that do not exist. Nothing warns you.
+
+Market was closed (~01:00 ET), so no trading impact. Fixed by `alembic upgrade head` on DEV — it
+was stamped at `d4a1b2c3e8f9`, exactly `e6f4a2b8c1d7`'s parent, so it applied only this migration —
+and a raw `ALTER TABLE users ADD COLUMN` on PROD, which has no `alembic_version` table because
+`create_all` built it.
+
+Afterwards PROD was brought under alembic with `alembic stamp head` — honest to do because a
+column-by-column diff showed DEV and PROD identical, and DEV genuinely reached `e6f4a2b8c1d7`
+through the chain. No DDL; it writes one bookkeeping row. Both DBs now report `e6f4a2b8c1d7 (head)`
+with nothing pending, so a future column add is `alembic upgrade head` against each, and the
+hand-written PROD `ALTER` is retired.
+
+This does **not** close the older debt: neither DB was built by alembic and `system_events` still
+has no migration, so `upgrade head` on a *fresh* database still won't reproduce this schema.
+Stamping made PROD exactly as accurate as DEV already was. Backfilling the chain is worth doing the
+next time a database is provisioned from scratch, with the schema in front of you — not
+speculatively.
+
+**The rule this earns:** when adding a column, apply the migration *before* saving the model, not
+after. The reloader does not wait for you.
+
+### 5. Verification
+
+`api/tests/test_trading_halt.py` — 22 assertions, all passing: predicate truth table (including
+that yesterday's and tomorrow's stamps are both ignored, and that a garbage mode degrades to
+`ride`), buy rejected / **sell allowed** in both modes, `ride` leaving the exit time and reason
+byte-identical, `flatten` pulling the exit to now, and `flatten` failing to push an exit later when
+already past EOD.
+
+Also verified against a real ORM `User` loaded from DEV (columns map, gate behaves) — in memory,
+rolled back, nothing persisted. Existing engine tests re-run and unaffected. UI builds clean.
+
+`test_market_hours.py` fails standalone on a pre-existing `sys.path` issue of its own; it passes
+with `PYTHONPATH=api`. Not related to this change.
+
+### 6. Not done
+
+**Never exercised against a live session.** `flatten` has only been tested at the predicate level.
+The close it triggers is the well-worn forced-EOD path, but the *trigger* has not fired on real
+market data — that wants a paper session with an open position.
+
+---
+
+## Session Date: August 31, 2026 (Part 2) — B1/B2, and what the drift metric actually measures
+
+### 1. The entry path never expired its quotes
+
+The 2026-08-27 fix added `quote_age_s` / `MAX_QUOTE_AGE_SECONDS` to `_check_exit_signals`. The
+**entry** sizing block (`strategy_executor.py:305`) read the same streamed `bid`/`ask` with no age
+check at all, so a contract that stopped quoting sized orders off a frozen price. Sixth variant of
+the same theme; the guard was written once and applied to one of the two consumers.
+
+Now fixed, and deliberately narrow. `arm()` clears the quote stamp and bid/ask together, so
+`quote_age_s is None` implies `ask == 0`, which the old code already skipped. Behaviour is therefore
+byte-identical except in exactly one case — a quote that exists and has gone stale — where entry now
+prices from REST, or skips the tick if REST has nothing either. A fresh but one-sided book still
+skips, unchanged, so the change cannot introduce over-sizing.
+
+Blast radius is confined to order size: `sizing_price` feeds `calculate_position_size`, the
+`validate_pre_trade` sanity check, and the drift event. It does **not** touch `avg_entry_price`,
+which comes from the fill — so this cannot alter stop-loss, take-profit or P&L.
+
+### 2. Exit-drift logging (B1) — wired
+
+`close_position` now takes `signal_price` and passes it to the preview it was already running, and
+the emit site no longer hard-skips sells. `exit_price` is the right value to pass: it is the price
+the exit decision was actually made on, post-freshness-guard. The forced-exit-without-a-price branch
+passes `None` — there is nothing to compare when the whole point is that no price exists.
+
+One honest gap: **`order_cost`'s sign on a sell is undocumented.** `docs/tradier/trading/preview_order.md`
+shows only a buy example. Rather than guess, the per-contract figure uses the magnitude and
+`event_data.order_cost_raw` records the signed value, so the convention gets read off the first real
+sells. Verify that before trusting an exit-drift number.
+
+### 3. The drift metric has never measured slippage — and I got the reason wrong once first
+
+Ran the distribution B2 has been waiting on: 851 usable events since 07-14, p5 −46.4%, p50 −1.7%,
+p95 +62.7%. Symmetric, and 20–40× the 0.8–1.0% spreads recorded on 08-27. Neither of those is what
+slippage looks like — slippage is one-sided and about the size of the spread.
+
+My first read was that our streamed mid was stale and the preview was accurate: joined to the fill
+that followed, the preview was within 1% of it 71% of the time while our signal price was within 1%
+only 1% of the time.
+
+**That conclusion was wrong, and the reason is worth recording.** `selected_trading_mode` is
+`paper`, so `get_client()` returns the **sandbox** client — the preview AND the fill are both
+sandbox, while `signal_price` is a **live** streamed mid (market data always comes from the live
+endpoint). "Preview matches fill" is sandbox agreeing with itself. The 25% gap is the sandbox↔live
+fabrication gap already documented under FUTURE CONSIDERATIONS, and it is indistinguishable from
+staleness in this dataset.
+
+So the 07-14 `signal.price` bug was not the only thing poisoning this well, and fixing it did not
+restart B2's clock the way the note claimed. **Every fill in the dataset is fabricated.** The
+"27% of orders would have been sized differently" figure I derived is contaminated the same way —
+discard it.
+
+The lesson is the one the journal already contains and I did not apply before computing: no metric
+derived from a sandbox fill means anything. It applies to execution quality exactly as it applied to
+win rate and Sharpe.
+
+### 4. Where that leaves B1 and B2
+
+**B2 is blocked on live fills, not on a threshold decision and not on a code change.** Picking a
+threshold off this data would cancel trades because our two price sources live in different
+universes. A +20% rule would have killed 31% of entries for a non-reason.
+
+**B1's instrumentation is done and its analysis is blocked the same way.** The value of wiring it
+now is that the first live session produces both sides of the measurement instead of one.
+
+The entry guard stands on its own as a correctness fix — the exit path proved that field freezes,
+and the entry path was exposed to the identical failure. It just cannot be *measured* in sandbox.
+
+### 5. Verification
+
+`api/tests/test_entry_quote_freshness.py` — 11 assertions, all passing, pinning the narrowness of
+the change specifically: never-quoted still skips, fresh still uses the stream mid, the 30s boundary
+does not fire early, a fresh one-sided book still skips, re-arming resets. Full engine suite re-run
+and unaffected.
+
+(`test_worker_integration.py` fails standalone on a pre-existing import of `SessionLocal`, renamed
+to `SessionLocals` by the multi-environment refactor. Untouched by this work.)
+
+---
+
+## Session Date: September 2, 2026 (evening) — The trailing stop that could never fire
+
+Started as "what is a trailing stop" and turned into finding that ours has never executed once,
+for two independent reasons, and that the fix recorded in the morning's write-up would not have
+worked.
+
+### 1. What was actually wrong
+
+`signal_generator.check_exit_signal` evaluated take profit → stop loss → trailing → max hold →
+time of day, each branch returning immediately. Prod strategy 3 runs `trailing_stop=true,
+activation=15, distance=10, take_profit=25`. Two defects sat on top of each other:
+
+**(a) Arming was not latched.** The activation test read the LIVE `pnl_pct` every tick, not the
+peak. So the trail switched itself off during the very pullback it exists to catch. The stop level
+is `peak * 0.90`; at a +15% peak that is +3.5%, below the 15% the branch re-checked, so the exit
+could not fire until the peak reached `1.15 / 0.90` = **+27.8%**. The parameter named
+`trailing_stop_activation: 15` behaved like 27.8.
+
+**(b) The flat target got there first.** Take profit fires on the way UP, at the tick price first
+crosses +25%, when no pullback yet exists for the trail to react to. The position is sold before
+the trail has anything to do.
+
+### 2. Why the recorded fix (S1a, "reorder") does not work
+
+`docs/live-test-results-2026-09-02.md` §S1(a) and TODO E1 both proposed evaluating the trail ahead
+of the target. Checked against the actual 09-02 ticks, that changes nothing:
+
+```
+3.27 entry -> 4.68 tick:  peak 4.68, trail stop 4.21, current 4.68 > 4.21  -> trail silent
+                          pnl +43% >= 25%                                  -> take profit SELLS
+```
+
+At the tick where the target fires there has been no pullback, so the trail is not hit and control
+falls through to the target regardless of which is checked first. For both to be true on one tick
+the peak must reach `1.25 / 0.90` = +38.9%, which the target already prevented the position from
+reaching. A flat target and a trail are mutually exclusive above the activation threshold; one of
+them has to stand down. Reordering is not that.
+
+### 3. What shipped
+
+Order is now **SL → trail → TP → max hold → time of day**, with two real changes:
+
+- Arming latches on `position.peak_price` / `trough_price` — the held contract's extremes since
+  open, which `strategy_executor.py:544` already maintains (and which must never be the
+  underlying's daily range, per the 08-27 note there).
+- **The flat take profit stands down while the trail is armed.** This is the half that makes the
+  feature reachable at all.
+
+Stop loss moved to first and is otherwise untouched: a position that arms and then collapses exits
+on the stop, not the trail. Below activation, and with `trailing_stop` unchecked, behaviour is
+identical to before — **unchecking the box is the revert**, live within ~30s via
+`db.refresh(strategy)`, no deploy.
+
+Arming compares with a `1e-9` tolerance. `(2.30 - 2.00) / 2.00` is `14.999999999999998`, so a peak
+of exactly the activation percentage failed to arm depending on binary representation.
+
+### 4. The trade-off, stated honestly
+
+On strategies 3 and 4 (activation 15, TP 25/30) the flat target is now **dead** — any position that
+arms the trail exits on the trail. Modelled on `SPY260903C00765000` at 2.14, two contracts:
+
+| Path | Old | New |
+|---|---|---|
+| peak < +15% | unchanged | unchanged |
+| −15% | stop, −$64 | stop, −$64 |
+| peak +15%, fades | no exit; rides to SL or 15:45 | trail exits 2.21, +$15 |
+| peak +25%, reverses hard | TP 2.675, **+$107** | trail 2.41, **+$54** |
+| runs to +50% | TP 2.675, +$107 | trail 2.89, **+$150** |
+
+The worst case has a floor: a position that touches +25% and immediately reverses collects +12.5%
+instead of +25%, never worse, because the trail is always 10% off a peak of at least +25%.
+Everything below +25% is unchanged or better — the old code had no exit at all between the stop and
+the target. Untested risk: 10% of a $2.14 contract is 21¢ against a 14¢ spread, so a noisy quote
+can trip the trail. All three exits on 09-02 were orderly, so there is no data on this yet.
+
+### 5. Verification
+
+`api/tests/test_trailing_stop_arming.py` — 18 cases: arm/disarm boundaries including the exact
+activation edge, the 09-02 runner replayed tick by tick, the target correctly staying silent while
+armed, stop-loss precedence over an armed trail, shorts mirrored off the trough, and the
+trail-disabled regression. `test_exit_price_no_stale_last`, `test_direction_and_side_gate`,
+`test_trading_halt`, `test_entry_quote_freshness`, `test_position_gates` all pass.
+`test_market_hours` needs `PYTHONPATH=api` to import at all — pre-existing, passes once set.
+
+UI: the Take Profit field now carries a hint, shown only when the trail is enabled, saying the
+target is ignored once the trail arms.
+
+### 6. Readiness check for 09-03, and three things it turned up
+
+`morning_check.py --env PROD` clean — flat, no orphan broker holdings, no duplicate rows. Equity
+$1,202.46 (+$143). Both strategies active with `direction` set.
+
+- **Settled cash read $13.46** at 22:00 PT with `unsettled_funds: 0` — the same figure the results
+  doc recorded at 11:48 ET, so the field had not refreshed since. T+1 should free the full $1,202
+  overnight. Unverified; if it still reads $13.46 before the open, the session repeats 09-02's 214
+  rejected previews and trades nothing.
+- **Puts likely cannot trade tomorrow.** Against the 3000 OI floor on tonight's chain: calls have 2
+  qualifying strikes (766 at OI 3373, 765 at OI 3081), puts have **zero** (best in band 1693). The
+  exact mirror of 09-02, when only puts qualified and strategy 4 had to be created.
+- **The account WS stream is connected to sandbox** (`wss://sandbox-ws.tradier.com`) while orders
+  route live — the client picks the host from its own env (`client.py:337`), and
+  `selected_trading_mode` governs order placement independently. Fills confirm via REST polling
+  instead. They reconciled correctly on 09-02, so this is latent, not broken.
+
+### 7. Operational note: `reload=True` hot-swaps the engine
+
+`app.py:158` runs uvicorn with `reload=True` and `reload_includes=["*.py"]`. The live-configured
+process from the 09-02 session was still up (started Sep 1 23:48), and its reload worker restarted
+at **17:23:37** — the exact second `signal_generator.py` was written. The exit logic changed
+underneath a running live process. Market was closed, so nothing traded on it, but the rule this
+implies is worth writing down: **do not edit `.py` files while the market is open.** It hot-swaps
+engine code under an open position.

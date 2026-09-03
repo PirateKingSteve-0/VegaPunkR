@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, Boolean, ForeignKey, DateTime, JSON, Float, func
+from sqlalchemy import Column, Integer, String, Boolean, Date, ForeignKey, DateTime, JSON, Float, func
 from sqlalchemy.orm import relationship
 from sqlalchemy.ext.declarative import declarative_base
 
@@ -26,6 +26,21 @@ class User(Base):
     # normally (entries-only halt — force-closing converts paper drawdown
     # into realized).
     daily_loss_limit_pct = Column(Float, default=5.0)
+
+    # Account-wide "done trading for today" halt. Stamped with the ET market
+    # date rather than a boolean so it expires by itself at the next ET
+    # midnight — the same day boundary the daily-loss cap uses. Nothing has to
+    # remember to clear it, which matters because the only processes running
+    # overnight are the ones the halt exists to restrain.
+    #
+    # `trading_halt_mode` decides what happens to positions that are already
+    # open. Both modes block new entries; only 'flatten' closes anything.
+    #   'ride'    - leave them to SL / TP / trailing / forced-EOD (default)
+    #   'flatten' - close everything now, at market
+    # NULL date means not halted. See utils.market_hours.trading_halt_state,
+    # which is the only thing that should read these two columns together.
+    trading_halted_on = Column(Date, nullable=True)
+    trading_halt_mode = Column(String, nullable=True)
 
     # Environment and trading mode selection (for multi-database and API switching)
     selected_environment = Column(String, default='dev')  # 'dev', 'test', or 'prod'

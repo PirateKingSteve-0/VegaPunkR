@@ -27,7 +27,7 @@ from auth import (
 )
 from database import get_db
 from models import Position, Strategy, Trade, User
-from utils.market_hours import user_day_start_utc
+from utils.market_hours import trading_halt_state, user_day_start_utc
 from schemas import (
     PerformanceMetricsResponse,  # noqa: F401 - kept for future per-user metrics endpoint
     PositionResponse,
@@ -205,6 +205,8 @@ def get_user_dashboard(
     else:
         risk_status = "OK"
 
+    trading_halted, trading_halt_mode = trading_halt_state(user)
+
     open_positions = db.query(Position).filter(
         Position.user_id == user.id,
         Position.qty > 0,
@@ -242,7 +244,12 @@ def get_user_dashboard(
             "daily_loss_remaining": max(0.0, daily_loss_limit - loss_consumed),
             "pct_consumed": pct_consumed,
             "risk_status": risk_status,
-            "entries_halted": risk_status == "HALTED",
+            # Mirrors get_account_risk_status: a manual halt is reported
+            # separately from the loss-cap status, but both block entries, so
+            # an admin reading `entries_halted` alone still gets the truth.
+            "trading_halted": trading_halted,
+            "trading_halt_mode": trading_halt_mode,
+            "entries_halted": risk_status == "HALTED" or trading_halted,
         },
         "counts": {
             "active_strategies": active_strategies,

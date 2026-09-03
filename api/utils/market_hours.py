@@ -7,8 +7,8 @@ and early closes). Falls back to local pytz logic if the API is unavailable.
 """
 
 import logging
-from datetime import datetime, time
-from typing import Dict, Optional
+from datetime import date, datetime, time
+from typing import Any, Dict, Optional, Tuple
 
 import pytz
 
@@ -64,6 +64,62 @@ def user_day_start_utc(timezone_name: Optional[str], now_utc: Optional[datetime]
     now_local = now.astimezone(tz)
     start_local = tz.localize(datetime(now_local.year, now_local.month, now_local.day, 0, 0, 0))
     return start_local.astimezone(pytz.utc).replace(tzinfo=None)
+
+
+# Modes for the account-wide "done trading today" halt (`User.trading_halt_mode`).
+# Both block new entries; they differ only in what happens to positions that are
+# already open when the user calls it a day.
+HALT_MODE_RIDE = 'ride'          # let SL / TP / trailing / forced-EOD close them
+HALT_MODE_FLATTEN = 'flatten'    # close everything now, at market
+HALT_MODES = (HALT_MODE_RIDE, HALT_MODE_FLATTEN)
+
+
+def current_market_date_et(now_utc: Optional[datetime] = None) -> date:
+    """Today's date on the US/Eastern calendar — the market day.
+
+    The halt is stamped with this rather than a boolean so it expires on its
+    own at the next ET midnight. A flag would have to be cleared by something,
+    and the only things running overnight are the very processes the halt is
+    meant to restrain.
+    """
+    now = now_utc or datetime.utcnow()
+    if now.tzinfo is None:
+        now = pytz.utc.localize(now)
+    return now.astimezone(ET).date()
+
+
+def trading_halt_state(
+    user: Any,
+    now_utc: Optional[datetime] = None,
+) -> Tuple[bool, Optional[str]]:
+    """Is this user halted for the current market day, and in which mode?
+
+    Returns ``(halted, mode)``. Single source of truth for the halt: the risk
+    manager reads it to reject entries and the signal generator reads it to
+    decide whether the forced exit is due immediately. Written once here so
+    those two can never disagree about whether trading is stopped.
+
+    Uses ``getattr`` so this module keeps its zero dependency on ``models`` —
+    the same reason ``forced_exit_time_et`` takes a duck-typed user.
+
+    A stamp for any date other than today is treated as not halted: the halt
+    covers one session and expires with it. An unrecognised mode falls back to
+    ``ride``, the non-destructive one — a bad string must never be the thing
+    that decides to market-sell the book.
+    """
+    if user is None:
+        return (False, None)
+    halted_on = getattr(user, 'trading_halted_on', None)
+    if halted_on is None:
+        return (False, None)
+    if isinstance(halted_on, datetime):
+        halted_on = halted_on.date()
+    if halted_on != current_market_date_et(now_utc):
+        return (False, None)
+    mode = getattr(user, 'trading_halt_mode', None)
+    if mode not in HALT_MODES:
+        mode = HALT_MODE_RIDE
+    return (True, mode)
 
 
 class MarketHours:

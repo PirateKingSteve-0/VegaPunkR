@@ -11,10 +11,13 @@ import { MatDividerModule } from '@angular/material/divider';
 import { MatChipsModule } from '@angular/material/chips';
 import { MatSlideToggleModule } from '@angular/material/slide-toggle';
 import { MatDialog, MatDialogModule } from '@angular/material/dialog';
+import { MatTooltipModule } from '@angular/material/tooltip';
 import { AuthService } from '../../services/auth.service';
 import { SystemService, EnvironmentSettings } from '../../services/system.service';
 import { ThemeService } from '../../services/theme.service';
 import { ProfileDialogComponent } from '../../components/profile-dialog/profile-dialog.component';
+import { TradingHaltDialogComponent } from '../../components/trading-halt-dialog/trading-halt-dialog.component';
+import { RiskService } from '../../services/risk.service';
 
 @Component({
   selector: 'app-dashboard',
@@ -31,7 +34,8 @@ import { ProfileDialogComponent } from '../../components/profile-dialog/profile-
     MatDividerModule,
     MatChipsModule,
     MatSlideToggleModule,
-    MatDialogModule
+    MatDialogModule,
+    MatTooltipModule
   ],
   templateUrl: './dashboard.component.html',
   styleUrls: ['./dashboard.component.scss']
@@ -42,6 +46,11 @@ export class DashboardComponent implements OnInit {
   private router = inject(Router);
   private dialog = inject(MatDialog);
   protected themeService = inject(ThemeService);
+  private riskService = inject(RiskService);
+
+  /** Shared with the Overview session card via RiskService, so stopping
+   *  trading from either surface updates both. */
+  haltStatus = this.riskService.haltStatus;
 
   currentUser$ = this.authService.currentUser$;
   isSidenavOpen = signal(true);
@@ -80,6 +89,13 @@ export class DashboardComponent implements OnInit {
 
   ngOnInit() {
     this.loadEnvironmentSettings();
+    // Seed the shared halt signal once for the whole shell — the toolbar
+    // control needs it on every page, not just after Overview has loaded.
+    // Failure is non-fatal: the control just renders as "not halted", and the
+    // backend gate is the real boundary regardless of what the toolbar shows.
+    this.riskService.getTradingHalt().subscribe({
+      error: (err) => console.error('Failed to load trading halt state:', err),
+    });
   }
 
   loadEnvironmentSettings() {
@@ -226,6 +242,21 @@ export class DashboardComponent implements OnInit {
     const mode = this.environmentSettings()?.trading_mode;
     if (!mode) return 'Loading...';
     return mode.charAt(0).toUpperCase() + mode.slice(1);
+  }
+
+  /** Mirrors the backend's `require_can_write_own`: read-only roles never see
+   *  a control the API would reject. */
+  canWrite(): boolean {
+    const role = this.authService.currentUserValue?.role;
+    return role === 'user' || role === 'admin' || role === 'strategy_author';
+  }
+
+  openHaltDialog(): void {
+    this.dialog.open(TradingHaltDialogComponent, {
+      width: '520px',
+      maxWidth: '100vw',
+      autoFocus: false,
+    });
   }
 
   openSettingsDrawer(): void {

@@ -34,6 +34,22 @@ Both items measure "signal price vs realized price" — just on different sides 
 
 ### B1. SPY 0DTE exits drifting past SL on fast moves (and others firing prematurely)
 
+> **2026-08-31 — exit-drift logging is now WIRED.** `close_position` takes a `signal_price` and
+> hands it to the preview, and the emit site in `_preview_or_abort` no longer skips sells. Exits now
+> log `ORDER_PREVIEW_DRIFT` with `side='sell'`, so both halves of the measurement exist. The
+> forced-exit-without-a-price path passes `None` — there is nothing to compare there.
+>
+> `order_cost`'s sign on a SELL is **undocumented** (`docs/tradier/trading/preview_order.md` shows
+> only a buy). The per-contract figure uses the magnitude and `event_data.order_cost_raw` carries
+> the signed value, so the convention can be read off the first real sells instead of assumed.
+>
+> **ANSWERED 2026-09-02 (live): a SELL comes back NEGATIVE.** Buys `+329 +424 +295`,
+> sells `-411 -530 -252`. Magnitude is the per-contract cost; the sign encodes direction.
+> Exit-drift numbers can now be trusted. See `docs/live-test-results-2026-09-02.md` §F4.
+>
+> The categorisation work (cluster exits by reason) is still open, and see the B2 note below on why
+> the data will not mean anything until fills are live.
+
 Observed 2026-05-07 — some SL exits realized at ~50% loss when the configured SL was tighter, while others felt premature. Traced two compounding causes:
 
 - **Late exits:** SL signal evaluates against the option **bid** (`strategy_executor.py:382`); the exit then submits as a market sell (`order_manager.py:342`). On a fast SPY 0DTE drop, price keeps falling between trigger and fill, so realized loss exceeds the trigger %. Compounded by `_EVAL_INTERVAL = 1s` (`stream_driven_worker.py:40`) dropping ticks — by the next allowed eval the bid can already be several % past the threshold.
@@ -42,7 +58,39 @@ Observed 2026-05-07 — some SL exits realized at ~50% loss when the configured 
 - **Add exit-drift logging while you're here:** mirror the entry-drift `ORDER_PREVIEW_DRIFT` event in `close_position` (pass `signal_price` from SL/TP signals). One-line change, feeds directly into B2's cancel-rule data. Held back from the original entry-drift change to keep scope tight; pick it up now.
 - **Possible fixes (after data):** switch SL eval to `(bid+ask)/2` or `(bid+last)/2` instead of bare bid; make `_EVAL_INTERVAL` adaptive (tighter on fast tape); convert SL exits from market to marketable-limit to cap slippage (risk: may not fill in a true gap).
 
-### B2. Preview-based cancel rule for entry drift *(data collection wired 2026-05-09)*
+### B2. Preview-based cancel rule for entry drift *(LIVE DATA IN — probably not needed, see 2026-09-02)*
+
+> **2026-09-02 — the first live fills say the drift was a sandbox artifact.** All six previews of
+> the live session:
+>
+> ```
+> buy   3.27  -> 3.29   +0.61%      sell  4.09 -> 4.11  +0.49%
+> buy   4.225 -> 4.24   +0.36%      sell  5.29 -> 5.30  +0.19%
+> buy   2.94  -> 2.95   +0.34%      sell  2.51 -> 2.52  +0.40%
+> ```
+>
+> Range **0.19%–0.61%** — versus −9% to −12.8% on sandbox 08-27 and +20% to +83% earlier. Exactly
+> as the 08-31 note predicted: the old distribution was measuring the sandbox↔live price-universe
+> gap, not slippage. On live, preview and signal agree to well under a percent.
+>
+> **There may be nothing here to cancel.** Do NOT build the cancel rule on this evidence — a
+> threshold tuned to sandbox noise would reject good entries. Revisit only if live drift ever
+> exceeds a few percent, and size the sample first (n=6 is not a distribution).
+> See `docs/live-test-results-2026-09-02.md` §F5.
+
+
+> **2026-08-31 — the dataset cannot answer this question, and no code change unblocks it.**
+> 851 usable events since 07-14 give a symmetric distribution (p5 −46%, p50 −1.7%, p95 +63%) that is
+> 20–40× the ~1% spreads actually observed. Symmetric and huge is not what slippage looks like.
+>
+> The reason is the one already recorded under FUTURE CONSIDERATIONS: in `paper` mode
+> `get_client()` returns the **sandbox** client, so `preview_per_contract` and the fill are both
+> sandbox numbers while `signal_price` is a **live** streamed mid. The drift is measuring the
+> sandbox↔live price-universe gap, not market slippage. (Preview matches the sandbox fill to a
+> median 0.0% — that is sandbox agreeing with itself, not evidence of accuracy.)
+>
+> **B2 needs live fills.** Same wall as strategy evaluation. Do not pick a threshold off this data —
+> a +20% rule would have cancelled 31% of entries for a reason that has nothing to do with the market.
 
 We need to figure out if we need to preview orders before execution. Whether that would be for slippage or for possible reconsideration in executing a trade for true TP defined. Important clarification: previews already run for buying-power validation (see `_preview_or_abort`); this item is specifically about whether to ALSO use preview output to **cancel** a signal when the preview-vs-signal price drift means the trade no longer pencils out. Per-strategy equity curves now exist (DONE 2026-05-09 Part 5), so the cross-strategy realized-vs-modeled comparison the cancel-rule decision was waiting on is unblocked — pending only that a few weeks of `ORDER_PREVIEW_DRIFT` events accumulate.
 
@@ -60,9 +108,163 @@ We need to add a feature for backtesting data. What im thinking is what if we we
 
 ---
 
-## D. A standalone button so we can say hey we are finishing trading today. As opposed to just deactivating the strategy
+## D. ~~A standalone button so we can say hey we are finishing trading today~~ *(built 2026-08-31)*
 
-I would like to add a button/feature that allows us to pause trading for the day. As of now I would have to go through the strategies page and deactivate the strategy
+"Done for the day" now lives on the Overview session card **and** the toolbar (reachable from
+every page). Clicking it asks one question — what happens to positions that are already open:
+
+- **`ride`** — new entries stop; open positions keep their stop-loss, take-profit, trailing stop
+  and forced-EOD close. Nothing is sold.
+- **`flatten`** — new entries stop **and** the forced exit is brought forward to now, so the engine
+  closes everything at market on its next eval tick.
+
+Account-wide (`User.trading_halted_on` + `trading_halt_mode`, migration `e6f4a2b8c1d7`), stamped
+with the ET market date so it expires by itself at the next ET midnight — the same day boundary the
+daily-loss cap uses. Resumable same-day; re-postable to switch mode.
+
+`utils.market_hours.trading_halt_state()` is the single predicate; the risk manager reads it to
+reject entries and the signal generator reads it to decide whether the forced exit is due, so the
+two cannot disagree. Sells are never blocked. `flatten` is expressed as a bound on the forced-exit
+*time* inside `forced_exit_time_et`, so it reuses the existing EOD close path — no new order path
+was added, and nothing calls `place_order` from a router.
+
+**Remaining:** never exercised against a live session. `flatten` in particular has only been tested
+at the predicate level — the close it triggers is the well-worn forced-EOD close, but the trigger
+itself has not fired on real market data.
+
+### D2. Automatic daily profit target (the upside twin of the loss cap)
+
+Every daily-scoped gate today is downside-only: `_check_user_trading_halt`,
+`_check_user_daily_loss_limit`, `_check_daily_loss_limit`. There is no upside equivalent, so the
+engine keeps opening positions all session no matter how far ahead it is. `take_profit_pct` is
+**per trade** — it closes one position at +30% and immediately hunts the next entry.
+
+That asymmetry matters most on exactly the strategy we run: a scalper doing dozens of round trips
+can give a good morning back by 3pm and nothing stops it. The 2026-09-01 paper session did 64
+round trips in four hours.
+
+D1's manual halt is the current substitute — `ride` mode banks the day by hand. This item is the
+automatic version.
+
+**Shape (deliberately mirrors the loss cap, opposite sign):** read `daily_profit_target_pct` off
+the user row, compute `today_pnl` the same way `_check_user_daily_loss_limit` does (realized
+`Trade.pnl` + unrealized, anchored to the ET market day via `market_day_start_utc()`), and block
+`side='buy'` once it exceeds the target. **Sells stay open** — exits are sacred, and a position
+open when the target trips must still reach its own stop/target/EOD.
+
+**Do NOT build this the night before a live run.** Raised 2026-09-01 while prepping the 09-02 live
+test and explicitly deferred: adding an untested gate to the entry path hours before the first
+real-money session means debugging your own change instead of measuring fills. Build it once there
+is live data to size the target against.
+
+---
+
+## E. Exit rule structure *(from the 2026-09-02 live session)*
+
+Full write-up: `docs/live-test-results-2026-09-02.md`.
+
+### E1. The trailing stop is unreachable by construction *(structural bug)*
+
+> **2026-09-02 — FIXED, and option (a) as written below does NOT work.** Reordering the branches
+> changes nothing: the flat target fires on the way UP, at the tick price first crosses +25%, when
+> no pullback yet exists for the trail to be hit by. At that tick the trail falls through and the
+> target sells regardless of which is checked first. For both to be true on one tick the peak must
+> reach 1.25/0.90 = +38.9%, which the target already prevented the position from reaching.
+>
+> What shipped instead — `signal_generator.check_exit_signal`, order now SL → trail → TP:
+> 1. **Arming latches on the peak.** It re-tested the live `pnl_pct` every tick, so the trail
+>    switched itself off during the pullback it exists to catch; nothing could fire below a peak of
+>    1.15/0.90 = **+27.8%**, not the +15% configured. Now armed off `position.peak_price` /
+>    `trough_price` (with a 1e-9 tolerance — `(2.30-2.00)/2.00` is 14.999999999999998).
+> 2. **The flat take-profit stands down while the trail is armed.** The two rules are mutually
+>    exclusive above the activation threshold; the target has to yield or the trail cannot govern.
+>    Consequence on strategy 3 (`activation 15`, `take_profit 25`): the target is now dead — every
+>    position that arms the trail exits via the trail.
+>
+> Stop loss is untouched and still outranks the trail. Below activation, and with `trailing_stop`
+> unchecked, behaviour is identical to before — **unchecking the box in the strategy form is the
+> revert**, live within ~30s via `db.refresh(strategy)`, no deploy. Tests:
+> `api/tests/test_trailing_stop_arming.py` (18 cases: arm/disarm boundaries, the 09-02 runner
+> replay, SL precedence, shorts, trail-off regression).
+
+Prod strategy 3 is configured `trailing_stop=true, activation=15%, distance=10%,
+take_profit=25%`. `signal_generator.check_exit_signal` evaluates in a fixed order, each branch
+returning immediately:
+
+```
+1. take profit    (25%)   -> return
+2. stop loss      (15%)   -> return
+3. trailing stop  (arms at 15%)   <- never reached
+4. max hold time
+```
+
+The trail arms at +15% but take profit fires at +25% and returns first, so **any position that
+would arm the trail is sold before the trail can act.** It has never executed and cannot at these
+numbers. A configured feature that is dead code — not a tuning preference.
+
+**Fix options.** (b) is preferred as the first move: it is a data change, reversible from the
+portal, needs no code, and is therefore testable without touching the exit path.
+
+- **(a) Reorder** — evaluate trailing before the flat target. Once up 15% the trail governs and the
+  flat 25% only fires on a gap through it. Changes behaviour most aggressively.
+- **(b) Raise `take_profit_pct`** above the trail's useful range (e.g. 60%), leaving the trail as
+  the normal exit and the target as a ceiling.
+
+**What it affects — this is a real trade-off, not a free win.** Winners run further and exit below
+their peak; hold time rises; round-trip count falls. But a position that reaches +15% and then
+reverses now exits near +5% instead of at +25%, converting some current winners into smaller ones.
+Every exit the engine makes is affected, so it wants tests, not a quick edit.
+
+**Evidence (2026-09-02).** `SPY260902C00760000` ran 3.27 -> session high 6.40. The engine took
++25.7%, immediately re-entered the same contract, and took +24.8% again:
+
+| | settled cash used | P&L | return on cash |
+|---|---|---|---|
+| actual: two 25% round trips | $750 | +$189 | 25% |
+| one position with a working 10% trail (exit ~5.76) | $327 | ~+$249 | 76% |
+
+The P&L difference is modest (~+$60). **The cost that matters is the cash** — see E2.
+
+### E2. Settled cash is the binding constraint, and the flat target doubles its consumption
+
+The 09-02 session generated **321 entry signals**, executed **3**, and produced **214 rejected
+previews** (`Tradier preview rejected: You do not have enough buying power`). T+1 settlement on a
+cash account: $1,060 settled at the open, $13.46 by 11:48 ET, proceeds unusable until the next day.
+
+No GFV was incurred — every buy was funded from settled cash and the ledger reconciles to the
+broker exactly (results doc §F3). But the ceiling is roughly **three trades per day**, and E1's
+flat target spends two of them on one move.
+
+**Two separate items follow:**
+
+- **E2a. Stop previewing when out of buying power.** The engine should recognise it has no settled
+  cash and stop issuing previews rather than being refused 214 times. *Affects log readability,
+  broker request volume, rate-limit headroom — **no change to trading behaviour**, those orders
+  were already refused.* Low risk, purely additive. Adjacent to A1, whose probe still has never
+  run: today's protection came from Tradier's check, not ours.
+- **E2b. Funding is a precondition for strategy measurement.** Three samples/day cannot support any
+  read on win rate. Not a code change — a decision about whether the next test measures the
+  strategy or measures the cash constraint again.
+
+### E3. Do NOT retune the stop loss on 09-02 data
+
+Trade 3 stopped at 2.50 (−15.5%); the contract recovered to 2.98 (high 3.13) by 12:00 and was back
+to **2.50 by 13:00**. It reads as a shakeout at twelve minutes and as a correct exit at the hour.
+One ambiguous trade. Listed explicitly so it is not quietly retuned.
+
+### E4. Decide the fate of the stale-quote guards
+
+The exit-path guard (landed 08-27) was written against a misdiagnosis that the 09-02 live session
+disproved — exits were never mispriced; sandbox fills were fabricated. It is harmless but unearned
+and adds a REST call to the exit path.
+
+The entry-path guard (landed 08-31) also never fires: across 321 live signals, quote age was
+`0s` x280, `1s` x38, `2s` x3 — maximum 2 seconds against a 30-second threshold. Belt-and-braces,
+not load-bearing.
+
+Also: `api/tests/test_stale_stream_quote.py` was deleted 2026-09-01 and never restored, so the
+exit-path guard currently has **no test**. Either restore the test or remove the guard; do not
+leave an untested branch in the exit path.
 
 ---
 

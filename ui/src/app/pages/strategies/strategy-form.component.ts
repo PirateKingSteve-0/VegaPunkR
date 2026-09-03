@@ -74,8 +74,23 @@ export class StrategyFormComponent implements OnInit {
       direction: ['call', [Validators.required]],
       timeframe: ['1h', [Validators.required]],
       max_positions: [5, [Validators.required, Validators.min(1)]],
-      stop_loss_percentage: [2, [Validators.min(0.1), Validators.max(20)]],
-      take_profit_percentage: [4, [Validators.min(0.1), Validators.max(50)]],
+      // Max raised from 20 to 100: a 50% stop is a legitimate 0DTE setting and
+      // prod strategy 3 already stores one. The old cap made that value fail
+      // validation on load, so the form could not round-trip it.
+      stop_loss_percentage: [2, [Validators.min(0.1), Validators.max(100)]],
+      take_profit_percentage: [4, [Validators.min(0.1), Validators.max(100)]],
+      // Half of the position-size calculation. risk_manager.calculate_position_size
+      // uses min(user.max_trade_percentage, this) — so raising only one has no
+      // effect. Was previously unreachable from the UI at all.
+      risk_per_trade_pct: [1.5, [Validators.min(0.1), Validators.max(100)]],
+      // Hard ceiling on contracts per entry, applied after the risk maths.
+      max_contracts: [3, [Validators.min(1), Validators.max(50)]],
+      // Contract selection band. Deep-ITM (high delta) costs more premium and
+      // carries far less open interest than at-the-money — these two settings
+      // and min_open_interest together decide whether anything arms at all.
+      delta_min: [0.6, [Validators.min(0.01), Validators.max(1)]],
+      delta_max: [0.85, [Validators.min(0.01), Validators.max(1)]],
+      min_open_interest: [3000, [Validators.min(0)]],
       max_hold_time_minutes: [0, [Validators.min(0)]],
       entry_after_open_minutes: [0, [Validators.min(0)]],
       // Minimum 15, never 0. Mirrors the engine's hard floor
@@ -124,8 +139,20 @@ export class StrategyFormComponent implements OnInit {
                       : 'call'),
           timeframe: strategy.timeframe,
           max_positions: strategy.max_positions,
-          stop_loss_percentage: strategy.stop_loss_percentage,
-          take_profit_percentage: strategy.take_profit_percentage,
+          // Show what the ENGINE uses, not the column. signal_generator.py:549
+          // reads params_json['stop_loss_pct'] FIRST and only falls back to
+          // ...['stop_loss_percentage']; the column is read by neither. On prod
+          // those disagreed (column 15, params 50) so the form displayed a stop
+          // the engine was not applying.
+          stop_loss_percentage:
+            p['stop_loss_pct'] ?? p['stop_loss_percentage'] ?? strategy.stop_loss_percentage,
+          take_profit_percentage:
+            p['take_profit_pct'] ?? p['take_profit_percentage'] ?? strategy.take_profit_percentage,
+          risk_per_trade_pct: p['risk_per_trade_pct'] ?? 1.5,
+          max_contracts: p['max_contracts'] ?? 3,
+          delta_min: p['delta_min'] ?? 0.6,
+          delta_max: p['delta_max'] ?? 0.85,
+          min_open_interest: p['min_open_interest'] ?? 3000,
           max_hold_time_minutes: p['max_hold_time_minutes'] ?? 0,
           entry_after_open_minutes: p['entry_after_open_minutes'] ?? 0,
           // Clamp up, don't just default: legacy strategies stored 0, and
@@ -185,8 +212,18 @@ export class StrategyFormComponent implements OnInit {
     // ema_period, etc.) are preserved.
     const params_json = {
       direction: formValue.direction,
+      // Write BOTH spellings. The engine prefers the `_pct` key, so writing
+      // only `_percentage` (as this did) left a stale `_pct` in charge and the
+      // edit silently did nothing.
+      stop_loss_pct: formValue.stop_loss_percentage,
       stop_loss_percentage: formValue.stop_loss_percentage,
+      take_profit_pct: formValue.take_profit_percentage,
       take_profit_percentage: formValue.take_profit_percentage,
+      risk_per_trade_pct: formValue.risk_per_trade_pct,
+      max_contracts: formValue.max_contracts,
+      delta_min: formValue.delta_min,
+      delta_max: formValue.delta_max,
+      min_open_interest: formValue.min_open_interest,
       max_hold_time_minutes: formValue.max_hold_time_minutes,
       entry_after_open_minutes: formValue.entry_after_open_minutes,
       exit_before_close_minutes: formValue.exit_before_close_minutes,

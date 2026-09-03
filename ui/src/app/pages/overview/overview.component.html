@@ -5,6 +5,15 @@
       <div class="page-subtitle">Account-wide position, risk and session state.</div>
     </div>
     <div class="header-actions">
+      <button
+        mat-stroked-button
+        class="halt-trigger"
+        [class.halt-trigger--active]="accountRisk()?.trading_halted"
+        (click)="openHaltDialog()"
+        [disabled]="!canWrite()">
+        <mat-icon>{{ accountRisk()?.trading_halted ? 'play_circle' : 'do_not_disturb_on' }}</mat-icon>
+        {{ accountRisk()?.trading_halted ? 'Resume trading' : 'Done for the day' }}
+      </button>
       <button mat-stroked-button (click)="refresh()" [disabled]="loading()">
         <mat-icon>refresh</mat-icon>
         Refresh
@@ -46,8 +55,8 @@
           </div>
 
           <div class="session-status-badge">
-            <mat-icon>{{ risk.risk_status === 'HALTED' ? 'block' : risk.risk_status === 'WARNING' ? 'warning' : 'check_circle' }}</mat-icon>
-            <span>{{ risk.risk_status === 'HALTED' ? 'Entries halted' : risk.risk_status === 'WARNING' ? 'Approaching cap' : 'Within cap' }}</span>
+            <mat-icon>{{ risk.trading_halted ? 'pause_circle' : risk.risk_status === 'HALTED' ? 'block' : risk.risk_status === 'WARNING' ? 'warning' : 'check_circle' }}</mat-icon>
+            <span>{{ risk.trading_halted ? 'Stopped for today' : risk.risk_status === 'HALTED' ? 'Entries halted' : risk.risk_status === 'WARNING' ? 'Approaching cap' : 'Within cap' }}</span>
           </div>
         </div>
 
@@ -55,7 +64,18 @@
           <div class="session-status-bar-fill" [style.width.%]="riskBarPct()"></div>
         </div>
 
-        <div class="session-status-footnote" *ngIf="risk.risk_status === 'HALTED'">
+        <div class="session-status-footnote" *ngIf="risk.trading_halted">
+          You stopped trading for today.
+          <ng-container *ngIf="risk.trading_halt_mode === 'flatten'">
+            Open positions are being closed at market.
+          </ng-container>
+          <ng-container *ngIf="risk.trading_halt_mode !== 'flatten'">
+            Open positions keep running their stop-loss and take-profit.
+          </ng-container>
+          New entries resume on the next market day.
+        </div>
+
+        <div class="session-status-footnote" *ngIf="!risk.trading_halted && risk.risk_status === 'HALTED'">
           New entries are blocked across all of your strategies. Existing
           positions can still be closed normally; the cap resets at midnight ET.
         </div>
