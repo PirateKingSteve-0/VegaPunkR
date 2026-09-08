@@ -66,9 +66,21 @@
             <ng-container matColumnDef="status">
               <th mat-header-cell *matHeaderCellDef>Status</th>
               <td mat-cell *matCellDef="let strategy">
-                <mat-chip [color]="getStatusColor(strategy.is_active)" highlighted>
-                  {{ strategy.is_active ? 'Active' : 'Inactive' }}
-                </mat-chip>
+                <div class="status-cell">
+                  <mat-chip [color]="getStatusColor(strategy.is_active)" highlighted>
+                    {{ strategy.is_active ? 'Active' : 'Inactive' }}
+                  </mat-chip>
+                  <!-- Running, evaluating, generating signals — and refusing
+                       every entry. Without this the page shows a healthy
+                       "Active" chip on a strategy that has silently stopped
+                       trading. -->
+                  @if (isBlocked(strategy)) {
+                    <mat-chip class="blocked-badge" [matTooltip]="blockReason(strategy)">
+                      <mat-icon class="blocked-badge-icon">block</mat-icon>
+                      Blocked
+                    </mat-chip>
+                  }
+                </div>
               </td>
             </ng-container>
 

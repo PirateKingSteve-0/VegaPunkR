@@ -72,6 +72,19 @@ class Strategy(Base):
     user_id = Column(Integer, ForeignKey('users.id'), nullable=False)
     name = Column(String, nullable=False)
     strategy_type = Column(String)  # 'mean_reversion', 'momentum', 'ml_based', etc.
+    # 'option' | 'equity'. Read via `trades_options` below, never directly.
+    #
+    # Defaults to 'option' so a strategy created through the API or the template
+    # cloner is never born NULL. NULL falls back to guessing from the name, which
+    # is the bug this column exists to remove — leaving new rows NULL would let it
+    # back in through the front door. Every strategy this engine runs is options
+    # and every template is 0DTE options, and the harm is asymmetric: guessing
+    # "shares" for an options strategy triples the position size, while the
+    # reverse case does not currently exist. An equity strategy must say so
+    # explicitly. Deliberately NOT derived from `strategy_type` at creation —
+    # that would reproduce the original footgun, storing 'equity' for anything
+    # named "momentum". See TODO E9.
+    instrument_type = Column(String, default='option')
     params_json = Column(JSON, nullable=False)  # e.g., {"ma_short": 50, "ma_long": 200}
     instruments = Column(JSON, default=list)  # e.g., ["AAPL", "TSLA"] or ["stocks", "options"]
 
@@ -94,6 +107,34 @@ class Strategy(Base):
     user = relationship("User", back_populates="strategies")
     positions = relationship("Position", back_populates="strategy")
     performance_metrics = relationship("PerformanceMetrics", back_populates="strategy")
+
+    # Options contracts carry a 100x multiplier; shares do not. Position sizing
+    # is wrong by two orders of magnitude if this is answered incorrectly, so it
+    # gets ONE definition, here, next to the data.
+    #
+    # It used to be answered independently at two call sites by string-matching
+    # `strategy_type` for 'option' / '0dte' / 'scalping'. Renaming a strategy to
+    # anything missing those words silently switched it to the share formula:
+    # measured on the live account 2026-09-06, a $3.00 contract went from 1
+    # contract to 3, and the uncapped figure was 202 — $60,600 of options on a
+    # $1,214 account, stopped only by `max_contracts` and the broker's buying
+    # power check. A third site (`trading_safeguards.py:79`) matched on 'option'
+    # alone and so never fired at all. Three lists, three answers. See TODO E9.
+    @property
+    def trades_options(self) -> bool:
+        """True when this strategy trades option contracts rather than shares.
+
+        Prefers the recorded `instrument_type`. Falls back to the historical
+        string match when it is NULL, so a row this has never been set on keeps
+        behaving exactly as it does today — the fallback is what makes this
+        change incapable of altering behaviour for unmigrated data.
+        """
+        if self.instrument_type:
+            return self.instrument_type.strip().lower() == 'option'
+        return any(
+            k in (self.strategy_type or '').lower()
+            for k in ('option', '0dte', 'scalping')
+        )
 
 
 class Position(Base):
@@ -150,6 +191,13 @@ class Trade(Base):
     commission = Column(Float, default=0.0)
     fees = Column(Float, default=0.0)  # Regulatory fees (SEC/TAF/ORF) — populated from /account/history type=fee
     pnl = Column(Float)  # Profit/loss for closed positions
+    # Excursion, captured on the SELL leg only. `positions.peak_price` /
+    # `trough_price` track this live but are RESET on every reopen, and position
+    # rows are reused for re-entries — so without copying them here the figure is
+    # destroyed by the next entry into the same contract. Lost real data twice in
+    # the first live week (2026-09-02, 09-03). See TODO.md E5.
+    mfe_price = Column(Float)  # best price seen while held (Max Favourable Excursion)
+    mae_price = Column(Float)  # worst price seen while held (Max Adverse Excursion)
 
     # Timestamps
     timestamp = Column(DateTime, nullable=False, index=True)  # Partition key for TimescaleDB

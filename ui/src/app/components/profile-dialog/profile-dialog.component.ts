@@ -10,6 +10,7 @@ import { MatProgressSpinnerModule } from '@angular/material/progress-spinner';
 import { MatDividerModule } from '@angular/material/divider';
 import { MatSlideToggleModule } from '@angular/material/slide-toggle';
 import { MatCheckboxModule } from '@angular/material/checkbox';
+import { MatTooltipModule } from '@angular/material/tooltip';
 import { AuthService } from '../../services/auth.service';
 import {
   DiscordPrefs,
@@ -42,6 +43,7 @@ function looksLikeDiscordWebhook(url: string): boolean {
     MatInputModule,
     MatProgressSpinnerModule,
     MatDividerModule,
+    MatTooltipModule,
     MatSlideToggleModule,
     MatCheckboxModule,
   ],
@@ -83,6 +85,7 @@ export class ProfileDialogComponent implements OnInit {
   discordWebhookUrl = signal<string>('');
   discordNotifyOpen = signal<boolean>(true);
   discordNotifyClose = signal<boolean>(true);
+  discordNotifyRisk = signal<boolean>(true);
   initialDiscord = signal<DiscordPrefs | null>(null);
   discordTesting = signal(false);
   discordTestResult = signal<{ ok: boolean; message: string } | null>(null);
@@ -144,6 +147,7 @@ export class ProfileDialogComponent implements OnInit {
           this.discordWebhookUrl.set(discord.webhook_url ?? '');
           this.discordNotifyOpen.set(discord.notify_open ?? true);
           this.discordNotifyClose.set(discord.notify_close ?? true);
+          this.discordNotifyRisk.set(discord.notify_risk ?? true);
         }
         this.initialDiscord.set(discord);
 
@@ -173,6 +177,7 @@ export class ProfileDialogComponent implements OnInit {
       webhook_url: this.discordWebhookUrl().trim() || null,
       notify_open: this.discordNotifyOpen(),
       notify_close: this.discordNotifyClose(),
+      notify_risk: this.discordNotifyRisk(),
     };
   }
 
@@ -195,7 +200,8 @@ export class ProfileDialogComponent implements OnInit {
       cur.enabled !== prev.enabled ||
       cur.webhook_url !== (prev.webhook_url ?? null) ||
       cur.notify_open !== (prev.notify_open ?? true) ||
-      cur.notify_close !== (prev.notify_close ?? true)
+      cur.notify_close !== (prev.notify_close ?? true) ||
+      cur.notify_risk !== (prev.notify_risk ?? true)
     );
   }
 

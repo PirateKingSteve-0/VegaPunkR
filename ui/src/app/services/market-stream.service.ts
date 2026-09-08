@@ -1,5 +1,6 @@
 import { Injectable } from '@angular/core';
 import { Subject, BehaviorSubject } from 'rxjs';
+import { environment } from '../../environments/environment';
 
 export type ConnectionStatus = 'disconnected' | 'connecting' | 'connected' | 'error';
 
@@ -26,7 +27,7 @@ export interface StreamEvent {
 
 @Injectable({ providedIn: 'root' })
 export class MarketStreamService {
-  private readonly apiUrl = 'http://localhost:8000/api/v1';
+  private readonly apiUrl = environment.apiUrl;
 
   private eventSource: EventSource | null = null;
   private subscribedSymbols = new Set<string>();

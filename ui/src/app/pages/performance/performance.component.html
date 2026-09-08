@@ -101,7 +101,13 @@
                 help_outline
               </mat-icon>
             </div>
-            <div class="metric-value">{{ metric.value }}</div>
+            <div class="metric-value" [class.metric-value-pair]="metric.parts">
+              <ng-container *ngIf="metric.parts; else singleValue">
+                <span class="metric-part">{{ metric.parts[0] }}&nbsp;/</span>
+                <span class="metric-part">{{ metric.parts[1] }}</span>
+              </ng-container>
+              <ng-template #singleValue>{{ metric.value }}</ng-template>
+            </div>
             <div *ngIf="metric.sub" class="metric-sub">{{ metric.sub }}</div>
           </div>
         </div>

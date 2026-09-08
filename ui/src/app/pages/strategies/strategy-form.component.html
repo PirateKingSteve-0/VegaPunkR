@@ -34,9 +34,17 @@
                   <mat-option [value]="type">{{ type }}</mat-option>
                 }
               </mat-select>
+              <!-- Not a label. The engine reads this string to decide whether it
+                   is sizing options or shares — see StrategyType in the model. -->
+              <mat-hint>
+                Options strategies must use a type containing
+                <strong>0dte</strong>, <strong>option</strong> or
+                <strong>scalping</strong> — anything else is sized as shares and
+                will buy several times the intended position.
+              </mat-hint>
             </mat-form-field>
 
-            <mat-form-field appearance="outline">
+            <mat-form-field appearance="outline" subscriptSizing="dynamic">
               <mat-label>Direction</mat-label>
               <mat-select formControlName="direction">
                 <mat-option value="call">Calls (bullish)</mat-option>
@@ -68,7 +76,7 @@
         <div class="form-section">
           <h2>Trading Parameters</h2>
 
-          <mat-form-field appearance="outline" class="full-width">
+          <mat-form-field appearance="outline" class="full-width" subscriptSizing="dynamic">
             <mat-label>Instruments/Symbols</mat-label>
             <mat-chip-grid #chipGrid>
               @for (instrument of instruments; track instrument) {
@@ -88,7 +96,7 @@
             <mat-hint>Press Enter or comma to add a symbol</mat-hint>
           </mat-form-field>
 
-          <mat-form-field appearance="outline" class="full-width">
+          <mat-form-field appearance="outline" class="full-width" subscriptSizing="dynamic">
             <mat-label>Max Positions</mat-label>
             <input matInput type="number" formControlName="max_positions" step="1">
             <mat-hint>Maximum number of concurrent positions</mat-hint>
@@ -115,7 +123,7 @@
               }
             </mat-form-field>
 
-            <mat-form-field appearance="outline">
+            <mat-form-field appearance="outline" subscriptSizing="dynamic">
               <mat-label>Take Profit</mat-label>
               <input matInput type="number" formControlName="take_profit_percentage" step="0.1">
               <span matSuffix>%</span>
@@ -132,7 +140,7 @@
           </div>
 
           <div class="form-row">
-            <mat-form-field appearance="outline">
+            <mat-form-field appearance="outline" subscriptSizing="dynamic">
               <mat-label>Risk Per Trade</mat-label>
               <input matInput type="number" formControlName="risk_per_trade_pct" step="0.1">
               <span matSuffix>%</span>
@@ -142,7 +150,7 @@
               </mat-hint>
             </mat-form-field>
 
-            <mat-form-field appearance="outline">
+            <mat-form-field appearance="outline" subscriptSizing="dynamic">
               <mat-label>Max Contracts</mat-label>
               <input matInput type="number" formControlName="max_contracts" step="1" min="1">
               <mat-hint>Hard ceiling per entry, applied after the risk maths.</mat-hint>
@@ -160,7 +168,7 @@
             and the strategy trades nothing.
           </p>
 
-          <div class="form-row">
+          <div class="form-row form-row-3">
             <mat-form-field appearance="outline">
               <mat-label>Delta Min</mat-label>
               <input matInput type="number" formControlName="delta_min" step="0.05" min="0.01" max="1">
@@ -171,7 +179,7 @@
               <input matInput type="number" formControlName="delta_max" step="0.05" min="0.01" max="1">
             </mat-form-field>
 
-            <mat-form-field appearance="outline">
+            <mat-form-field appearance="outline" subscriptSizing="dynamic">
               <mat-label>Min Open Interest</mat-label>
               <input matInput type="number" formControlName="min_open_interest" step="100" min="0">
               <mat-hint>Liquidity floor. Contracts below this are skipped.</mat-hint>
@@ -184,14 +192,14 @@
           <h2>Time & Trailing Exits</h2>
 
           <div class="form-row">
-            <mat-form-field appearance="outline">
+            <mat-form-field appearance="outline" subscriptSizing="dynamic">
               <mat-label>Max Hold Time</mat-label>
               <input matInput type="number" formControlName="max_hold_time_minutes" step="1" min="0">
               <span matSuffix>min</span>
               <mat-hint>Force exit after N minutes. 0 = disabled.</mat-hint>
             </mat-form-field>
 
-            <mat-form-field appearance="outline">
+            <mat-form-field appearance="outline" subscriptSizing="dynamic">
               <mat-label>Entry After Open</mat-label>
               <input matInput type="number" formControlName="entry_after_open_minutes" step="1" min="0">
               <span matSuffix>min</span>
@@ -200,7 +208,7 @@
           </div>
 
           <div class="form-row">
-            <mat-form-field appearance="outline">
+            <mat-form-field appearance="outline" subscriptSizing="dynamic">
               <mat-label>Exit Before Close</mat-label>
               <input matInput type="number" formControlName="exit_before_close_minutes"
                      step="1" [min]="EOD_EXIT_FLOOR_MIN">
@@ -224,18 +232,48 @@
           </div>
 
           <div class="form-row">
-            <mat-form-field appearance="outline">
+            <mat-form-field appearance="outline" subscriptSizing="dynamic">
               <mat-label>Trailing Activation</mat-label>
               <input matInput type="number" formControlName="trailing_stop_activation" step="0.1" min="0">
               <span matSuffix>%</span>
               <mat-hint>Gain % required before trailing stop activates</mat-hint>
             </mat-form-field>
 
-            <mat-form-field appearance="outline">
+            <mat-form-field appearance="outline" subscriptSizing="dynamic">
               <mat-label>Trailing Distance</mat-label>
               <input matInput type="number" formControlName="trailing_stop_distance" step="0.1" min="0">
               <span matSuffix>%</span>
               <mat-hint>Pullback % from peak that fires the trailing stop</mat-hint>
+            </mat-form-field>
+          </div>
+
+          <div class="checkbox-row">
+            <mat-checkbox
+              formControlName="max_drawdown_block"
+              matTooltip="ON: the strategy STOPS opening new trades once it falls this far below its best-ever total profit. OFF: you get an alert and it keeps trading. Open positions and their exits are never affected either way."
+              matTooltipPosition="above"
+            >
+              Pause trading on drawdown
+            </mat-checkbox>
+            <mat-hint>
+              Leave OFF to get the alert without the pause — recommended on a small
+              account. Turning it ON means the strategy stops entering, and it can
+              only recover by winning the drawdown back, which it cannot do while
+              blocked and holding nothing.
+            </mat-hint>
+          </div>
+
+          <div class="form-row">
+            <mat-form-field appearance="outline" subscriptSizing="dynamic">
+              <mat-label>Drawdown Threshold</mat-label>
+              <input matInput type="number" formControlName="max_drawdown_pct" step="1" min="0">
+              <span matSuffix>%</span>
+              <mat-hint>
+                How far below its best-ever total profit the strategy may fall before
+                this fires, as a % of account size. Set it to several losing trades'
+                worth — too low and one bad trade trips it. <strong>0 turns it off
+                entirely</strong> (no alert, no pause).
+              </mat-hint>
             </mat-form-field>
           </div>
         </div>

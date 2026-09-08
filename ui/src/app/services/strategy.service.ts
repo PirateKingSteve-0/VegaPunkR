@@ -4,6 +4,7 @@ import { Observable } from 'rxjs';
 import { Strategy, StrategyTemplate, CreateStrategyRequest, UpdateStrategyRequest } from '../models/strategy.model';
 import { AuthService } from './auth.service';
 import { ResolvedRange } from '../models/date-range';
+import { environment } from '../../environments/environment';
 
 @Injectable({
   providedIn: 'root'
@@ -12,7 +13,7 @@ export class StrategyService {
   private http = inject(HttpClient);
   private authService = inject(AuthService);
 
-  private apiUrl = 'http://localhost:8000/api/v1';
+  private apiUrl = environment.apiUrl;
 
   private getHeaders(): HttpHeaders {
     const token = this.authService.getToken();

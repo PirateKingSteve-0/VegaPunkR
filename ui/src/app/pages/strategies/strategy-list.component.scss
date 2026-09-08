@@ -124,3 +124,29 @@
     }
   }
 }
+
+// "Active but blocked" — the strategy is running and refusing every entry.
+// Warning, not error: nothing has failed, something has stopped.
+.status-cell {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  flex-wrap: wrap;
+}
+
+.blocked-badge {
+  --mdc-chip-label-text-color: var(--color-warning-strong);
+  background: var(--color-warning-bg) !important;
+  color: var(--color-warning-strong) !important;
+  border: 1px solid var(--color-warning) !important;
+  font-weight: var(--fw-semibold);
+  cursor: help;
+}
+
+.blocked-badge-icon {
+  font-size: var(--fs-sm);
+  width: var(--fs-sm);
+  height: var(--fs-sm);
+  margin-right: var(--sp-1);
+  vertical-align: middle;
+}

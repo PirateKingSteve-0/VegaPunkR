@@ -21,8 +21,47 @@ from models import Base
 # access to the values within the .ini file in use.
 config = context.config
 
-# Override sqlalchemy.url from environment variable
-config.set_main_option('sqlalchemy.url', os.getenv('DATABASE_URL'))
+def _redact(url: str) -> str:
+    """Host and database name only — never print credentials."""
+    try:
+        from urllib.parse import urlsplit
+        p = urlsplit(url)
+        return f"{p.hostname or '?'}:{p.port or ''}{p.path or ''}"
+    except Exception:
+        return "<unparseable>"
+
+
+# Which database? Mirror `database.py`'s rule — APP_ENV selects
+# DATABASE_{DEV,PROD,TEST}_URL — instead of reading DATABASE_URL, which is what
+# this did before and which points at DEV regardless of APP_ENV.
+#
+# 2026-09-06: `APP_ENV=prod alembic upgrade head` silently migrated **dev**,
+# twice, printing "Running upgrade ..." both times. It was caught only because
+# the new column was verified afterwards rather than trusting alembic's output.
+# Same shape as the wrong-database hour recorded in JOURNAL.md on 09-05.
+_APP_ENV = (os.getenv('APP_ENV') or 'dev').strip().lower()
+_URL_VAR_BY_ENV = {
+    'dev': 'DATABASE_DEV_URL',
+    'prod': 'DATABASE_PROD_URL',
+    'test': 'DATABASE_TEST_URL',
+}
+_url_var = _URL_VAR_BY_ENV.get(_APP_ENV)
+if _url_var is None:
+    raise RuntimeError(
+        f"APP_ENV={_APP_ENV!r} is not one of {sorted(_URL_VAR_BY_ENV)} — refusing to guess "
+        f"which database to migrate."
+    )
+# DATABASE_URL remains a last-resort fallback so an environment that only sets
+# that one keeps working; the explicit per-env variable always wins.
+_db_url = os.getenv(_url_var) or os.getenv('DATABASE_URL')
+if not _db_url:
+    raise RuntimeError(f"No database URL: {_url_var} is unset and DATABASE_URL is empty.")
+
+# Say the target out loud BEFORE running anything. A migration that reports
+# success against the wrong database is precisely what this guards against.
+print(f"[alembic] APP_ENV={_APP_ENV} -> {_url_var} -> {_redact(_db_url)}")
+
+config.set_main_option('sqlalchemy.url', _db_url)
 
 # Interpret the config file for Python logging.
 # This line sets up loggers basically.

@@ -57,7 +57,15 @@ Equity $1,060 → $1,202. Two winners of three.
 
 ## 3. Findings
 
-### F1. The trailing stop is unreachable by construction *(structural bug)*
+### F1. ~~The trailing stop is unreachable by construction~~ *(structural bug — FIXED 2026-09-03, fired live 2026-09-04)*
+
+> ⚠️ **This finding is a snapshot of 2026-09-02 and is no longer true.** Fixed in `023f477`; the
+> flat take-profit now stands down while the trail is armed, and arming latches on the peak. The
+> branch has fired live twice — 2026-09-04, both on the puts: `+4.51%` (+$14) and **`+49.16%`
+> (+$153)**. Source: `logs/livetest-2026-09-03/engine-20260903-061605.log:28859,29072` (the 09-03
+> log spans into the 09-04 session). Current detail lives in TODO.md **E1**. The analysis below is
+> kept because the reasoning is still what justified the fix.
+
 
 `prod` strategy 3 is configured:
 
@@ -185,12 +193,47 @@ Maximum observed: **2 seconds**, against a 30-second threshold. Zero `Stale stre
 entry` events. The guard is belt-and-braces, not load-bearing — streamed quotes stay fresh at
 entry. Its silent-failure risk did not materialise.
 
-### F7. The stop-loss exit — inconclusive, not clearly wrong
+### F7b. MFE proves the losing trade should have been a winner *(strongest evidence for F1)*
+
+`Position.peak_price` / `trough_price` are Maximum Favorable / Adverse Excursion in all but name.
+Captured 2026-09-02 before the rows are reused:
+
+```
+pos1  C00760000  entry 4.23   peak 5.29   trough 3.88   exited 5.28  (take profit)
+pos2  C00763000  entry 2.96   peak 3.61   trough 2.51   exited 2.50  (stop loss)
+```
+
+**pos2 — the only loser of the day — reached 3.61, or +22%, before reversing.** Take profit needed
+3.70 and missed by nine cents. The trailing stop (arms at 15%, trails 10%) would have governed:
+
+```
+peak 3.61  ->  trail = 3.61 x 0.90 = 3.25
+exit 3.25 = +9.8%  = +$29
+actual    = -15.5% = -$46
+                     ------
+swing                 +$75
+```
+
+With a reachable trailing stop the day would have been **+$218 instead of +$143, on identical
+entries**, and the session would have had zero losing trades. This is not a model — it is the
+stored peak price. F1 is not a theoretical improvement; it cost a winner today.
+
+**MFE capture ratio** (realized / MFE) generalises this: `100%, 100%, -70%`.
+
+> **Data caveat:** `Trade` has no MFE/MAE columns, and `order_manager.py:1348` resets
+> `position.peak_price` on every reopen, so MFE survives only for a row's most recent cycle.
+> Trade 1's peak was already lost to trade 2's re-entry. The numbers above are recorded here
+> because they will otherwise be destroyed. See TODO E5.
+
+### F7. The stop-loss exit — inconclusive on price action alone
 
 Trade 3 stopped at 2.50 (−15.5%). The contract recovered to 2.98 (high 3.13) by 12:00 — but was
 back to **2.50 by 13:00**. So the stop exited at a local low that mean-reverted and then declined
 again. It looks like a shakeout in the first twelve minutes and like a correct exit by the end of
 the hour. **One trade proves nothing here.** Do not retune the stop on this evidence.
+
+**But see F7b:** the stop level is not the problem — the missing trailing stop is. The position was
++22% before it turned. Fix F1 before touching the stop.
 
 ---
 
@@ -262,7 +305,8 @@ point.
 ## 6. Still unverified after today
 
 - **The halt (`ride` / `flatten`) never ran.** Still has never executed anywhere.
-- **The trailing stop never ran** — and per F1, cannot.
+- ~~**The trailing stop never ran** — and per F1, cannot.~~ **Superseded:** fixed 2026-09-03, and
+  it fired twice live on 2026-09-04 (+$14 and +$153). See the correction at F1.
 - **The reservation-ledger probe (TODO A1) never ran.** Today's cash protection was Tradier's.
 - **The put side never traded.** Strategy 4 armed `SPY260902P00766000` once at 08:15 and never
   entered; the day was a call day.

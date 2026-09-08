@@ -21,7 +21,7 @@
       />
     </mat-form-field>
 
-    <mat-form-field appearance="outline" class="full-width">
+    <mat-form-field appearance="outline" class="full-width" subscriptSizing="dynamic">
       <mat-label>Email</mat-label>
       <input
         matInput
@@ -43,7 +43,7 @@
       drive position sizing.
     </p>
 
-    <mat-form-field appearance="outline" class="full-width">
+    <mat-form-field appearance="outline" class="full-width" subscriptSizing="dynamic">
       <mat-label>Daily loss limit (% of account)</mat-label>
       <input
         matInput
@@ -57,7 +57,7 @@
       <mat-hint>0.5% – 20%. Default 5%.</mat-hint>
     </mat-form-field>
 
-    <mat-form-field appearance="outline" class="full-width">
+    <mat-form-field appearance="outline" class="full-width" subscriptSizing="dynamic">
       <mat-label>Account size (USD)</mat-label>
       <input
         matInput
@@ -70,7 +70,7 @@
       <mat-hint>Used as the denominator for daily loss and position sizing.</mat-hint>
     </mat-form-field>
 
-    <mat-form-field appearance="outline" class="full-width">
+    <mat-form-field appearance="outline" class="full-width" subscriptSizing="dynamic">
       <mat-label>Max trade size (% of account)</mat-label>
       <input
         matInput
@@ -171,6 +171,16 @@
         [disabled]="!discordEnabled()"
       >
         Notify on close
+      </mat-slide-toggle>
+      <!-- A strategy that is still Active but silently refusing every entry
+           has no other symptom. Off by choice, never by omission. -->
+      <mat-slide-toggle
+        [checked]="discordNotifyRisk()"
+        (change)="discordNotifyRisk.set($event.checked)"
+        [disabled]="!discordEnabled()"
+        matTooltip="Alerts when a running strategy stops opening positions (drawdown or loss limit reached)"
+      >
+        Notify when blocked
       </mat-slide-toggle>
     </div>
 
@@ -281,7 +291,7 @@
       />
     </mat-form-field>
 
-    <mat-form-field appearance="outline" class="full-width">
+    <mat-form-field appearance="outline" class="full-width" subscriptSizing="dynamic">
       <mat-label>New password</mat-label>
       <input
         matInput

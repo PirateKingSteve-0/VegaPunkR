@@ -11,6 +11,7 @@ import { MatIconModule } from '@angular/material/icon';
 import { MatChipsModule } from '@angular/material/chips';
 import { MatProgressSpinnerModule } from '@angular/material/progress-spinner';
 import { MatCheckboxModule } from '@angular/material/checkbox';
+import { MatTooltipModule } from '@angular/material/tooltip';
 import { COMMA, ENTER } from '@angular/cdk/keycodes';
 import { MatChipInputEvent } from '@angular/material/chips';
 import { StrategyType } from '../../models/strategy.model';
@@ -39,7 +40,8 @@ const EOD_EXIT_FLOOR_MIN = 15;
     MatIconModule,
     MatChipsModule,
     MatProgressSpinnerModule,
-    MatCheckboxModule
+    MatCheckboxModule,
+    MatTooltipModule
   ],
   templateUrl: './strategy-form.component.html',
   styleUrls: ['./strategy-form.component.scss']
@@ -101,6 +103,10 @@ export class StrategyFormComponent implements OnInit {
       trailing_stop: [false],
       trailing_stop_activation: [0, [Validators.min(0)]],
       trailing_stop_distance: [0, [Validators.min(0)]],
+      // Threshold in % of account; 0 disables the alert AND the pause.
+      max_drawdown_pct: [10, [Validators.min(0)]],
+      // Whether crossing the threshold stops entries or only raises an alert.
+      max_drawdown_block: [true],
       is_active: [false],
       is_paper_trading: [true]
     });
@@ -162,6 +168,10 @@ export class StrategyFormComponent implements OnInit {
           trailing_stop: p['trailing_stop'] ?? false,
           trailing_stop_activation: p['trailing_stop_activation'] ?? 0,
           trailing_stop_distance: p['trailing_stop_distance'] ?? 0,
+          max_drawdown_pct: p['max_drawdown_pct'] ?? 10,
+          // Default TRUE to match the engine: a strategy that never opted out
+          // keeps blocking, so loading a form can never silently disarm a gate.
+          max_drawdown_block: p['max_drawdown_block'] ?? true,
           is_active: strategy.is_active,
           is_paper_trading: strategy.is_paper_trading
         });
@@ -230,6 +240,8 @@ export class StrategyFormComponent implements OnInit {
       trailing_stop: formValue.trailing_stop,
       trailing_stop_activation: formValue.trailing_stop_activation,
       trailing_stop_distance: formValue.trailing_stop_distance,
+      max_drawdown_pct: formValue.max_drawdown_pct,
+      max_drawdown_block: formValue.max_drawdown_block,
     };
 
     const strategyData = this.isEditMode ? {

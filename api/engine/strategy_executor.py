@@ -300,7 +300,7 @@ class StrategyExecutor:
         })
 
         # For options strategies use the option premium for sizing, not the underlying price
-        _is_options = any(k in strategy.strategy_type.lower() for k in ('option', '0dte', 'scalping'))
+        _is_options = strategy.trades_options
         if _is_options:
             bid = market_data.get('bid', 0) or 0
             ask = market_data.get('ask', 0) or 0

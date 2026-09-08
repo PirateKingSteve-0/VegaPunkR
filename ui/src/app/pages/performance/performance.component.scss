@@ -77,6 +77,17 @@
         }
       }
 
+      // Two figures in one card need room to break. Flex + wrap lets the pair
+      // fall onto a second line at the slash rather than overflow the cell;
+      // the slash rides with the first figure so it never lands alone.
+      .metric-value-pair {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: baseline;
+        column-gap: var(--sp-2);
+        font-size: var(--fs-lg);
+      }
+
       .metric-value {
         font-size: var(--fs-xl);
         font-weight: var(--fw-semibold);

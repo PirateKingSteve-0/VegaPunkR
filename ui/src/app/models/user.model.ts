@@ -3,6 +3,7 @@ export interface DiscordPrefs {
   webhook_url?: string | null;
   notify_open: boolean;
   notify_close: boolean;
+  notify_risk: boolean;
 }
 
 export interface EmailReportsPrefs {

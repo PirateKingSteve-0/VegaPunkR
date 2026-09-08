@@ -1,6 +1,7 @@
 """
 Strategy management endpoints.
 """
+import logging
 from typing import List, Dict, Any
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
@@ -11,8 +12,30 @@ from schemas import StrategyCreate, StrategyUpdate, StrategyResponse
 from auth import get_current_user, require_can_write_own
 from strategy_templates import StrategyTemplates
 from engine.event_logger import log_event
+from engine.risk_manager import RiskManager
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/strategies", tags=["Strategies"])
+
+
+def _attach_entry_block(db: Session, user: User, strategy: Strategy) -> Strategy:
+    """Stamp the live entry-block status onto a strategy for serialisation.
+
+    Read-only: `get_entry_block_status` writes nothing and commits nothing, so
+    this is safe on a GET. Set as a plain instance attribute — `entry_block` is
+    not a column, and pydantic's `from_attributes` picks it up either way.
+
+    Never allowed to fail the request. If the risk evaluation raises, the page
+    still renders; it simply shows no badge. A broken badge must not be able to
+    take down the strategies list.
+    """
+    try:
+        strategy.entry_block = RiskManager(db).get_entry_block_status(user, strategy)
+    except Exception:
+        logger.exception(f"Entry-block status failed for strategy {strategy.id}")
+        strategy.entry_block = None
+    return strategy
 
 
 @router.get("", response_model=List[StrategyResponse])
@@ -24,7 +47,7 @@ def get_strategies(
     Get all strategies for the current user.
     """
     strategies = db.query(Strategy).filter(Strategy.user_id == current_user.id).all()
-    return strategies
+    return [_attach_entry_block(db, current_user, s) for s in strategies]
 
 
 @router.get("/templates", response_model=List[Dict[str, Any]])
@@ -115,7 +138,7 @@ def get_strategy(
             detail="Strategy not found"
         )
 
-    return strategy
+    return _attach_entry_block(db, current_user, strategy)
 
 
 @router.post("", response_model=StrategyResponse, status_code=status.HTTP_201_CREATED)

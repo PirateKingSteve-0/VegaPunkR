@@ -45,6 +45,11 @@ import {
 interface MetricCard {
   label: string;
   value: string;
+  /** Two figures shown side by side (e.g. best/worst trade). Rendered as
+   *  separate spans so the card can break at the slash instead of overflowing
+   *  — a single 22px string of two currency figures does not fit the 200px
+   *  grid cell. `value` stays the joined form and is what non-paired cards use. */
+  parts?: [string, string];
   sub?: string;
   icon: string;
   tone: 'neutral' | 'positive' | 'negative';
@@ -261,6 +266,49 @@ export class PerformanceComponent implements OnInit, OnDestroy {
       }
     }
 
+    // --- Added 2026-09-02, from comparing our reports against Tradervue --------
+    // All derived from the same in-period closed trades the cards above use, so
+    // they respect the period filter and need no extra request.
+    const winPnls = inPeriodClosed.filter(p => p.gain_loss > 0).map(p => p.gain_loss);
+    const lossPnls = inPeriodClosed.filter(p => p.gain_loss < 0).map(p => p.gain_loss);
+    const avgWin = winPnls.length
+      ? winPnls.reduce((a, b) => a + b, 0) / winPnls.length : 0;
+    const avgLoss = lossPnls.length
+      ? lossPnls.reduce((a, b) => a + b, 0) / lossPnls.length : 0;   // negative
+    const largestWin = winPnls.length ? Math.max(...winPnls) : 0;
+    const largestLoss = lossPnls.length ? Math.min(...lossPnls) : 0;
+
+    // Expectancy — expected P&L per trade. Positive means the average trade
+    // makes money whatever the win rate is. avgLoss is negative, so this sums.
+    const lossRate = totalTrades > 0 ? losses / totalTrades : 0;
+    const winRateFrac = totalTrades > 0 ? wins / totalTrades : 0;
+    const expectancy = totalTrades > 0
+      ? winRateFrac * avgWin + lossRate * avgLoss : 0;
+    const payoff = avgLoss !== 0 ? avgWin / Math.abs(avgLoss) : 0;
+
+    // Longest runs of same-sign outcomes, in close order.
+    const byClose = [...inPeriodClosed].sort(
+      (a, b) => +new Date(a.close_date) - +new Date(b.close_date));
+    let maxWinRun = 0, maxLossRun = 0, runW = 0, runL = 0;
+    for (const p of byClose) {
+      if (p.gain_loss > 0) { runW++; runL = 0; maxWinRun = Math.max(maxWinRun, runW); }
+      else if (p.gain_loss < 0) { runL++; runW = 0; maxLossRun = Math.max(maxLossRun, runL); }
+    }
+
+    // Hold time SPLIT by outcome, not pooled. Winners held briefly while losers
+    // are held long is the cut-winners/ride-losers signature, and a single
+    // blended average hides it entirely.
+    const holdSecs = (p: { open_date: string; close_date: string }) =>
+      (+new Date(p.close_date) - +new Date(p.open_date)) / 1000;
+    const median = (xs: number[]): number | null => {
+      if (!xs.length) return null;
+      const v = [...xs].sort((a, b) => a - b);
+      const m = Math.floor(v.length / 2);
+      return v.length % 2 ? v[m] : (v[m - 1] + v[m]) / 2;
+    };
+    const winHold = median(byClose.filter(p => p.gain_loss > 0).map(holdSecs));
+    const lossHold = median(byClose.filter(p => p.gain_loss < 0).map(holdSecs));
+
     const tone = (n: number): 'positive' | 'negative' | 'neutral' =>
       n > 0 ? 'positive' : n < 0 ? 'negative' : 'neutral';
 
@@ -361,8 +409,85 @@ export class PerformanceComponent implements OnInit, OnDestroy {
           'Computed from this period’s per-trade returns (net P&L ÷ cost); ' +
           'no risk-free rate assumed. Needs at least 2 closed trades.',
       },
+      {
+        label: 'Expectancy',
+        value: totalTrades ? `${expectancy >= 0 ? '+' : ''}${this.fmtCurrency(expectancy)}` : 'N/A',
+        sub: 'Per trade',
+        icon: 'functions',
+        tone: tone(expectancy),
+        tooltip:
+          'What the average trade is worth: (win% × average win) + ' +
+          '(loss% × average loss).\n\n' +
+          'The clearest single read on whether an edge exists. Positive means the ' +
+          'average trade makes money no matter what the win rate looks like — a ' +
+          '30% win rate with large winners beats a 70% win rate with large losers.',
+      },
+      {
+        label: 'Avg Win / Avg Loss',
+        value: payoff ? `${payoff.toFixed(2)}x` : 'N/A',
+        sub: `${this.fmtCurrency(avgWin)} / ${this.fmtCurrency(Math.abs(avgLoss))}`,
+        icon: 'balance',
+        tone: payoff >= 1 ? 'positive' : payoff > 0 ? 'negative' : 'neutral',
+        tooltip:
+          'How many times bigger the average winner is than the average loser ' +
+          '(the payoff ratio).\n\n' +
+          'Never read it alone — 0.5x is fine at a 70% win rate and ruinous at ' +
+          '30%. Expectancy folds both numbers into one.',
+      },
+      {
+        label: 'Largest Win / Loss',
+        value: totalTrades ? `${this.fmtCurrency(largestWin)} / ${this.fmtCurrency(largestLoss)}` : 'N/A',
+        parts: totalTrades
+          ? [this.fmtCurrency(largestWin), this.fmtCurrency(largestLoss)]
+          : undefined,
+        sub: 'Best and worst single trade',
+        icon: 'stacked_bar_chart',
+        tone: 'neutral',
+        tooltip:
+          'The best and worst individual trades of the period.\n\n' +
+          'Compare against Expectancy: if one outsized win is carrying the whole ' +
+          'result, the edge is thinner than the totals suggest.',
+      },
+      {
+        label: 'Hold Time (win / loss)',
+        value: (winHold === null && lossHold === null)
+          ? 'N/A'
+          : `${this.fmtDuration(winHold)} / ${this.fmtDuration(lossHold)}`,
+        parts: (winHold === null && lossHold === null)
+          ? undefined
+          : [this.fmtDuration(winHold), this.fmtDuration(lossHold)],
+        sub: 'Median, by outcome',
+        icon: 'timer',
+        tone: (winHold !== null && lossHold !== null && lossHold > winHold * 1.5)
+          ? 'negative' : 'neutral',
+        tooltip:
+          'Median time positions were held, split into winners and losers.\n\n' +
+          'Losers held much LONGER than winners is the classic ' +
+          'cut-your-winners / ride-your-losers pattern — it means the exit rule ' +
+          'takes profits quickly but sits in losing trades hoping they recover. ' +
+          'A single blended average hides this completely.',
+      },
+      {
+        label: 'Max Streak (W / L)',
+        value: totalTrades ? `${maxWinRun} / ${maxLossRun}` : 'N/A',
+        sub: 'Consecutive wins / losses',
+        icon: 'repeat',
+        tone: 'neutral',
+        tooltip:
+          'Longest run of consecutive winning and losing trades in the period.\n\n' +
+          'The losing streak is the one that matters for position sizing: it is ' +
+          'what your account has to survive without the strategy being wrong.',
+      },
     ];
   });
+
+  /** Seconds -> compact duration. Null renders as an em dash, not "0s". */
+  private fmtDuration(secs: number | null): string {
+    if (secs === null) return '—';
+    if (secs < 60) return `${Math.round(secs)}s`;
+    if (secs < 3600) return `${Math.round(secs / 60)}m`;
+    return `${(secs / 3600).toFixed(1)}h`;
+  }
 
   // Equity-curve chart config
   chartType: ChartConfiguration<'line'>['type'] = 'line';

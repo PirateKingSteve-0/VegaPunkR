@@ -4,6 +4,23 @@ Get Account's Balances Overtime
 
 Get the historical account balances to track value over time
 
+> **The live response does not match the OpenAPI example below.** Observed
+> 2026-09-07 against production, account 6YB70356:
+>
+> ```json
+> {"historical_balances": {
+>    "balances": {"balance": [{"date": "2026-08-07", "value": 1060.0}, ...]},
+>    "delta": 154.07,
+>    "delta_percent": 14.53}}
+> ```
+>
+> Two differences that matter: the payload is wrapped in `historical_balances`
+> and the array sits under `balances.balance` (not `balances` directly), and the
+> percentage field is `delta_percent`, not `deltaPercent`. A single-day period
+> returns `balance` as an object rather than a list, per Tradier's usual
+> collection convention. `client.get_historical_balances` normalises all of this
+> and accepts either shape.
+
 # OpenAPI definition
 
 ```json

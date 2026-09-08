@@ -10,6 +10,12 @@ from sqlalchemy import func
 
 from models import User, Strategy, Position, Trade, RiskEvent
 from config import TradingMode
+from notifications.discord import (
+    notify_strategy_blocked,
+    notify_strategy_bleeding,
+    notify_strategy_recovered,
+    notify_strategy_unblocked,
+)
 from utils.market_hours import (
     HALT_MODE_FLATTEN,
     market_day_start_utc,
@@ -22,10 +28,21 @@ logger = logging.getLogger(__name__)
 
 class RiskCheckResult:
     """Result of a risk check operation"""
-    def __init__(self, approved: bool, reason: str = "", suggested_qty: Optional[int] = None):
+    def __init__(
+        self,
+        approved: bool,
+        reason: str = "",
+        suggested_qty: Optional[int] = None,
+        code: Optional[str] = None,
+    ):
         self.approved = approved
         self.reason = reason
         self.suggested_qty = suggested_qty
+        # Machine-readable reason, set only on the entry blocks that are NOT
+        # self-evident from the screen. Drives the "why has this strategy gone
+        # quiet?" notification and the Blocked badge. `None` means "no code
+        # assigned to this rejection", never "nothing is wrong".
+        self.code = code
 
 
 class RiskManager:
@@ -38,8 +55,184 @@ class RiskManager:
     - Position limit enforcement
     """
 
+    # Blocks worth announcing: the strategy still reads as Active, still
+    # evaluates, still generates signals — and silently opens nothing, with
+    # nothing on screen saying why. Deliberately EXCLUDES the self-evident
+    # ones: an inactive strategy, a halt the user pressed themselves, and the
+    # position cap (normal operation, fires constantly).
+    _NOTIFIABLE_BLOCKS: Dict[str, str] = {
+        "mode_mismatch": "Trading mode mismatch",
+        "account_daily_loss": "Account daily loss cap",
+        "strategy_daily_loss": "Strategy daily loss limit",
+        "max_drawdown": "Drawdown limit",
+    }
+
+    # (user_id, strategy_id) -> {"code", "since", "suppressed"} while entries
+    # are blocked for one of the reasons above. Mirrors
+    # OrderManager._cash_block_state: announce the transition IN, count the
+    # repeats quietly, announce the recovery. 2026-09-02 produced 321 entry
+    # signals in a single day — one alert per rejection is 321 Discord posts.
+    _entry_block_state: Dict[Tuple[int, int], Dict] = {}
+
+    # (user_id, strategy_id) -> {"since", "drawdown"} while a strategy is past
+    # its drawdown threshold but configured NOT to block. Same announce-once
+    # discipline; cleared with hysteresis at 80% of the threshold so a strategy
+    # hovering on the line does not alternate alerts.
+    _drawdown_bleed_state: Dict[Tuple[int, int], Dict] = {}
+
     def __init__(self, db: Session):
         self.db = db
+
+    def _note_entry_block(
+        self, user: User, strategy: Strategy, result: RiskCheckResult
+    ) -> None:
+        """Record that entries are blocked; announce only the transition in.
+
+        Best-effort and never raises: a notification problem must not be able
+        to change whether a trade is allowed.
+        """
+        code = result.code
+        if code not in self._NOTIFIABLE_BLOCKS:
+            return
+        key = (user.id, strategy.id)
+        state = self._entry_block_state.get(key)
+        if state and state.get("code") == code:
+            state["suppressed"] += 1
+            return
+
+        self._entry_block_state[key] = {
+            "code": code,
+            "since": datetime.utcnow(),
+            "suppressed": 0,
+        }
+        logger.warning(
+            f"Strategy {strategy.id} ({strategy.name}) entries BLOCKED "
+            f"[{code}]: {result.reason} — repeats will be counted quietly"
+        )
+        try:
+            notify_strategy_blocked(
+                user.notification_preferences,
+                strategy_name=strategy.name,
+                headline=self._NOTIFIABLE_BLOCKS[code],
+                detail=result.reason,
+            )
+        except Exception as e:  # pragma: no cover - notification is best-effort
+            logger.warning(f"Blocked-strategy notification failed: {e}")
+
+    def _note_entry_clear(self, user: User, strategy: Strategy) -> None:
+        """Entries are possible again — announce the recovery once."""
+        state = self._entry_block_state.pop((user.id, strategy.id), None)
+        if not state:
+            return
+        code = state.get("code")
+        suppressed = state.get("suppressed", 0)
+        logger.info(
+            f"Strategy {strategy.id} ({strategy.name}) entries RESUMED "
+            f"[was {code}] — {suppressed} entries were skipped while blocked"
+        )
+        try:
+            notify_strategy_unblocked(
+                user.notification_preferences,
+                strategy_name=strategy.name,
+                headline=self._NOTIFIABLE_BLOCKS.get(code, "Entries blocked"),
+                skipped=suppressed,
+            )
+        except Exception as e:  # pragma: no cover - notification is best-effort
+            logger.warning(f"Unblocked-strategy notification failed: {e}")
+
+    def _note_drawdown_bleed(
+        self,
+        user: User,
+        strategy: Strategy,
+        drawdown: float,
+        limit: float,
+        peak: float,
+        cumulative: float,
+    ) -> None:
+        """Alert-only drawdown: the strategy is bleeding but still trading.
+
+        Announced once, on the transition over the threshold. This runs inside
+        the entry path, which fired 321 times in a day on 2026-09-02 — one post
+        per evaluation would be unusable.
+        """
+        key = (user.id, strategy.id)
+        if self._drawdown_bleed_state.get(key):
+            return
+        self._drawdown_bleed_state[key] = {
+            "since": datetime.utcnow(),
+            "drawdown": drawdown,
+        }
+        logger.warning(
+            f"Strategy {strategy.id} ({strategy.name}) BLEEDING: "
+            f"${drawdown:.2f} below peak (threshold ${limit:.2f}) — "
+            f"alert only, entries continue"
+        )
+        try:
+            notify_strategy_bleeding(
+                user.notification_preferences,
+                strategy_name=strategy.name,
+                drawdown=drawdown,
+                limit=limit,
+                peak=peak,
+                cumulative=cumulative,
+            )
+        except Exception as e:  # pragma: no cover - notification is best-effort
+            logger.warning(f"Drawdown-bleed notification failed: {e}")
+
+    def _clear_drawdown_bleed(
+        self, user: User, strategy: Strategy, drawdown: float
+    ) -> None:
+        """Climbed back clear of the threshold — close the alert out."""
+        state = self._drawdown_bleed_state.pop((user.id, strategy.id), None)
+        if not state:
+            return
+        logger.info(
+            f"Strategy {strategy.id} ({strategy.name}) drawdown recovered to "
+            f"${drawdown:.2f} (was ${state['drawdown']:.2f})"
+        )
+        try:
+            notify_strategy_recovered(
+                user.notification_preferences,
+                strategy_name=strategy.name,
+                drawdown=drawdown,
+                was=state["drawdown"],
+            )
+        except Exception as e:  # pragma: no cover - notification is best-effort
+            logger.warning(f"Drawdown-recovered notification failed: {e}")
+
+    def get_entry_block_status(self, user: User, strategy: Strategy) -> Dict:
+        """Read-only: would new entries be refused right now, and why?
+
+        Runs the same private checks `validate_pre_trade` runs, in the same
+        order, so the badge cannot disagree with the engine. Writes nothing,
+        commits nothing, notifies nothing — it is safe to call from a GET.
+
+        Only the non-obvious gates are evaluated. "Inactive" and "you halted
+        trading" are already on the screen and are not this function's job.
+        """
+        if not strategy.is_active:
+            return {"blocked": False, "code": None, "reason": None}
+
+        if user.selected_trading_mode == TradingMode.LIVE and strategy.is_paper_trading:
+            return {
+                "blocked": True,
+                "code": "mode_mismatch",
+                "reason": "Paper strategy cannot run in live trading mode",
+            }
+
+        for check in (
+            self._check_user_daily_loss_limit(user, "buy"),
+            self._check_daily_loss_limit(user, strategy),
+            self._check_max_drawdown(user, strategy),
+        ):
+            if not check.approved:
+                return {
+                    "blocked": True,
+                    "code": check.code,
+                    "reason": check.reason,
+                }
+
+        return {"blocked": False, "code": None, "reason": None}
 
     def calculate_position_size(
         self,
@@ -85,8 +278,9 @@ class RiskManager:
             logger.warning(f"Invalid price {current_price} for position sizing")
             return 0
 
-        # For options: more conservative sizing due to theta decay
-        _is_options = any(k in strategy.strategy_type.lower() for k in ('option', '0dte', 'scalping'))
+        # For options: more conservative sizing due to theta decay.
+        # ONE definition, on the model — see Strategy.trades_options for why.
+        _is_options = strategy.trades_options
         if _is_options:
             # Limit to max capital / (price * safety factor)
             safety_factor = 2.0  # More conservative for options
@@ -146,10 +340,13 @@ class RiskManager:
 
         # 2. Check trading mode consistency
         if user.selected_trading_mode == TradingMode.LIVE and strategy.is_paper_trading:
-            return RiskCheckResult(
+            mode_check = RiskCheckResult(
                 False,
-                "Cannot execute paper strategy in live trading mode"
+                "Cannot execute paper strategy in live trading mode",
+                code="mode_mismatch",
             )
+            self._note_entry_block(user, strategy, mode_check)
+            return mode_check
 
         # 2.4. Account-wide manual halt ("done trading today"). Checked before
         # the loss caps because it is unconditional — if the user has called it
@@ -176,28 +373,31 @@ class RiskManager:
                 user, strategy, "user_daily_loss_limit",
                 account_loss_check.reason, "trade_rejected"
             )
+            self._note_entry_block(user, strategy, account_loss_check)
             return account_loss_check
 
         # 3. Check daily loss limit
-        daily_loss_check = self._check_daily_loss_limit(user, strategy)
+        daily_loss_check = self._check_daily_loss_limit(user, strategy, side)
         if not daily_loss_check.approved:
             self._log_risk_event(
                 user, strategy, "daily_loss_limit", "critical",
                 daily_loss_check.reason, "trade_rejected"
             )
+            self._note_entry_block(user, strategy, daily_loss_check)
             return daily_loss_check
 
         # 4. Check maximum drawdown
-        drawdown_check = self._check_max_drawdown(user, strategy)
+        drawdown_check = self._check_max_drawdown(user, strategy, side)
         if not drawdown_check.approved:
             self._log_risk_event(
                 user, strategy, "max_drawdown", "critical",
                 drawdown_check.reason, "trade_rejected"
             )
+            self._note_entry_block(user, strategy, drawdown_check)
             return drawdown_check
 
         # 5. Check position limits
-        position_limit_check = self._check_position_limits(user, strategy)
+        position_limit_check = self._check_position_limits(user, strategy, side)
         if not position_limit_check.approved:
             self._log_risk_event(
                 user, strategy, "position_limit", "warning",
@@ -235,7 +435,10 @@ class RiskManager:
                     f"Total position size {total_qty} would exceed risk limits"
                 )
 
-        # All checks passed
+        # All checks passed. If this strategy was in a notifiable blocked
+        # state, it has just come back — announce the recovery once.
+        self._note_entry_clear(user, strategy)
+
         logger.info(
             f"Pre-trade validation PASSED: {symbol} {side} {qty} @ ${estimated_price}"
         )
@@ -317,7 +520,8 @@ class RiskManager:
                 False,
                 f"Account daily loss cap reached: ${today_pnl:.2f} "
                 f"(limit: ${-daily_loss_limit:.2f}). "
-                f"New entries halted; existing positions can still be closed."
+                f"New entries halted; existing positions can still be closed.",
+                code="account_daily_loss",
             )
 
         if today_pnl < -(daily_loss_limit * 0.8):
@@ -359,8 +563,20 @@ class RiskManager:
             logger.error(f"Failed to persist {event_type} risk event: {exc}")
         logger.warning(f"User {user.id} entry rejected ({event_type}): {reason}")
 
-    def _check_daily_loss_limit(self, user: User, strategy: Strategy) -> RiskCheckResult:
-        """Check if daily loss limit has been exceeded"""
+    def _check_daily_loss_limit(
+        self, user: User, strategy: Strategy, side: str = "buy"
+    ) -> RiskCheckResult:
+        """Check if daily loss limit has been exceeded.
+
+        Entries-only, matching `_check_user_daily_loss_limit` and
+        `_check_user_trading_halt`: a sell is never blocked, so a breached cap
+        can never strand an open position. Unreachable today — exits run
+        through `close_position`, which does not call `validate_pre_trade` —
+        but a risk gate that can refuse an exit is a landmine, not a feature.
+        """
+        if side != "buy":
+            return RiskCheckResult(True)
+
         # Trading gate: anchor "today" to the market (ET) day, not UTC midnight.
         today_start = market_day_start_utc()
 
@@ -379,7 +595,8 @@ class RiskManager:
         if today_pnl < -daily_loss_limit:
             return RiskCheckResult(
                 False,
-                f"Daily loss limit exceeded: ${today_pnl:.2f} (limit: ${-daily_loss_limit:.2f})"
+                f"Daily loss limit exceeded: ${today_pnl:.2f} (limit: ${-daily_loss_limit:.2f})",
+                code="strategy_daily_loss",
             )
 
         # Warning if approaching limit (80%)
@@ -390,53 +607,130 @@ class RiskManager:
 
         return RiskCheckResult(True)
 
-    def _check_max_drawdown(self, user: User, strategy: Strategy) -> RiskCheckResult:
-        """Check if maximum drawdown limit has been exceeded"""
-        # Get all-time high watermark for this strategy
+    def _check_max_drawdown(
+        self, user: User, strategy: Strategy, side: str = "buy"
+    ) -> RiskCheckResult:
+        """Block new entries while the strategy sits too far below its own
+        high-water mark.
+
+        Entries-only — a sell is never blocked. See `_check_daily_loss_limit`.
+
+        Measures the CURRENT drawdown — how far under its peak the cumulative
+        P&L is right now — and not, as this did before, the worst drawdown ever
+        recorded. That distinction is the whole fix. `max_drawdown` was a
+        running maximum: it only ever rose, nothing reset it, and the query has
+        no date filter, so a single bad stretch retired the strategy for the
+        rest of its life even after it recovered to new all-time highs. Nothing
+        surfaced that anywhere — the strategy stayed "Active" and silently
+        stopped opening positions.
+
+        Measured 2026-09-05: strategy 3 carried $119.00 of worst-ever drawdown
+        against a $121.43 limit. One $3 loser from being permanently retired,
+        with no warning and no way to clear it short of editing the database.
+
+        Recovery is the point. Win the drawdown back and entries resume.
+
+        Deliberate consequence: this gate is now strictly more permissive than
+        before (current drawdown can never exceed worst-ever). That is the
+        intent — the old bound was not a risk control, it was a latch.
+
+        Two settings, because warning and blocking are different decisions:
+
+          `max_drawdown_pct`    the threshold, as a % of account size.
+                                <= 0 turns the whole thing off — no alert,
+                                no block, and no database query.
+          `max_drawdown_block`  whether crossing the threshold STOPS entries
+                                (True, the default) or only raises an alert
+                                (False).
+
+        Alert-only is the useful mode on a small account. Blocking has a trap:
+        the drawdown can only shrink when a trade CLOSES, a trade can only
+        close if it was OPENED, and opening is exactly what the block prevents
+        — so a blocked strategy with nothing open cannot recover by trading.
+        With `max_drawdown_block=False` the strategy keeps trading, so it can
+        climb out on its own and the alert is genuinely self-clearing.
+        """
+        if side != "buy":
+            return RiskCheckResult(True)
+
+        # Read the settings BEFORE the query: a disabled gate must cost nothing.
+        # This loads the strategy's entire trade history, and it runs on every
+        # entry attempt — 321 of them on 2026-09-02 alone.
+        params = strategy.params_json or {}
+        max_drawdown_limit_pct = float(params.get('max_drawdown_pct', 10.0) or 0)
+        if max_drawdown_limit_pct <= 0:
+            return RiskCheckResult(True)  # gate switched off entirely
+
+        # Ordered explicitly. A cumulative running total is meaningless if the
+        # rows arrive in whatever order the database felt like returning them,
+        # and the previous form relied on exactly that.
         all_trades = self.db.query(Trade).filter(
             Trade.user_id == user.id,
             Trade.strategy_id == strategy.id,
             Trade.status == 'executed'
-        ).all()
+        ).order_by(Trade.timestamp).all()
 
         if not all_trades:
             return RiskCheckResult(True)  # No trade history yet
 
-        # Calculate cumulative P&L over time
         cumulative_pnl = 0.0
         peak_pnl = 0.0
-        max_drawdown = 0.0
-
         for trade in all_trades:
             cumulative_pnl += float(trade.pnl or 0.0)
             if cumulative_pnl > peak_pnl:
                 peak_pnl = cumulative_pnl
 
-            current_drawdown = peak_pnl - cumulative_pnl
-            if current_drawdown > max_drawdown:
-                max_drawdown = current_drawdown
+        # Distance below the high-water mark as of the last closed trade.
+        # Zero whenever the strategy is at a new peak.
+        current_drawdown = peak_pnl - cumulative_pnl
 
-        # Default max drawdown limit: 10% of account
         account_size = float(user.account_size_usd or 10000)
-        max_drawdown_limit_pct = strategy.params_json.get('max_drawdown_pct', 10.0)
         max_drawdown_limit = account_size * (max_drawdown_limit_pct / 100.0)
 
-        if max_drawdown > max_drawdown_limit:
-            return RiskCheckResult(
-                False,
-                f"Maximum drawdown exceeded: ${max_drawdown:.2f} (limit: ${max_drawdown_limit:.2f})"
-            )
+        # Defaults to True so any strategy that has not opted out keeps the
+        # behaviour it has today. Turning enforcement off is always explicit.
+        blocks = bool(params.get('max_drawdown_block', True))
 
-        # Warning if approaching limit (80%)
-        if max_drawdown > (max_drawdown_limit * 0.8):
+        if current_drawdown > max_drawdown_limit:
+            if blocks:
+                return RiskCheckResult(
+                    False,
+                    f"Drawdown limit reached: ${current_drawdown:.2f} below peak "
+                    f"(limit: ${max_drawdown_limit:.2f}). New entries paused until the "
+                    f"strategy recovers; open positions are unaffected.",
+                    code="max_drawdown",
+                )
+            # Alert-only: say so once, then let the strategy carry on trading.
+            self._note_drawdown_bleed(
+                user, strategy, current_drawdown, max_drawdown_limit, peak_pnl, cumulative_pnl
+            )
+            return RiskCheckResult(True)
+
+        # Hysteresis. Recovering to exactly the threshold would re-alert on the
+        # next tick that dips back over it; the bleed is only "cleared" once the
+        # strategy has climbed meaningfully clear of it.
+        if current_drawdown < (max_drawdown_limit * 0.8):
+            self._clear_drawdown_bleed(user, strategy, current_drawdown)
+        elif current_drawdown > (max_drawdown_limit * 0.8):
             logger.warning(
-                f"Approaching max drawdown limit: ${max_drawdown:.2f} / ${max_drawdown_limit:.2f}"
+                f"Strategy {strategy.id} approaching drawdown limit: "
+                f"${current_drawdown:.2f} / ${max_drawdown_limit:.2f}"
             )
 
         return RiskCheckResult(True)
 
-    def _check_position_limits(self, user: User, strategy: Strategy) -> RiskCheckResult:
-        """Check if we're at maximum number of open positions"""
+    def _check_position_limits(
+        self, user: User, strategy: Strategy, side: str = "buy"
+    ) -> RiskCheckResult:
+        """Check if we're at maximum number of open positions.
+
+        Entries-only. Blocking a sell here would be the worst of the three:
+        being AT the position cap is precisely when you most need to close
+        something.
+        """
+        if side != "buy":
+            return RiskCheckResult(True)
+
         open_positions = self.db.query(Position).filter(
             Position.user_id == user.id,
             Position.strategy_id == strategy.id,
@@ -462,17 +756,42 @@ class RiskManager:
         message: str,
         action_taken: str
     ):
-        """Log a risk event to the database"""
-        risk_event = RiskEvent(
-            user_id=user.id,
-            strategy_id=strategy.id,
-            event_type=event_type,
-            severity=severity,
-            message=message,
-            action_taken=action_taken
-        )
-        self.db.add(risk_event)
-        self.db.commit()
+        """Log a risk event to the database.
+
+        `RiskEvent` has no `message` column — it carries `details` JSON. This
+        passed `message=` anyway, which raised
+
+            TypeError: 'message' is an invalid keyword argument for RiskEvent
+
+        on every call, and there was no try/except to contain it. Three gates
+        route through here (per-strategy daily loss, max drawdown, position
+        cap), so a clean rejection became an exception, `strategy_executor`
+        counted it as a tick error, and at 20 consecutive errors the strategy
+        DEACTIVATED itself (`strategy_executor.py:238`) — turning "stop for
+        today" into "off until someone notices". The per-strategy daily cap
+        defaults to 5% of account, about two losing trades, so this was
+        reachable on any ordinary session.
+
+        Now mirrors `_log_account_risk_event`: writes `details`, and wraps the
+        write so a logging failure can never decide whether a trade happens.
+        """
+        try:
+            risk_event = RiskEvent(
+                user_id=user.id,
+                strategy_id=strategy.id if strategy is not None else None,
+                event_type=event_type,
+                severity=severity,
+                action_taken=action_taken,
+                details={"reason": message},
+            )
+            self.db.add(risk_event)
+            self.db.commit()
+        except Exception as exc:  # pragma: no cover - logging must never crash trade flow
+            try:
+                self.db.rollback()
+            except Exception:
+                pass
+            logger.error(f"Failed to persist {event_type} risk event: {exc}")
 
         logger.warning(
             f"Risk event: {event_type} ({severity}) - {message} - Action: {action_taken}"

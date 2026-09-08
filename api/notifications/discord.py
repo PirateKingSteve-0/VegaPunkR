@@ -9,6 +9,7 @@ shaped as:
         "webhook_url": str,            # full Discord webhook URL
         "notify_open": bool,           # default True when missing
         "notify_close": bool,          # default True when missing
+        "notify_risk": bool,           # default True when missing
     }
 
 All sends are best-effort and fired from a daemon thread so a slow or down
@@ -260,6 +261,150 @@ def notify_position_closed(
             f"Closed · {format_contract(option_symbol, symbol)}",
             tone, rows, strategy_name,
         ),
+    )
+
+
+def notify_strategy_blocked(
+    user_prefs: Optional[Dict[str, Any]],
+    strategy_name: Optional[str],
+    headline: str,
+    detail: str,
+) -> None:
+    """A strategy still reads as Active but will not open anything.
+
+    This is the message for the failure mode that has no other symptom: the
+    engine keeps evaluating, keeps generating signals, and silently refuses
+    every entry. Without this the only tell is an account that quietly stops
+    trading, which is indistinguishable from a market with no setups.
+
+    Fired ONCE, on the transition into the blocked state — see
+    RiskManager._note_entry_block. 2026-09-02 produced 321 entry signals in a
+    day; one message per refusal would be 321 posts.
+    """
+    discord = _discord_prefs(user_prefs)
+    if not discord.get("enabled") or not discord.get("notify_risk", True):
+        return
+    webhook = discord.get("webhook_url")
+    if not is_valid_discord_webhook(webhook):
+        return
+
+    rows = [
+        ("Reason", headline),
+        ("-", ""),
+        ("Entries", "PAUSED"),
+        # Stated explicitly because it is the first thing you want to know and
+        # the least obvious: a blocked strategy is not an abandoned position.
+        ("Open positions", "unaffected — exits still run"),
+    ]
+
+    # WARNING, not LOSS: nothing has lost money. Something has stopped.
+    _post_async(
+        webhook,
+        _embed("Strategy blocked · entries paused", WARNING, rows, strategy_name),
+    )
+
+
+def notify_strategy_unblocked(
+    user_prefs: Optional[Dict[str, Any]],
+    strategy_name: Optional[str],
+    headline: str,
+    skipped: int,
+) -> None:
+    """The block cleared. Reports what the quiet period cost.
+
+    Sent so a blocked alert can never be left hanging — every "entries paused"
+    gets a matching "entries resumed", and the skipped count says how many
+    setups went by in between.
+    """
+    discord = _discord_prefs(user_prefs)
+    if not discord.get("enabled") or not discord.get("notify_risk", True):
+        return
+    webhook = discord.get("webhook_url")
+    if not is_valid_discord_webhook(webhook):
+        return
+
+    rows = [
+        ("Cleared", headline),
+        ("-", ""),
+        ("Entries", "RESUMED"),
+        ("Skipped while blocked", f"{skipped}"),
+    ]
+
+    _post_async(
+        webhook,
+        _embed("Strategy unblocked · entries resumed", INFO, rows, strategy_name),
+    )
+
+
+def notify_strategy_bleeding(
+    user_prefs: Optional[Dict[str, Any]],
+    strategy_name: Optional[str],
+    drawdown: float,
+    limit: float,
+    peak: float,
+    cumulative: float,
+) -> None:
+    """The strategy is past its drawdown threshold but still trading.
+
+    The alert-only counterpart to `notify_strategy_blocked`. Nothing has
+    stopped — this is the "come and look at this" message for a strategy that
+    is grinding down without ever tripping a daily cap, which is the one
+    failure mode the per-day limits cannot see.
+
+    Fired once, on the transition over the threshold.
+    """
+    discord = _discord_prefs(user_prefs)
+    if not discord.get("enabled") or not discord.get("notify_risk", True):
+        return
+    webhook = discord.get("webhook_url")
+    if not is_valid_discord_webhook(webhook):
+        return
+
+    rows = [
+        ("Down from peak", _money(drawdown)),
+        ("Threshold", _money(limit)),
+        ("-", ""),
+        ("Best ever", _signed_money(peak)),
+        ("Now", _signed_money(cumulative)),
+        ("-", ""),
+        # The whole point of alert-only mode, said out loud.
+        ("Entries", "still running — not blocked"),
+    ]
+
+    _post_async(
+        webhook,
+        _embed("Strategy bleeding · drawdown threshold passed", WARNING, rows, strategy_name),
+    )
+
+
+def notify_strategy_recovered(
+    user_prefs: Optional[Dict[str, Any]],
+    strategy_name: Optional[str],
+    drawdown: float,
+    was: float,
+) -> None:
+    """Climbed back clear of the drawdown threshold.
+
+    Sent so a bleed alert is never left hanging — every "bleeding" gets a
+    matching all-clear.
+    """
+    discord = _discord_prefs(user_prefs)
+    if not discord.get("enabled") or not discord.get("notify_risk", True):
+        return
+    webhook = discord.get("webhook_url")
+    if not is_valid_discord_webhook(webhook):
+        return
+
+    rows = [
+        ("Down from peak", _money(drawdown)),
+        ("Was", _money(was)),
+        ("-", ""),
+        ("Status", "recovered"),
+    ]
+
+    _post_async(
+        webhook,
+        _embed("Strategy recovered · drawdown eased", INFO, rows, strategy_name),
     )
 
 

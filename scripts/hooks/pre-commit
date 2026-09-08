@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+#
+# Pre-commit gate: the whole suite must pass, and engine changes should carry
+# test changes.
+#
+# Lives in the repo (not .git/hooks) so it is version-controlled and applies on
+# every machine. Enabled with:
+#
+#     git config core.hooksPath scripts/hooks
+#
+# Bypass for a genuine emergency:  git commit --no-verify
+# Use that sparingly — a gate that is routinely skipped is not a gate.
+set -uo pipefail
+
+repo_root=$(git rev-parse --show-toplevel)
+cd "$repo_root" || exit 1
+
+echo "pre-commit: running test suite..."
+if ! ./scripts/run_tests.sh -q; then
+    cat <<'MSG'
+
+  COMMIT BLOCKED — tests failed.
+
+  Fix the code, or update the test if the behaviour changed deliberately.
+  A test that no longer matches the code is not noise to be silenced: it is
+  the only thing standing between a refactor and a live-money defect.
+
+  Emergency bypass:  git commit --no-verify
+MSG
+    exit 1
+fi
+
+# --- advisory: engine changed, tests did not -------------------------------
+#
+# NOT a block. Plenty of engine commits legitimately touch no test — comments,
+# logging, a docstring. Blocking those would train the reflex of reaching for
+# --no-verify, and then the hard gate above stops being read either.
+staged=$(git diff --cached --name-only --diff-filter=ACM)
+engine_changed=$(echo "$staged" | grep -c '^api/engine/' || true)
+tests_changed=$(echo "$staged" | grep -c '^api/tests/' || true)
+
+if [ "$engine_changed" -gt 0 ] && [ "$tests_changed" -eq 0 ]; then
+    cat <<MSG
+
+  NOTE: $engine_changed engine file(s) staged, no test changes.
+
+$(echo "$staged" | grep '^api/engine/' | sed 's/^/    /')
+
+  If this changes behaviour, it wants a test. If it is comments, logging or
+  naming, carry on — this is advisory only.
+MSG
+fi
+
+echo "pre-commit: OK"
+exit 0

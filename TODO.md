@@ -159,11 +159,241 @@ is live data to size the target against.
 
 ---
 
+### D3. ~~The drawdown gate was a latch, not a limit~~ *(FIXED 2026-09-05)*
+
+> `RiskManager._check_max_drawdown` compared the **worst drawdown ever recorded** against the
+> limit. A running maximum only rises, nothing reset it, and the query had no date filter — so one
+> bad stretch retired the strategy permanently. It kept reading as **Active**, kept evaluating,
+> kept generating signals, and silently refused every entry, with no alert and nothing on screen
+> to explain it. The only way to clear it was to edit the database.
+>
+> **Caught at $2.43 of margin.** Measured on prod 2026-09-05:
+>
+> | | worst-ever dd | current dd | limit (10% of $1,214.25) | headroom |
+> |---|---|---|---|---|
+> | strategy 3 (calls) | $119.00 | $119.00 | $121.43 | **$2.43** |
+> | strategy 4 (puts) | $71.00 | $71.00 | $121.43 | $50.43 |
+>
+> **What changed.** The gate now measures the **current** distance below the strategy's own
+> high-water mark, so winning the drawdown back lifts the block. Trades are also now read
+> `ORDER BY timestamp` — a cumulative running total was previously computed over whatever order
+> the database happened to return, which made `peak` (and therefore the drawdown) arbitrary.
+>
+> This is deliberately **more permissive** than before: current drawdown can never exceed
+> worst-ever. That is the point — the old bound was not a risk control, it was a latch.
+>
+> **It does not remove the near-miss.** Strategy 3 is currently sitting *at* its trough, so
+> current dd == worst-ever dd == $119.00 and the $2.43 headroom is unchanged. The next losing
+> trade still pauses it. The difference is that it now **un-pauses on recovery** instead of
+> retiring. Open question: 10% of a $1,214 account is ~2 losing trades — decide whether
+> `max_drawdown_pct` is tuned for an account this size.
+>
+> **The recovery path is narrower than it first looked.** Current drawdown only shrinks when a
+> trade CLOSES, a trade can only close if it was OPENED, and opening is exactly what the block
+> prevents. A blocked strategy holding nothing therefore *cannot* trade its way out — the only
+> escapes are a position that was already open when the block tripped, or `account_size_usd`
+> growing until 10% of it clears the drawdown (from $1,168 that needs $1,650, +41%, and it would
+> have to come from another strategy). So the fix converted "blocked forever because you EVER had
+> a bad stretch" into "blocked forever because you are CURRENTLY in one" — strictly better, and
+> still a latch while enforcement is on.
+>
+> **Hence two settings, not one:**
+>
+> | key | meaning |
+> |---|---|
+> | `max_drawdown_pct` | threshold as % of account. **`<= 0` disables everything** — no alert, no block, and no DB query. |
+> | `max_drawdown_block` | `True` (default) crossing it stops entries; `False` it only raises an alert and the strategy keeps trading. |
+>
+> Alert-only is the useful mode on a small account: the strategy keeps trading, so it can climb
+> out on its own and the alert is genuinely self-clearing. `max_drawdown_block` defaults to `True`
+> so nothing that has not explicitly opted out changes behaviour.
+>
+> Reading the settings now happens BEFORE the trade query, so a disabled gate costs nothing. That
+> query loads the strategy's entire history and runs on every entry attempt — 321 times on
+> 2026-09-02.
+>
+> Bleed alerts (`notify_strategy_bleeding` / `notify_strategy_recovered`) fire once on the
+> transition over the threshold, and clear with **hysteresis at 80%** so a strategy sitting on the
+> line does not alternate messages.
+>
+> **Still deferred:** the lookback window and a manual clear. Both only matter with
+> `max_drawdown_block=True`, which nothing currently uses.
+>
+> Tests: `api/tests/test_max_drawdown_recovery.py` (28 cases: recovery to a new high, recovery to
+> flat, still-in-the-hole, insertion-order independence, badge/gate agreement, account-size
+> scaling, notification safety, the off switch, absent-means-default, alert-only mode, re-alert
+> suppression across 50 evaluations, and the hysteresis band).
+
+### D4. ~~A blocked strategy looked identical to a healthy one~~ *(FIXED 2026-09-05)*
+
+> Every silent entry block had the same symptom: an account that quietly stops trading, which is
+> indistinguishable from a market with no setups. Now surfaced two ways.
+>
+> **Discord** — `notify_strategy_blocked` / `notify_strategy_unblocked`, gated on a new
+> `notification_preferences.discord.notify_risk` (defaults True). Fired **once**, on the
+> transition into the blocked state, and once again on recovery with the count of entries skipped
+> in between. Throttling is not optional here: 2026-09-02 produced **321 entry signals in one
+> day**, and this gate is evaluated on every one of them. Mirrors the
+> `OrderManager._cash_block_state` idiom — announce the transition, count the repeats quietly.
+>
+> **UI** — the strategies table shows a `Blocked` chip beside `Active`, with the reason on hover.
+> Backed by `RiskManager.get_entry_block_status`, a read-only evaluation that runs the same
+> private checks in the same order as `validate_pre_trade`, so the badge cannot disagree with the
+> engine. It writes nothing and commits nothing; a failure is swallowed and the page renders
+> without a badge rather than 500ing.
+>
+> Covered codes — the blocks with no other symptom: `mode_mismatch`, `account_daily_loss`,
+> `strategy_daily_loss`, `max_drawdown`. Deliberately **excluded** as self-evident: an inactive
+> strategy, the manual "done for the day" halt, and the position cap (normal operation, fires
+> constantly). Out-of-cash entries already have their own `ENTRY_SKIPPED_NO_CASH` event.
+
+### D5. ~~`_log_risk_event` raises TypeError — a tripped cap DEACTIVATES the strategy~~ *(FIXED 2026-09-07)*
+
+> **Fixed exactly as prescribed below, verified 2026-09-07.** `_log_risk_event` now writes
+> `details={"reason": message}` instead of `message=`, and wraps the write in the same try/except
+> as `_log_account_risk_event` — with a rollback — so a logging failure can never decide whether a
+> trade happens. The `logger.warning` is outside the try, so the event is still visible even when
+> the row cannot be written.
+>
+> The test the item asked for exists: `api/tests/test_risk_event_logging.py` trips all three gates
+> **through `validate_pre_trade`** (not the private checks), asserts a failed write still returns a
+> clean `rejected`, and asserts a SELL is approved on every one of the four gates. All passing.
+>
+> Uncommitted as of 2026-09-07: `api/engine/risk_manager.py` is modified in the working tree and
+> `api/tests/test_risk_event_logging.py` is still untracked.
+
+`RiskEvent` has no `message` column (`models.py`) — it carries `details` JSON. `_log_risk_event`
+passes `message=message` to the constructor anyway, and unlike its sibling
+`_log_account_risk_event` it has **no try/except**. Reproduced:
+
+```
+TypeError: 'message' is an invalid keyword argument for RiskEvent
+```
+
+The docstring on `_log_account_risk_event` already names this ("the legacy `_log_risk_event`,
+which references a `message` column that doesn't exist on the model") — the newer writer was
+written correctly and the old one was left in place.
+
+**Three gates route through it:** the per-strategy daily loss limit, max drawdown, and the
+position cap. So a *clean rejection* becomes an *exception*, and then:
+
+```
+cap trips -> TypeError -> caught at strategy_executor.py:229 -> state.error_count += 1
+          -> repeats on every entry attempt
+          -> at 20 consecutive errors: strategy.is_active = False   (:238)
+```
+
+**Hitting a daily loss cap does not pause the strategy for the day — it turns the strategy OFF,
+and it stays off tomorrow.** 2026-09-02 produced 321 entry signals in a day; 20 consecutive
+errors is a couple of minutes.
+
+**Reachable on the next session.** The per-strategy default is 5% of account = **$60.71**, about
+two typical losing trades ($46/$39/$34 observed).
+
+Knock-on: the D4 alerts never fire on these paths — `_note_entry_block` is called *after*
+`_log_risk_event`, so the exception pre-empts it. A strategy that deactivates itself this way
+sends nothing.
+
+Not caused by the D3/D4 work; it predates it. Contained in one respect: exits are unaffected,
+because a strategy holding a position runs the exit-only tick, which never calls
+`validate_pre_trade`.
+
+**Fix:** make `_log_risk_event` match `_log_account_risk_event` — write `details={"reason": ...}`
+instead of `message=`, and wrap it in the same try/except so a logging failure can never decide
+whether a trade happens. Needs a test that trips each of the three gates through
+`validate_pre_trade` (the existing tests call the private checks directly and miss this).
+
+### D6. Position sizing does not scale with the account — acknowledge before the next band *(planning, 2026-09-07)*
+
+Full write-up: **[docs/risk-bands.md](docs/risk-bands.md)**. Nothing implemented; this item exists so
+the decision is made deliberately rather than on a market morning.
+
+**The situation.** A $3.00 contract costs $300, which is **24.7% of the $1,214 account**. That was
+never chosen — it is what the current settings happen to produce at this balance, and it goes wrong
+in both directions as the balance moves. `max_contracts: 3` binds around $5,000 and never releases,
+so exposure drifts from 24.7% down to **0.9% at $100k** by accident rather than by design. Today's
+settings are roughly right between $5k and $25k and wrong at both ends.
+
+**Two things that surprise everyone reading the sizing code:**
+
+- `risk_per_trade_pct: 50` does **not** risk 50%. `SAFETY_FACTOR = 2.0` halves it — 50 deploys ~25%.
+  The rule of thumb is `risk_per_trade_pct ≈ 2 × (target % of account per position)`.
+- It is a `min()` of `risk_per_trade_pct` and the user's `max_trade_percentage`, both 50 today.
+  **Changing one alone does nothing.**
+
+**Size against the tail, not the stop.** The 15% stop is 3.7% of the account; the contract going to
+zero is 24.7%. There are still no broker-side stops (TODO #1), 0DTE genuinely goes to zero, and a gap
+never gives a simulated stop a price to fire at. The tail is the honest number.
+
+**Proposed bands** (verified against `calculate_position_size` at a $3.00 premium — set
+`risk_per_trade_pct` **and** `max_trade_percentage` together):
+
+| band | account | risk pct | `max_contracts` | result |
+|---|---|---|---|---|
+| A | < $2,500 | 50 | 3 | 1 contract, 13–25% *(no choice available)* |
+| B | $2,500–10k | 20 | 3 | 10.0% |
+| C | $10k–25k | 10 | 6 | 4.5–5.0% |
+| D | $25k–50k | 6 | 10 | 2.7–3.0% |
+| E | $50k–100k | 4 | 15 | 2.0% |
+| F | $100k+ | 2 | 25 | 1.0% |
+
+**A band table alone does not bound risk** — this is the part worth carrying forward. The settings
+cap the capital *allocated*, not the fraction of the account one position represents. Rerun band A at
+a **$5.00** premium and the same settings produce **41.2%** of the account in one contract. The
+companion is a new entries-only gate in `validate_pre_trade`:
+
+```
+reject when  qty × premium × 100  >  account_size × max_position_pct / 100
+```
+
+Sells never gated, a hard ceiling rather than a silent resize, carries a machine-readable `code` so
+it joins the D4 alert and the Blocked badge. It only ever removes trades, so it composes cleanly.
+
+**How to roll it out** — recommended order is (1) this doc plus a manual checklist, (2) a
+`--dry-run` script that prints the band and the diff, (3) an advisory UI banner when
+`account_size_usd` crosses a boundary. **Explicitly NOT** automatic sizing from a band table: it
+makes position size change with no diff, no event and nothing to point at afterwards, and "why did it
+buy 2 contracts today" would mean reconstructing a historical balance.
+
+**Open questions carried in the doc:** whether `daily_loss_limit_pct` needs its own band column (5%
+is $61 today and $5,000 at $100k), whether `max_positions` should rise above 1, and whether bands
+apply per strategy or across the account — two strategies at 10% each is 20% deployed and nothing
+currently checks the total.
+
+---
+
 ## E. Exit rule structure *(from the 2026-09-02 live session)*
 
 Full write-up: `docs/live-test-results-2026-09-02.md`.
 
-### E1. The trailing stop is unreachable by construction *(structural bug)*
+### E1. ~~The trailing stop is unreachable by construction~~ *(FIXED 2026-09-03 — exercised live 2026-09-04)*
+
+> **Fixed in `signal_generator.check_exit_signal`.** Order is now stop loss -> trailing stop ->
+> take profit, and critically the **take profit is SUPPRESSED while the trail is armed**.
+> Reordering alone would not have worked: at the tick where price touches +TP the trail is not yet
+> hit, so it falls through to the target regardless — the target has to stand down for the trail to
+> govern. Unchecking `trailing_stop` restores the old behaviour exactly.
+>
+> **Exercised live 2026-09-04 — the branch fires, and it pays.** Two `Trailing stop hit:` exits,
+> both on strategy 4 (puts, `SPY260904P00774000`):
+>
+> | entry | trail level | exit fill | realised | |
+> |---|---|---|---|---|
+> | $2.97 (10:29:30 ET) | $4.44 (peak ~$4.93) | $4.50 | **+$153** | the flat +30% target would have sold at $3.86 = +$89 |
+> | $2.88 (10:16:39 ET) | $3.02 (peak ~$3.35) | $3.02 | **+$14** | armed just past +15%, then reversed |
+>
+> The $153 trade is the proof this item was waiting for. `take_profit_percentage=30` was correctly
+> suppressed while the trail was armed, so the position ran to a ~$4.93 peak instead of being sold
+> at $3.86 — **+$153 against +$89**; the flat target would have surrendered 42% of the move.
+>
+> The $14 trade is the other side of the trade-off, exactly as predicted below: armed at ~+16%,
+> reversed, exited at +4.5% rather than running to the target. A small win instead of a probable
+> stop-loss — the cost of letting winners run.
+>
+> Source: `logs/livetest-2026-09-03/engine-20260903-061605.log` lines 28859 and 29072 (the 09-03
+> log file spans into the 09-04 session).
+
+The original finding, kept for the reasoning:
 
 > **2026-09-02 — FIXED, and option (a) as written below does NOT work.** Reordering the branches
 > changes nothing: the flat target fires on the way UP, at the tick price first crosses +25%, when
@@ -186,6 +416,11 @@ Full write-up: `docs/live-test-results-2026-09-02.md`.
 > revert**, live within ~30s via `db.refresh(strategy)`, no deploy. Tests:
 > `api/tests/test_trailing_stop_arming.py` (18 cases: arm/disarm boundaries, the 09-02 runner
 > replay, SL precedence, shorts, trail-off regression).
+
+> 📜 **Everything from here to the end of E1 is the original 2026-09-02 analysis, preserved for the
+> reasoning that justified the fix. It describes the PRE-FIX engine and is no longer true — the
+> trail is reachable, has fired live, and neither fix option below is what shipped.** Current state
+> is at the top of this item.
 
 Prod strategy 3 is configured `trailing_stop=true, activation=15%, distance=10%,
 take_profit=25%`. `signal_generator.check_exit_signal` evaluates in a fixed order, each branch
@@ -227,6 +462,24 @@ The P&L difference is modest (~+$60). **The cost that matters is the cash** — 
 
 ### E2. Settled cash is the binding constraint, and the flat target doubles its consumption
 
+> **2026-09-05 — the 214 wasted previews are fixed (results doc §S2).** `_preview_or_abort` now runs
+> a settled-cash check BEFORE the broker preview, on buys only. Cash comes from a 60s cache
+> (`SETTLED_CASH_CACHE_SECONDS`, invalidated on every fill), so the precheck costs no broker call of
+> its own — it replaces 214 round trips with one balance fetch per minute.
+>
+> Deliberately permissive: the estimate omits commission/fees in prod, so it runs slightly LOW and
+> lets marginal orders through to the authoritative gate, which is unchanged and still decides.
+> Unknown price or unknown cash → proceed. **Sells are never gated** — a cash shortfall must not be
+> able to strand an open position.
+>
+> Logging is state-based, not per-event: one WARNING + one `ENTRY_SKIPPED_NO_CASH` row on the way
+> in, skips counted quietly, a total reported when cash returns. The count is the useful part — it
+> is the evidence that cash, not the strategy, is the binding constraint.
+>
+> Tests: `api/tests/test_cash_precheck_gate.py` (17 cases, sell-never-gated first among them).
+> Still open here: the reservation-ledger probe (A1) has never been run, and there is no end-of-day
+> summary line if the block never clears before shutdown.
+
 The 09-02 session generated **321 entry signals**, executed **3**, and produced **214 rejected
 previews** (`Tradier preview rejected: You do not have enough buying power`). T+1 settlement on a
 cash account: $1,060 settled at the open, $13.46 by 11:48 ET, proceeds unusable until the next day.
@@ -251,6 +504,334 @@ flat target spends two of them on one move.
 Trade 3 stopped at 2.50 (−15.5%); the contract recovered to 2.98 (high 3.13) by 12:00 and was back
 to **2.50 by 13:00**. It reads as a shakeout at twelve minutes and as a correct exit at the hour.
 One ambiguous trade. Listed explicitly so it is not quietly retuned.
+
+### E5. ~~Capture MFE/MAE per trade — the data is being destroyed~~ *(DONE 2026-09-05)*
+
+> **Shipped.** `trades.mfe_price` / `mae_price` added (migration `a1b2c3d4e5f6`, applied to **DEV
+> and PROD**), and `order_manager` snapshots `position.peak_price` / `trough_price` onto the SELL
+> leg at close — before any re-entry can reset them. Covered by
+> `api/tests/test_mfe_mae_capture.py`, whose load-bearing assertion is that a reopen wipes the
+> position's peak while the already-closed leg keeps its own.
+>
+> Note the reset only fires on the **reopen** path (a row already at `qty=0`). With `qty>0`
+> `_update_position_entry` averages into the open position and legitimately keeps the peak.
+>
+> **Migration gotcha for next time:** the first PROD attempt stalled 4.5 min and had to be
+> cancelled. The running engine holds connections `idle in transaction`, which keeps an
+> `AccessShareLock` on `trades`; the `ALTER` queued for `AccessExclusiveLock`, and a queued
+> exclusive request makes every later reader queue behind it too. **Stop the app before DDL on
+> `trades` / `positions`.** Nothing was half-applied — the transaction rolled back clean.
+>
+> Data starts accumulating from the next live session. Historical trades stay NULL.
+
+The original finding, kept for the reasoning:
+
+`Position.peak_price` / `trough_price` are Maximum Favorable / Adverse Excursion in all but name,
+and they are the single most useful diagnostic for exit-rule quality. **They are currently
+unrecoverable after the fact.**
+
+Two problems:
+
+1. `Trade` has **no** `peak_price` / `trough_price` columns — MFE is never written to the
+   immutable record.
+2. `order_manager.py:1348` resets `position.peak_price = price` on every reopen, and position rows
+   are reused for re-entries. So MFE survives only for a row's **most recent cycle**.
+
+On 2026-09-02 that already cost us: trade 1's peak was overwritten by trade 2's re-entry into the
+same contract, hours after the fact. Only pos2's peak survived long enough to be read — and it is
+the evidence that the day's only loser was +22% before it reversed
+(`docs/live-test-results-2026-09-02.md` §F7b). **Every future session loses this silently.**
+
+**Fix:** add `mfe_price` / `mae_price` to `Trade`, and copy `position.peak_price` /
+`trough_price` onto the sell-leg Trade row in `_update_position_exit` before the reopen path can
+reset them.
+
+**Sequencing — this is not a UI change.** Model change -> Alembic migration on **DEV *and* PROD**
+before the model edit lands (`reload=True` means a models.py save hits the live shared DB
+instantly) -> `order_manager` write (engine code, so it needs the usual care and a test) -> then
+the metric is computable and the UI can show it.
+
+**Do this before E1.** E1's whole case rests on MFE, and right now the argument can only be made
+from one surviving row. A week of captured MFE turns "it cost a winner on 09-02" into a
+distribution.
+
+**Metric it unlocks:** *MFE capture ratio* = realized P&L / MFE. 09-02 was `100%, 100%, -70%`. A
+persistently low ratio means the exit rule is systematically leaving the move behind; a negative
+one means a position that was well in profit closed at a loss.
+
+### E6. Performance metrics we do not compute
+
+Prompted by comparing our reports against Tradervue / Lightspeed (2026-09-02). We already have
+`win_rate`, `profit_factor`, `sharpe_ratio`, `max_drawdown`, `total_pnl`, `net_pnl`,
+`total_trades`, `commission`, `fees`, `cum_pnl` equity curve, per-strategy breakdown.
+
+**Worth adding — computable from existing `Trade` rows, no schema change:**
+
+- **Expectancy** — `(win% x avgWin) - (loss% x avgLoss)`. Best single-line summary of an edge.
+- **Average winning trade vs average losing trade** (payoff ratio). Win rate alone misleads.
+- **Largest gain / largest loss** — catches outlier dependence.
+- **Hold time split by winner / loser.** The classic cut-winners/ride-losers tell. 09-02: winners
+  6 and 14 min, loser 32 min — the same shape as the Tradervue reference (5 min winners, 8 min
+  losers).
+- **Max consecutive wins / losses** — position-sizing input.
+
+**Needs E5 first:** average MFE / MAE, MFE capture ratio.
+
+**NOT worth building yet:** SQN, K-Ratio, Kelly %, Probability of Random Chance, trade P&L standard
+deviation. All need sample sizes unreachable at ~3 trades/day (the Tradervue reference has 1,709
+trades over a year). They would render confident-looking noise. Revisit at a few hundred trades.
+
+**Also low value now:** Lightspeed-style gross-vs-net with a fee breakdown (Reg Fees / Fee Cost /
+Other Fees). Tradier reports commission and fees as `0` even on live, and real fees are ~$0.18 per
+contract inferred from cash reconciliation — see the results doc.
+
+### E7. Deep-ITM puts structurally cannot clear the OI floor *(2026-09-03)*
+
+The put strategy has now run two live sessions and **entered zero trades**. On 09-03 it rejected
+its contract scan **329 times**, always the same way:
+
+```
+181 puts scanned: 179 wrong delta (need 0.6-0.85), 0 no ask, 0 spread too wide, 2 low OI
+closest to target: strike=770.0 delta=0.688 (SPY260903P00770000)
+```
+
+Only two puts fell in the delta band, and both failed `min_open_interest: 3000`. Verified against
+the live chain the same hour:
+
+```
+PUTS  in band            CALLS in band
+P00774000  OI =    1     C00772000  OI = 6,443
+P00775000  OI =    8     C00771000  OI = 7,815
+                         C00770000  OI = 8,005
+```
+
+**The OI reading was accurate** — this is not a data bug.
+
+**Why it is geometric, not incidental.** A put at delta 0.60-0.85 is deep in the money, which means
+a strike ABOVE spot. SPY sat at 771.76, so the band lands on 774/775 — strikes SPY had not traded
+at that day, where no interest has accumulated. Calls at the same delta sit at 770-772, exactly
+where price has been all session, so they carry thousands of contracts.
+
+**Consequence:** deep-ITM puts only accumulate OI at strikes the underlying has already *fallen
+from*. So the put side cannot arm on a rising day at all, and on a falling day can only arm once
+the decline is well established. **The strategy is late to the put side by construction.** The
+09-02 session is the counter-example that proves the mechanism: SPY had been at 764+ earlier, so
+the 765/766 puts carried OI 3,186 / 7,728 and did qualify.
+
+This is the delta-band-vs-OI tension already noted for calls (see the defaults item below), now
+shown to be *asymmetric* — it bites the put side far harder.
+
+**Do not change the floor on this.** It was set deliberately and the user has asked for research
+before adjusting it. Recorded so the decision is made on evidence:
+
+- Measure how often, across a month, ANY put clears both gates — is the put strategy usable at all
+  at these settings, or is it dead weight burning eval cycles?
+- If the answer is "rarely", the lever is the delta band, not the OI floor: a 0.35-0.55 band sits
+  nearer the money where OI actually lives, on both sides. That is a different strategy, not a
+  cheaper version of this one — it needs its own backtest.
+- Cheap interim: log a daily one-liner of best-in-band OI per side, so the distribution accumulates
+  without anyone watching for it.
+
+### E8. Consider a tiered (tightening) trailing stop *(idea — needs data first)*
+
+A fixed 10% trail hands back 10% of the **peak price**, so the give-back in P&L points grows with
+the size of the move:
+
+| peak | realised | handed back |
+|---|---|---|
+| +66% | +49% | ~17 pts *(the real 2026-09-04 trade)* |
+| +100% | +80% | 20 pts |
+| +200% | +170% | 30 pts |
+
+A tiered trail — e.g. 10% up to +50%, 7% to +100%, 5% beyond — would bank more of a big run while
+leaving normal trades alone.
+
+**Do not build this yet.** There is exactly ONE big winner on record (09-04, peak +66%). Tuning an
+exit rule on n=1 is how the retracted 31%-win-rate analysis happened.
+
+**The blocker is already lifting:** E5 now writes `mfe_price` / `mae_price` onto every closed
+trade, so each round trip records how far it ran before turning. After a few more live sessions
+the MFE distribution answers this directly — what fraction of trades exceed +50%, +100%, and how
+much a tighter band would have cost the ones that did not. Revisit then, with the distribution,
+not with an intuition.
+
+Related: `take_profit_pct` is inert whenever `trailing_stop_activation <= take_profit_pct`, which
+is the current config (15 vs 25). Raising the target to 50/75/100 changes nothing. Note that
+`trading_safeguards.validate_strategy_params` rejects `take_profit_pct > 100` — dead code today
+(nothing calls `check_pre_trade_safeguards`) but a landmine if it is ever wired up.
+
+### E11. Re-run the edge analysis at adequate sample size *(BLOCKED on n — do not judge the strategy before this)*
+
+**Trigger: ~62 closed round trips for a first read, ~126 for a confident one.** At ~3 trades/day
+that is roughly 21 and 42 trading days from 2026-09-04. Do not re-litigate "is the strategy good"
+before the first threshold — the answer cannot be computed, and looking early invites tuning to
+noise.
+
+#### Week-one baseline, locked in for comparison (2026-09-02 -> 09-04, PROD, live money)
+
+```
+ id  date        strat kind  entry   exit      pnl    ret%   exit reason
+  2  2026-09-02  s3    CALL   3.27   4.11   +84.00  +25.7   Take profit
+  4  2026-09-02  s3    CALL   4.23   5.28  +105.00  +24.8   Take profit
+  6  2026-09-02  s3    CALL   2.96   2.50   -46.00  -15.5   Stop loss
+  8  2026-09-03  s3    CALL   2.36   1.97   -39.00  -16.5   Stop loss
+ 10  2026-09-03  s3    CALL   2.16   1.82   -34.00  -15.7   Stop loss
+ 12  2026-09-04  s4    PUT    2.88   3.02   +14.00   +4.9   Trailing stop
+ 14  2026-09-04  s4    PUT    2.97   4.50  +153.00  +51.5   Trailing stop
+ 16  2026-09-04  s4    PUT    4.57   3.86   -71.00  -15.5   Stop loss
+
+n=8  win rate 50%  total +$166  expectancy +$20.75/trade
+avg win +$89  avg loss -$47.50  payoff 1.87x  profit factor 1.87
+sd $82.87  se $29.30  t=0.71  (needs ~2.36 at n=8)
+95% CI for the true per-trade edge: -$48 to +$90     <- contains zero
+equity $1,060 -> $1,214 (+14.5%)
+```
+
+#### Why week one proves nothing, and what to guard against repeating
+
+- **The CI contains zero and contains -$48/trade.** t=0.71 is a coin flip. "Positive after a week"
+  is not evidence of an edge.
+- **One trade is 92% of the profit.** Without t14 (+$153) the week is +$13 over 7 trades. Check
+  outlier dependence again next time — if the result still rests on one or two trades, n is still
+  too small regardless of what the count says.
+- **The 8 trades are TWO rule sets, not one.** The trailing-stop fix (E1) landed mid-week:
+  pre-fix 09-02 = +$143 over 3; post-fix 09-03/04 = +$23 over 5. Pooling them is wrong. **Going
+  forward, segment by exit-rule version** — and note the OLD logic produced the better days, so
+  "the trail is better" is also unproven.
+- **It contradicts the 8-day replay** (114 signals: calls 32% right, puts 42%, both
+  anti-predictive). One good week does not overturn that; it is exactly the variance that study
+  predicts. If the larger sample disagrees with the replay, work out WHY before believing it.
+
+#### What to compute when the sample arrives
+
+- Expectancy with a confidence interval; win rate, payoff, profit factor.
+- **MFE capture ratio** (realised / MFE) — available from the next session onward now that E5 has
+  shipped. This is the number that says whether the exit rule leaves money behind, and week one
+  had to be argued from a single surviving row.
+- **MAE distribution on losers** — how often does a stopped-out trade later reach +15%? That is
+  the real test of the stop distance, and the question E3 refused to answer on two data points.
+- Split by direction (call vs put) and by strategy id — s3 and s4 traded on different days in week
+  one, so nothing about their relative quality is known.
+- Hold time split by outcome, and exit-reason mix (TP / SL / trail / EOD).
+
+#### Standing caution
+
+Established after four live sessions: the **machinery** (0% decision-vs-fill mismatch, sane holds,
+no phantom adoptions, correct T+1 settlement, no GFV). The **edge** is not established. Keep those
+two claims separate in any write-up.
+
+### E9. `strategy_type` is load-bearing, and three places disagree about it *(2026-09-06)*
+
+The engine decides whether it is sizing **options or shares** by string-matching the strategy type:
+
+```python
+_is_options = any(k in strategy.strategy_type.lower() for k in ('option', '0dte', 'scalping'))
+```
+
+`risk_manager.py:282` picks the sizing formula (`capital / (price * 100 * 2)` vs `capital / price`);
+`strategy_executor.py:303` picks whether to size off the option premium or the underlying. Measured
+on the live account ($1,214.25, 50% risk, $3.00 contract):
+
+| `strategy_type` | position |
+|---|---|
+| `scalping_0dte` / `momentum_0dte` | **1 contract** (~$300) |
+| `momentum` | **3 contracts** (~$900) — the share formula reads "$3.00" as $3, computes 202, and only `max_contracts: 3` stops it |
+
+**The sizing logic would ask for $60,600 of options on a $1,214 account.** What actually protects
+you is the `max_contracts` cap and Tradier rejecting for buying power — not the sizing code.
+
+A third site, `trading_safeguards.py:79`, matches on **`'option'` alone**, which
+`scalping_0dte` never contained and `momentum_0dte` still does not. So the delta-band config check
+has never run on these strategies. Doubly disconnected: the function it lives in
+(`validate_strategy_params`) is also dead — nothing calls `check_pre_trade_safeguards`. Left alone
+deliberately; wiring up an untested all-or-nothing gate before a live session is the wrong trade,
+and it would still not match. Note their configured band is `delta_min 0.6 / delta_max 0.85`, inside
+the validator's `[0.30, 0.90]`, so enabling it would change nothing anyway.
+
+**The real delta protection is NOT dead** and never was: `stream_driven_worker.py:1217` rejects any
+contract outside the configured band at selection time, and `:1523` drops an armed contract that
+drifts out.
+
+Done 2026-09-06: strategies renamed to `momentum_0dte` (sizing verified byte-identical before and
+after), `MOMENTUM_0DTE` added to the UI `StrategyType` enum with a warning comment, and a hint added
+to the strategy form. Before that, `momentum` was in the dropdown and `momentum_0dte` was not —
+picking the obvious option would have tripled position size silently.
+
+**DONE 2026-09-06 — the instrument is now a stored fact.** `strategies.instrument_type`
+(`'option' | 'equity' | NULL`), migration `b7c3d9e4f2a8`, applied and backfilled on **dev and prod**.
+Read through a single `Strategy.trades_options` property, so the question has one definition next to
+the data instead of two independent string matches. Both call sites (`risk_manager.py:283`,
+`strategy_executor.py:303`) now call it.
+
+`NULL` is load-bearing: it falls back to the old string match, so a row this has never touched
+behaves exactly as before. The change therefore cannot alter behaviour for unmigrated data — it can
+only make it more correct. Verified against live prod: both strategies resolve `trades_options=True`
+and size to 1 contract, byte-identical to before.
+
+Tests: `api/tests/test_instrument_type.py` (24 cases) — the stored fact overriding the name, the
+NULL fallback reproducing every legacy answer, and every non-options type in the UI dropdown sizing
+correctly once the fact is recorded.
+
+Deliberately NOT exposed on `StrategyCreate` / `StrategyUpdate` — the form cannot clobber it.
+Instead the **model defaults to `'option'`**, so a strategy created through the API or the template
+cloner is never born NULL. Leaving new rows NULL would have let the guessing behaviour back in
+through the front door for anything created from here on. Not derived from `strategy_type` at
+creation either: that reproduces the original footgun, storing `'equity'` for anything named
+"momentum". An equity strategy has to say so explicitly. Wire a selector into the form if a real
+equity strategy ever exists.
+
+The NULL fallback in `trades_options` stays as defence in depth — a manual insert, a restored
+backup or a future migration could still produce one, and 0 of 5 rows are NULL today.
+
+`trading_safeguards.py:79` still matches `'option'` alone and still never fires — left alone
+because the function it lives in is dead (nothing calls `check_pre_trade_safeguards`) and the
+contract-level delta check in `stream_driven_worker.py:1217`/`:1523` is the one that actually runs.
+If that validator is ever wired up, switch it to `strategy.trades_options` first.
+
+**Also found:** `alembic/env.py:25` reads `DATABASE_URL` and ignores `APP_ENV` entirely, so
+`APP_ENV=prod alembic upgrade head` silently migrates **dev**. Caught only by verifying the column
+afterwards. Migrating prod requires `DATABASE_URL="$(grep '^DATABASE_PROD_URL=' .env | cut -d= -f2-)"`.
+**Fixed 2026-09-06:** `env.py` now mirrors `database.py` — `APP_ENV` selects
+`DATABASE_{DEV,PROD,TEST}_URL`, an unknown `APP_ENV` raises rather than guessing, `DATABASE_URL`
+remains a last-resort fallback, and it **prints the target before running anything**:
+
+```
+[alembic] APP_ENV=prod -> DATABASE_PROD_URL -> ...rds.amazonaws.com:5432/vegapunkr_prod
+```
+
+Host and database name only; credentials are never printed. Related: the engine holds `strategies` open
+`idle in transaction`, so DDL needs the app stopped; running with `PGOPTIONS='-c lock_timeout=5000'`
+makes it fail fast instead of queueing and blocking every reader (same hazard as the 271-second
+`trades` hang recorded in JOURNAL).
+
+### E10. Four "tests" cannot fail *(2026-09-06)*
+
+`scripts/run_tests.sh` now labels these **SMOKE** rather than PASS, and excludes two more from the
+commit gate entirely. Recorded so the labels are not mistaken for a runner quirk.
+
+**No assertions — they print observations and always exit 0, so they fail only on a crash:**
+
+- `test_market_hours` — a demo script printing example usage. Not a test.
+- `test_position_contract_isolation` — prints what the contract lookup does; useful as a
+  diagnostic, proves nothing automatically.
+- `test_api`, `test_database` — see below.
+
+**Excluded from the gate because they need live services:**
+
+- `test_api` — HTTP against `localhost:8000`; red whenever the engine is stopped.
+- `test_database` — connects to the real RDS instance.
+
+Gating commits on those would mean a failing suite every time the app is down, and a gate that
+fails for unrelated reasons gets bypassed and then ignored. `--all` runs them deliberately.
+
+**Worth doing eventually:** give the two diagnostics real assertions, or move them out of
+`api/tests/` so the directory means "things that gate a commit". Until then the honest count is
+**13 real tests**, not 17 — and 17 was the number that looked reassuring before this was checked.
+
+**Also removed 2026-09-06:** `test_worker_integration.py`, which imported
+`services.strategy_worker` — a module that no longer exists and is referenced nowhere. It had been
+failing on an unrelated `SessionLocal` -> `SessionLocals` rename, which is exactly the stale-test
+rot the gate now prevents.
 
 ### E4. Decide the fate of the stale-quote guards
 

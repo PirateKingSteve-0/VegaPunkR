@@ -538,13 +538,36 @@ def get_strategy_performance_summary(
         ).order_by(PerformanceMetrics.date.desc()).first()
 
         if metric:
+            # expectancy is derived, not stored — see PerformanceMetricsResponse.
+            expectancy = None
+            if (metric.win_rate is not None
+                    and metric.avg_win is not None
+                    and metric.avg_loss is not None):
+                expectancy = round(
+                    metric.win_rate * metric.avg_win
+                    + (1.0 - metric.win_rate) * metric.avg_loss, 2)
+
+            payoff = None
+            if metric.avg_win and metric.avg_loss:
+                payoff = round(metric.avg_win / abs(metric.avg_loss), 4)
+
             summary[period] = {
                 "total_trades": metric.total_trades,
+                "winning_trades": metric.winning_trades,
+                "losing_trades": metric.losing_trades,
                 "total_pnl": metric.total_pnl,
                 "win_rate": metric.win_rate,
                 "profit_factor": metric.profit_factor,
                 "sharpe_ratio": metric.sharpe_ratio,
                 "max_drawdown": metric.max_drawdown,
+                "avg_win": metric.avg_win,
+                "avg_loss": metric.avg_loss,
+                "largest_win": metric.largest_win,
+                "largest_loss": metric.largest_loss,
+                "consecutive_wins": metric.consecutive_wins,
+                "consecutive_losses": metric.consecutive_losses,
+                "expectancy": expectancy,
+                "payoff_ratio": payoff,
                 "last_calculated": metric.date
             }
         else:
@@ -553,5 +576,48 @@ def get_strategy_performance_summary(
     return {
         "strategy_id": strategy_id,
         "strategy_name": strategy.name,
-        "metrics": summary
+        "metrics": summary,
+        "hold_times": _hold_time_stats(db, strategy_id),
+    }
+
+
+def _hold_time_stats(db: Session, strategy_id: int) -> dict:
+    """Median hold time in seconds, split by outcome.
+
+    Winners held BRIEFLY while losers are held LONG is the classic
+    cut-your-winners / ride-your-losers signature, and it is invisible in a
+    single blended average — which is why this is split rather than pooled.
+
+    Hold time is measured by PAIRING buy and sell legs, not from
+    `Trade.exit_timestamp`: that column is written with the sell's own timestamp
+    (`order_manager`), so `exit_timestamp - timestamp` on a sell row is ~0 and
+    would report every position as instantaneous.
+    """
+    legs = db.query(Trade).filter(
+        Trade.strategy_id == strategy_id,
+        Trade.status == 'executed',
+    ).order_by(Trade.id).all()
+
+    wins, losses = [], []
+    open_at = None
+    for leg in legs:
+        if leg.side == 'buy':
+            open_at = leg.timestamp
+        elif open_at is not None:
+            held = (leg.timestamp - open_at).total_seconds()
+            (wins if (leg.pnl or 0) > 0 else losses).append(held)
+            open_at = None
+
+    def _median(xs):
+        if not xs:
+            return None
+        xs = sorted(xs)
+        mid = len(xs) // 2
+        return round(xs[mid] if len(xs) % 2 else (xs[mid - 1] + xs[mid]) / 2, 1)
+
+    return {
+        "winners_median_s": _median(wins),
+        "losers_median_s": _median(losses),
+        "winners_n": len(wins),
+        "losers_n": len(losses),
     }

@@ -232,6 +232,21 @@ export class StrategyListComponent implements OnInit {
     return isActive ? 'primary' : 'accent';
   }
 
+  /** Active, but the engine will refuse every entry.
+   *
+   *  Only meaningful while the strategy is running — an inactive strategy is
+   *  already visibly off, and flagging it as "blocked" would be noise. A
+   *  missing `entry_block` (create/update responses never carry one) reads as
+   *  not blocked: an unknown badge must never look alarming. */
+  isBlocked(strategy: Strategy): boolean {
+    return !!strategy.is_active && !!strategy.entry_block?.blocked;
+  }
+
+  blockReason(strategy: Strategy): string {
+    return strategy.entry_block?.reason
+      || 'New entries are paused by a risk limit. Open positions are unaffected.';
+  }
+
   getSymbolsList(strategy: Strategy): string {
     return strategy.instruments?.join(', ') || 'N/A';
   }

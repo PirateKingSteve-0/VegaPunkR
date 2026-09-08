@@ -11,6 +11,7 @@ import {
   TradingWindowUpdate,
   User,
 } from '../models/user.model';
+import { environment } from '../../environments/environment';
 
 @Injectable({
   providedIn: 'root'
@@ -19,7 +20,11 @@ export class AuthService {
   private http = inject(HttpClient);
   private router = inject(Router);
 
-  private apiUrl = 'http://localhost:8000/api/v1'; // FastAPI endpoint with v1 prefix
+  // environment.apiUrl follows the host the page was served from, so this
+  // works from a phone or laptop on the LAN. It was hardcoded to localhost,
+  // which on any other device means THAT device — login failed with
+  // "check credentials" because the request never reached the API.
+  private apiUrl = environment.apiUrl;
   private currentUserSubject = new BehaviorSubject<User | null>(this.getUserFromStorage());
   public currentUser$ = this.currentUserSubject.asObservable();
 

@@ -703,15 +703,30 @@ class TradierClient:
             f"/v1/accounts/{acct}/historical-balances",
             params={"period": period.upper()},
         )
-        balances = data.get("balances", [])
+        # The LIVE response does not match the published OpenAPI example. Observed
+        # 2026-09-07 on account 6YB70356:
+        #
+        #   {"historical_balances": {"balances": {"balance": [{date, value}, ...]},
+        #                            "delta": 154.07, "delta_percent": ...}}
+        #
+        # while docs/tradier/accounts/balance_overtime.md shows a flat
+        # {"balances": [...], "delta":..., "deltaPercent":...}. Reading the
+        # documented shape returned zero points for every period, which is why
+        # the performance page's equity curve had been empty: the data was there
+        # the whole time, two levels below where we looked. Accept both shapes,
+        # and both the camelCase and snake_case spellings of deltaPercent.
+        root = data.get("historical_balances") or data
+        balances = root.get("balances")
+        if isinstance(balances, dict):
+            balances = balances.get("balance")
         if balances is None or balances == "null":
             balances = []
-        if isinstance(balances, dict):
+        if isinstance(balances, dict):   # single day comes back unwrapped
             balances = [balances]
         return {
             "balances": balances,
-            "delta": data.get("delta", 0.0),
-            "deltaPercent": data.get("deltaPercent", 0.0),
+            "delta": root.get("delta", 0.0),
+            "deltaPercent": root.get("deltaPercent", root.get("delta_percent", 0.0)),
         }
 
     def get_gainloss(

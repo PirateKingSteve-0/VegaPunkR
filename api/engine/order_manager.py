@@ -61,6 +61,11 @@ ENABLE_ORDER_PREVIEW = True
 # instead of locking cash forever.
 RESERVATION_TTL_SECONDS = 60.0
 
+# Settled cash moves only on fills and on overnight settlement, so a short
+# cache is enough to make the pre-preview cash check free of broker calls.
+# Invalidated explicitly after every fill.
+SETTLED_CASH_CACHE_SECONDS = 60.0
+
 # Per-options-contract estimate of broker commission + regulatory fees. Used
 # as a safety buffer in non-prod environments where Tradier's preview returns
 # commission=0 and fees=0 — without it, a sandbox-validated buy can slip past
@@ -115,6 +120,14 @@ class OrderManager:
     # nothing across restarts (broker is the source of truth post-restart).
     # Maps reservation_id -> {user_id, amount, expires_at}.
     _pending_buy_reservations: Dict[str, Dict] = {}
+
+    # user_id -> (settled_cash, fetched_at). See SETTLED_CASH_CACHE_SECONDS.
+    _settled_cash_cache: Dict[int, Tuple[float, datetime]] = {}
+    # user_id -> {"since": datetime, "skipped": int} while entries are blocked
+    # for want of settled cash. Exists so the 200th skip is not the 200th log
+    # line: we log the transition in, count the rest, and report the total when
+    # cash comes back.
+    _cash_block_state: Dict[int, Dict] = {}
 
     # Orders we placed but could not confirm within the terminal-status poll window.
     # "Unconfirmed" is NOT "didn't happen" — the broker may still fill it, and on
@@ -341,6 +354,49 @@ class OrderManager:
         if reservation_id:
             cls._pending_buy_reservations.pop(reservation_id, None)
 
+    @classmethod
+    def _invalidate_settled_cash(cls, user_id: int) -> None:
+        """Drop the cached balance. Called after every fill — a fill is the only
+        thing besides overnight settlement that moves settled cash."""
+        cls._settled_cash_cache.pop(user_id, None)
+
+    async def _settled_cash_cached(self, user: User) -> Optional[float]:
+        """Settled cash for the buy precheck, cached briefly.
+
+        Returns None when the figure is unavailable. Callers MUST treat None as
+        "proceed", never as "block": this check is an optimisation in front of
+        the authoritative gate below, and a balance hiccup must not be able to
+        stop trading on its own.
+        """
+        hit = self._settled_cash_cache.get(user.id)
+        if hit and (datetime.utcnow() - hit[1]).total_seconds() < SETTLED_CASH_CACHE_SECONDS:
+            return hit[0]
+        try:
+            client = self.trading_client.get_client(user)
+            balances = await asyncio.to_thread(client.get_balances)
+        except Exception as e:
+            logger.debug(f"Settled-cash precheck unavailable, deferring to preview: {e}")
+            return None
+        raw = (balances.get("cash") or {}).get("cash_available")
+        cash = float(raw) if raw is not None else float(balances.get("total_cash") or 0.0)
+        self._settled_cash_cache[user.id] = (cash, datetime.utcnow())
+        return cash
+
+    @classmethod
+    def _record_cash_block(cls, user_id: int) -> int:
+        """Count one skipped entry. Returns the running total; 1 marks the
+        transition into the blocked state, which is the only one worth logging."""
+        st = cls._cash_block_state.setdefault(
+            user_id, {"since": datetime.utcnow(), "skipped": 0}
+        )
+        st["skipped"] += 1
+        return st["skipped"]
+
+    @classmethod
+    def _clear_cash_block(cls, user_id: int) -> Optional[Dict]:
+        """Leave the blocked state, returning what it accumulated (or None)."""
+        return cls._cash_block_state.pop(user_id, None)
+
     @staticmethod
     def _estimate_fee_buffer(user: User, qty: int, option_symbol: Optional[str]) -> float:
         """Per-order fee buffer added to the reservation in non-prod envs.
@@ -387,6 +443,68 @@ class OrderManager:
         """
         if not ENABLE_ORDER_PREVIEW:
             return True, None, "preview disabled", None
+
+        # --- settled-cash precheck: BUYS ONLY, before any broker call --------
+        #
+        # On 2026-09-02 the engine produced 321 entry signals with capacity for
+        # 3, and sent 214 of them to Tradier only to be told "you do not have
+        # enough buying power" — 214 round trips, 214 rate-limit slots, 214 log
+        # lines and 214 system_events rows for an answer we already had. The
+        # authoritative gate lives below and still runs; this one just declines
+        # to ask a question whose answer is knowable locally.
+        #
+        # SELLS ARE NEVER GATED HERE. An exit must stay possible no matter what
+        # the cash balance says, or a cash shortfall would strand an open
+        # position with no way out.
+        #
+        # Deliberately permissive: the estimate omits commission/fees in prod
+        # (see _estimate_fee_buffer), so it runs slightly LOW and lets marginal
+        # orders through to the real gate. Skipping happens only when the order
+        # is clearly unaffordable. Unknown price or unknown cash → proceed.
+        if side == "buy" and signal_price:
+            multiplier = 100 if is_option_symbol(option_symbol or symbol) else 1
+            estimate = (
+                qty * float(signal_price) * multiplier
+                + self._estimate_fee_buffer(user, qty, option_symbol)
+            )
+            settled = await self._settled_cash_cached(user)
+            if settled is not None:
+                available = settled - self._active_reservations_total(user.id)
+                if estimate > available:
+                    skipped = self._record_cash_block(user.id)
+                    msg = (
+                        f"Insufficient settled cash (pre-preview): "
+                        f"estimate=${estimate:.2f} > available=${available:.2f} "
+                        f"(settled=${settled:.2f} - reserved="
+                        f"${settled - available:.2f})"
+                    )
+                    if skipped == 1:
+                        logger.warning(f"{msg} — entries paused, further skips counted quietly")
+                        log_event(
+                            db=self.db,
+                            user_id=user.id,
+                            event_type="ENTRY_SKIPPED_NO_CASH",
+                            title="Entries paused: out of settled cash",
+                            detail=msg,
+                            symbol=symbol,
+                            strategy_id=strategy.id,
+                            severity="warning",
+                            event_data={
+                                "estimate": estimate,
+                                "settled_cash": settled,
+                                "available": available,
+                                "qty": qty,
+                                "option_symbol": option_symbol,
+                            },
+                        )
+                    return False, None, msg, None
+                # Affordable again — report what the quiet period cost.
+                was_blocked = self._clear_cash_block(user.id)
+                if was_blocked:
+                    logger.info(
+                        f"Settled cash available again (${available:.2f}) — "
+                        f"{was_blocked['skipped']} entries were skipped while blocked"
+                    )
 
         try:
             preview = await self.trading_client.preview_order(
@@ -1048,6 +1166,10 @@ class OrderManager:
                         trade=trade,
                         option_symbol=option_symbol,
                     )
+
+                # A fill is the one thing that moves settled cash mid-session,
+                # so the precheck's cached figure is now stale.
+                self._invalidate_settled_cash(user.id)
 
                 logger.info(
                     f"Order executed successfully: {order_id} - {side} {filled_qty} {symbol} @ ${filled_price:.2f}"
@@ -1721,6 +1843,13 @@ class OrderManager:
                 exit_price=filled_price,
                 exit_timestamp=datetime.utcnow(),
                 pnl=pnl,
+                # Snapshot excursion onto the immutable leg. The position row
+                # keeps tracking these live, but `_update_position_entry` resets
+                # both on reopen and rows are REUSED for re-entries — so read
+                # here, at close, or the next entry into this contract destroys
+                # them. Captured for the round trip just closed, nothing else.
+                mfe_price=position.peak_price,
+                mae_price=position.trough_price,
                 status='executed',
                 timestamp=datetime.utcnow(),
                 notes=close_notes,

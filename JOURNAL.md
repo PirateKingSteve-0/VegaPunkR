@@ -9421,3 +9421,804 @@ at **17:23:37** — the exact second `signal_generator.py` was written. The exit
 underneath a running live process. Market was closed, so nothing traded on it, but the rule this
 implies is worth writing down: **do not edit `.py` files while the market is open.** It hot-swaps
 engine code under an open position.
+
+---
+
+## Session Date: September 5, 2026 (evening) — Launch flags, a wrong-database hour, and the cash gate
+
+Four unrelated changes plus one operational finding. The finding first, because it invalidates an
+hour of the previous session's "we are ready" verdict.
+
+### 1. The live process spent an hour on the WRONG DATABASE
+
+After the 09-02 reboot the app was restarted as plain `python app.py` — no `APP_ENV`, no
+`LIVE_TEST_LOGGING`. `database.default_environment()` defaults to **dev**, so:
+
+```
+vegapunkr_dev    05:36:53  idle in transaction
+vegapunkr_dev    05:36:55  idle in transaction     <- the app (started 05:36:52)
+vegapunkr_prod   05:36:40                          <- the monitor, predates it
+```
+
+The monitor was on `--env prod` while the app worked dev. Nothing traded (market closed), but the
+failure mode had teeth: DEV user 1 is also `selected_trading_mode = live`, so it would have placed
+**real** orders — while DEV's `max_trade_percentage = 2.0` caps buying capacity at 2% of $1,060 =
+$21.20, which cannot afford any qualifying contract. Every entry would have sized to zero. A
+running engine, trading nothing, for a reason invisible from the outside. This is exactly the
+failure `scripts/prep_prod_live_test.py` note 2 was written about.
+
+Diagnosis was by `pg_stat_activity` connection timestamps, since `/proc/<pid>/environ` was
+unreadable and neither `/health` nor `/` report the environment.
+
+### 2. Launch flags, so that cannot happen silently again
+
+`api/app.py` now takes `--env {dev,test,prod}`, `--log`, `--no-reload`, `--port`, and prints what it
+resolved to before the server starts:
+
+```
+  DB environment : prod   <-- REAL MONEY DB
+  File logging   : on
+  Auto-reload    : on
+```
+
+Resolution order is **flag → env var → dev**, so `APP_ENV=prod LIVE_TEST_LOGGING=1 python app.py`
+still behaves identically and the runbook is unaffected. Flags set `os.environ` *before*
+`uvicorn.run` so the reloader's child inherits them — the child imports `app:app` without re-running
+`__main__`, and reads `APP_ENV` at import.
+
+`--no-reload` exists because of the 09-02 finding: with reload on, saving any `.py` hot-swaps engine
+code under an open position.
+
+Also moved `install_root_file_handler()` four lines earlier in `lifespan`, so the
+`🗄️ Process DB environment` banner lands **in** the engine log instead of only in the launching
+terminal. That line was unfindable during the diagnosis above precisely because it was logged before
+the file handler existed.
+
+### 3. Prod was posting Discord alerts to the dev channel
+
+`User.notification_preferences['discord']['webhook_url']` is per-user, and prod/dev are separate
+rows — but the prod row held `DISCORD_WEBHOOK_URL_DEV` character for character. Every live trade
+alert from the 09-02 session went to the dev channel.
+
+Fixed as a **data change** to the prod row only (dev untouched), pointing it at the `Dr.VegaPunk`
+webhook; test message confirmed. Webhook identities were read straight from Discord — an
+unauthenticated `GET` on a webhook URL returns its `name`, `channel_id` and `guild_id`, which
+settles "which channel is this?" without touching the Discord UI.
+
+Note for later: `config.py:69-70` declares `DISCORD_WEBHOOK_URL` / `_DEV` and **nothing reads them**.
+They are dead config. Wiring them in would contradict the per-user-settings rule (the user row is the
+source of truth, no env fallback), so they stay documentation-only.
+
+### 4. Largest Win / Loss card overflowed
+
+`performance.component.ts` built `"$105.00 / -$46.00"` as one string rendered at `--fs-xl` (22px) in
+a grid cell guaranteed only 200px — no wrap, no overflow rule. `MetricCard` gained an optional
+`parts: [string, string]`; the template renders them as two spans and `.metric-value-pair` is a
+wrapping flex row one step down at `--fs-lg`. The slash is glued to the first figure with `&nbsp;`
+so it can never strand alone on line two. Applied to `Hold Time (win / loss)` as well — same shape,
+same latent overflow. Single-value cards are untouched: the new branch only fires when `parts` is set.
+
+### 5. Settled-cash precheck: stop asking the broker what we already know
+
+The 09-02 session sent **214 previews** to Tradier purely to be told "you do not have enough buying
+power" — 214 round trips, 214 rate-limit slots, 214 log lines, 214 `system_events` rows. The
+authoritative cash gate runs *after* the preview; this adds a cheap one *before* it
+(`_preview_or_abort`, results doc §S2).
+
+- **Buys only.** `side == "buy"` is the condition. A cash shortfall must never be able to strand an
+  open position, so sells are not gated at any point in this path.
+- **No broker call of its own.** Settled cash comes from a 60s cache
+  (`SETTLED_CASH_CACHE_SECONDS`), invalidated after every fill — a fill being the only thing that
+  moves settled cash intraday.
+- **Deliberately permissive.** The estimate omits commission/fees in prod, so it runs slightly LOW
+  and lets marginal orders through to the real gate, which is unchanged and still decides. Unknown
+  price or unavailable balance → proceed. The precheck can only skip the clearly unaffordable; it
+  can never become the thing that stops trading.
+- **State-based logging.** One WARNING + one `ENTRY_SKIPPED_NO_CASH` row on the way in, further
+  skips counted silently, and the total reported when cash returns. The count is the useful part —
+  it is the evidence that cash, not the strategy, is the binding constraint.
+
+Tests: `api/tests/test_cash_precheck_gate.py`, 17 cases, sell-never-gated first among them. Writing
+them corrected one assumption: a balance-fetch failure does *not* let the order through, because the
+pre-existing gate then fetches balances itself and aborts fail-safe. The test now asserts what this
+change is responsible for — that the preview was reached.
+
+### 6. Still unverified
+
+The trailing stop has **still never executed** — 09-03 and 09-04 were not reviewed in this session,
+so whether it fired is unknown. The halt (`ride`/`flatten`) has still never run, and TODO A1's
+reservation-ledger probe has still never been run. There is no end-of-day summary line if the cash
+block never clears before shutdown.
+
+---
+
+## Session Date: September 5, 2026 (Part 2) — The trail's first fills, and making excursion survive
+
+Weekend session, market closed, account flat. Reviewed Friday 09-04 — which had never been
+discussed — then shipped the MFE/MAE capture (TODO E5).
+
+### 1. Friday 09-04: the trailing stop fired, twice
+
+First execution of that branch since it was written. It had never run anywhere.
+
+```
+t12  entry 2.88 -> 3.02   +$14    Trailing stop hit: $3.01 <= $3.02
+t14  entry 2.97 -> 4.50  +$153    Trailing stop hit: $4.43 <= $4.44
+t16  entry 4.57 -> 3.86   -$71    Stop loss hit: -15.54%
+                          -----
+                          +$96    3 round trips, 2 winners
+```
+
+`t14` is the one that matters. Under the pre-09-02 logic the flat +25% target would have taken it
+at roughly **+$74**; the trail held to **+51.5% / $153**. The log line reads
+`EXIT SIGNAL: SPY entry=$2.9700 current=$4.4300 pnl=49.16%` — held to +49%, exited one cent under
+the trail. E1 is now not merely fixed but validated on real money.
+
+Two other firsts: **strategy 4 entered its first trades** (all three round trips were puts, on
+`SPY260904P00774000`) — consistent with the E7 mechanism, which predicts the put side can only arm
+once the underlying has fallen from higher strikes. And **median hold jumped to 2218s (37 min)**
+from 8 min Thursday and 14 min Wednesday, the direct consequence of a trail replacing a flat target.
+
+Week one: `$1,060 -> $1,214`, **+$154 across four sessions.**
+
+### 2. Would a tighter ("crawling") trail have made more? Marginally — and it is a trap
+
+Question asked of the $153 trade. Reconstructed from the exit reason (`$4.43 <= $4.44` implies a
+peak of `4.44/0.90 = 4.93`):
+
+```
+ 5% trail -> exit $4.68  = +57.7%  = $171   (+$18 vs actual)
+ 7% trail -> exit $4.58  = +54.4%  = $161   (+$8)
+10% actual                = +51.5%  = $153
+```
+
+Eighteen dollars — against a real cost. Translating each distance into the underlying move that
+triggers it, on a ~0.70-delta contract:
+
+```
+ 5% trail = SPY move of 0.35 pts
+ 7% trail = SPY move of 0.49 pts
+10% trail = SPY move of 0.70 pts
+
+SPY median 1-minute range that week = 0.31 pts
+```
+
+**A 5% trail is roughly one minute of ordinary noise.** It would fire on chop far more often than
+it squeezes out $18. The current 10% sits comfortably above the noise floor. Not changing it.
+
+The trail also did better than the raw number suggests: the contract peaked at 5.01 (+68.7%) and
+then **collapsed to 2.79 (-6.1%)** by 12:51. Exiting at +51.5% captured **75% of the entire
+available move** before it gave everything back.
+
+### 3. The real leak on Friday was the re-entry, not the trail
+
+```
+t14  SELL 4.50   +$153   trailing stop
+t15  BUY  4.57           re-entered ~40s later, HIGHER than it just sold
+t16  SELL 3.86    -$71   stop loss
+```
+
+Friday was +$96; without that re-entry it was **+$167**. The re-entry cost roughly **four times**
+what a tighter trail would have gained. Same shape as 09-02, where the engine took profit and
+immediately re-bought the same contract twice, burning $750 of settled cash to earn $189.
+
+A short cooldown after a trail/TP exit looks like a much better lever than tightening the trail,
+and it is cheaper to test. Not built — recorded here and in TODO E2.
+
+### 4. Shipped: MFE/MAE now survives position-row reuse (TODO E5)
+
+`positions.peak_price` / `trough_price` track excursion live but are reset by
+`_update_position_entry` on the **reopen** path, and position rows are reused for re-entries. The
+figure was therefore destroyed by the next entry into the same contract — which happened on both
+09-02 and 09-03, in each case leaving one surviving row to carry an argument about exit quality.
+
+```
+migration a1b2c3d4e5f6   trades.mfe_price, trades.mae_price   (nullable)
+models.py                +7 lines
+order_manager.py         +2 lines — snapshot onto the SELL leg at close
+tests/test_mfe_mae_capture.py   13 assertions
+```
+
+Applied to **both RDS databases** (`vegapunkr_dev`, `vegapunkr_prod`, same instance). The
+load-bearing test is step 4: re-enter the same contract, watch the position's peak get wiped to the
+new fill, confirm the already-closed leg still reports its own.
+
+**The test caught a wrong assumption.** The reset fires only on the reopen branch — a row already
+at `qty=0`. With `qty>0` the entry averages into the open position and legitimately keeps the peak.
+The first run failed because the test had not flattened the row; the code was right and the mental
+model was not.
+
+Data accrues from the next live session. Historical trades stay NULL — what was overwritten is gone.
+
+### 5. Incident: DDL against a live engine stalled prod for 4.5 minutes
+
+The first `alembic upgrade head` against `vegapunkr_prod` hung and had to be cancelled.
+
+```
+pid=2074  ALTER TABLE trades ADD COLUMN mfe_price   waiting 271s  AccessExclusiveLock  granted=FALSE
+pid=2058  idle in transaction (engine: strategies)  AccessShareLock  granted=true
+pid=2060  idle in transaction (engine: strategies)  AccessShareLock  granted=true
+pid=23436 idle in transaction (engine: positions)   AccessShareLock  granted=true
+```
+
+The engine holds connections **idle in transaction**, keeping a shared lock on `trades`. The ALTER
+queued for the exclusive lock — and **a queued exclusive request makes every subsequent reader queue
+behind it**, which is why the follow-up diagnostic also hung. Cancelled the ALTER only (left the
+engine's sessions alone); the transaction rolled back clean, prod stayed at `e6f4a2b8c1d7` with
+nothing half-applied. Re-ran with the app stopped and it took under a second.
+
+**Rule, now in TODO E5: stop the app before DDL on `trades` or `positions`.** On a shared RDS
+instance that means every machine running one — the lock blocks all clients, not just the local
+process. Market was closed and the account flat, so nothing was at risk this time.
+
+### 6. Also recorded
+
+- **E1** marked fixed and verified live (§1).
+- **E7** added 09-03: deep-ITM puts cannot clear `min_open_interest: 3000` because a 0.60-0.85
+  delta put needs a strike ABOVE spot, where no interest has accumulated. Verified against the live
+  chain: in-band puts had OI 1 and 8, in-band calls 6,443-8,005. Not a data bug — geometry.
+- **E6** metrics work landed 09-03 (expectancy, payoff ratio, largest win/loss, max streak,
+  hold-time split by outcome). Most of it was already computed and stored and simply never exposed
+  by the response schema.
+
+---
+
+## Session Date: September 6, 2026 — The gates that stop you quietly
+
+Started as "will the app trade on Labor Day?" and turned into an audit of every rule that can stop
+a strategy without telling you. Found three: one latch that was $2.43 from firing, one crash that
+converts "stop for today" into "off indefinitely", and one setting that cancelled itself out.
+
+### 1. Labor Day: nothing will trade
+
+Verified against the broker rather than the code comments — Tradier's own calendar:
+
+```
+2026-09-04  open    Market is open
+2026-09-07  closed  Market is closed for Labor Day
+2026-09-08  open    Market is open
+```
+
+`is_market_open()` returns `clock.state == "open"`, and the local fallback holiday table has
+`datetime(2026, 9, 7)`. Both agree, so a clock outage cannot let anything through. Every order path
+sits behind that gate (`strategy_executor.py:117`, `:191`, `stream_driven_worker.py:360`), and the
+only two callers that reach the broker — `execute_signal` and `close_position` — are reachable
+only from `strategy_executor`. `_startup_sync` reads broker positions but places nothing.
+
+### 2. Twice I trusted a document over the data, and was wrong both times
+
+Worth recording as a process failure, not just a fact.
+
+- Claimed the trailing stop was still unreachable, citing **F1** in the 09-02 results doc. It had
+  been fixed in `023f477` and TODO **E1** said so.
+- Then claimed it had never actually fired, citing **E1**'s own line "`Trailing stop hit:` branch
+  has still never fired." That line was written before the 09-04 session.
+
+The logs had the answer the whole time. `logs/livetest-2026-09-03/engine-20260903-061605.log`
+(the file spans into 09-04), lines 28859 and 29072 — **two live trailing-stop exits, both on
+strategy 4, the puts:**
+
+```
+entry $2.88 -> exit $3.01   +4.51%   realised +$14
+entry $2.97 -> exit $4.50  +49.16%   realised +$153
+```
+
+The $153 trade is the proof E1 was waiting for: `take_profit_percentage=30` was correctly
+suppressed while the trail was armed, so the position ran to a ~$4.93 peak instead of being sold
+at $3.86. **+$153 against +$89.** The $14 trade is the other side of the trade-off — armed at
+~+16%, reversed, exited at +4.5% instead of riding to the stop.
+
+E1 and the results doc are now updated. **Rule: grep the logs before asserting engine behaviour
+from a doc. A doc records what was true when someone wrote it.**
+
+### 3. D3 — the drawdown gate was a latch, caught at $2.43
+
+`_check_max_drawdown` compared the **worst drawdown ever recorded** to the limit. A running
+maximum only rises, nothing reset it, and the query had no date filter — so one bad stretch
+retired a strategy permanently. It kept reading Active, kept evaluating, kept generating signals,
+and silently refused every entry.
+
+```
+strategy 3:  worst-ever drawdown $119.00   limit (10% of $1,214.25) $121.43   headroom $2.43
+strategy 4:  worst-ever drawdown  $71.00   limit                    $121.43   headroom $50.43
+```
+
+One $3 losing trade from being retired for good, with no alert and no way to clear it short of
+editing the database.
+
+Now measures the **current** distance below the strategy's own high-water mark. Also added
+`ORDER BY timestamp` — a cumulative running total was previously computed over whatever order
+the database returned, which made `peak` arbitrary.
+
+**The recovery path is narrower than it first looked**, and the user spotted it before I did.
+Current drawdown only shrinks when a trade CLOSES, a trade can only close if it was OPENED, and
+opening is exactly what the block prevents. A blocked strategy holding nothing cannot trade its
+way out. The only escapes are a position already open when the block tripped, or `account_size_usd`
+growing until the limit clears the drawdown (from $1,168 that needs $1,650, +41%).
+
+So the fix converted "blocked forever because you EVER had a bad stretch" into "blocked forever
+because you are CURRENTLY in one" — better, still a latch while enforcement is on. Hence two
+settings instead of one:
+
+| key | meaning |
+|---|---|
+| `max_drawdown_pct` | threshold as % of account. **`<= 0` disables everything** — no alert, no block, no DB query |
+| `max_drawdown_block` | `True` (default) stops entries; `False` alerts only and the strategy keeps trading |
+
+Alert-only is the useful mode on a small account: the strategy keeps trading, so it can climb out
+on its own and the alert is genuinely self-clearing. Reading the settings now happens BEFORE the
+trade query, so a disabled gate costs nothing — that query loads the whole history and runs on
+every entry attempt (321 times on 09-02).
+
+### 4. D4 — a blocked strategy looked identical to a healthy one
+
+Every silent block had the same symptom: an account that quietly stops trading, indistinguishable
+from a market with no setups. Now surfaced two ways.
+
+**Discord** — `notify_strategy_blocked` / `_unblocked`, plus `notify_strategy_bleeding` /
+`_recovered` for alert-only mode. Gated on a new `notification_preferences.discord.notify_risk`
+(defaults True, toggle added to the profile dialog). Fired once on the transition, once on
+recovery with the count of entries skipped in between. Throttling is not optional: this runs on
+the entry path, 321 evaluations in a day. Bleed alerts clear with **hysteresis at 80%** of the
+threshold so a strategy on the line does not alternate messages.
+
+**UI** — a `Blocked` chip beside `Active` on the strategies table, reason on hover. Backed by
+`RiskManager.get_entry_block_status`, a read-only evaluation calling the same private checks in
+the same order as `validate_pre_trade`, so the badge cannot disagree with the engine. Failure is
+swallowed and the page renders without a badge rather than 500ing.
+
+Covered codes: `mode_mismatch`, `account_daily_loss`, `strategy_daily_loss`, `max_drawdown`.
+Deliberately excluded as self-evident: inactive strategy, the manual halt, the position cap.
+
+### 5. D5 — the crash that deactivates strategies *(the real find)*
+
+`RiskEvent` has no `message` column — it carries `details` JSON — but `_log_risk_event` passed
+`message=` anyway, with no try/except:
+
+```
+TypeError: 'message' is an invalid keyword argument for RiskEvent
+```
+
+Three gates route through it: per-strategy daily loss, max drawdown, position cap. So a clean
+rejection became an exception, and then:
+
+```
+cap trips -> TypeError -> caught at strategy_executor.py:229 -> error_count += 1
+          -> repeats on every entry attempt
+          -> at 20 consecutive errors: strategy.is_active = False   (:238)
+```
+
+**Hitting a daily loss cap did not pause the strategy for the day. It switched the strategy OFF,
+and it stayed off.** Reachable on any ordinary session — the per-strategy cap defaults to 5% of
+account = $60.71, about two typical losing trades ($46/$39/$34 observed).
+
+It also silently defeated the D4 alerts: `_note_entry_block` runs after `_log_risk_event`, so the
+exception pre-empted it. A strategy that deactivated itself this way sent nothing.
+
+Predates today's work; the docstring on the newer `_log_account_risk_event` already named it
+("the legacy `_log_risk_event`, which references a `message` column that doesn't exist on the
+model") — the correct writer was added and the broken one left in place. Now mirrors its sibling:
+writes `details`, wrapped so a logging failure can never decide whether a trade happens.
+
+**Why every existing test missed it:** they call the private `_check_*` helpers directly. The
+crash lives in the logging that `validate_pre_trade` does *around* them.
+`api/tests/test_risk_event_logging.py` goes through the public entry point for all four gates,
+plus a poisoned-commit case proving a write failure still returns a clean rejection.
+
+### 6. Settings changed on prod
+
+**`trailing_stop_activation` 25 -> 15 on both strategies.** The user had set activation to 25 to
+match the 25% take-profit, which cancelled both rules out: an armed trail suppresses the flat
+target, and the trail arms at the same instant the target would fire — so the target could never
+fire, and everything below +25% had no exit but the stop loss. Simulated against the real exit
+logic:
+
+| path | activation 15 | activation 25 |
+|---|---|---|
+| the real 09-04 winner (peak +66%) | +49.2% / +$146 | +49.2% / +$146 |
+| **peaks +20%, then reverses** | **+8.0% / +$24** | **-15.3% / -$46** |
+| peaks +30%, then reverses | +16.7% / +$50 | +16.7% / +$50 |
+| straight loser | -15.3% / -$46 | -15.3% / -$46 |
+
+Only one row changes, and the 09-04 +$14 trade landed in exactly that band. Activation does not
+affect the ceiling — the trail level is always `peak x 0.90` and the peak only ratchets — so
+arming later bought nothing and cost the 15-25% band.
+
+**`max_drawdown_pct` 15, `max_drawdown_block` False** on both — alert only, never pauses.
+Strategy 3 has $63 of room, strategy 4 has $111.
+
+**Account `daily_loss_limit_pct` 15% -> 5%** ($182.14 -> $60.71). At 15% the cap could never fire:
+settled cash allows ~3 trades and stops you first, so it was decoration. At 5% it binds after
+about two losing trades — the only setting where the rule, not the broker, decides. Ordered after
+D5 deliberately: at 15% the cap was unreachable, so dropping to 5% without the fix would have
+armed the deactivation bug.
+
+**`max_hold_time_minutes` left at 0.** Considered setting 30, then found this journal at :5619
+recording that the original 30 "was a default to silence that warning, not a deliberate scalping
+rule", and that `exit_before_close_minutes: 15` satisfies the safeguard alone. The 09-04 winner
+was held 37 minutes; a 30-minute clock fires precisely when a trade is still running and nothing
+else has triggered, which fights the trailing stop directly.
+
+### 7. Deferred, with reasons
+
+- **E8 — tiered (tightening) trailing stop.** A fixed 10% trail hands back 10% of the peak
+  *price*, so the give-back in P&L points grows with the move (peak +66% -> ~17 pts; peak +200% ->
+  30 pts). A tiered trail would bank more of a big run. **Not yet:** there is exactly one big
+  winner on record. E5 now writes `mfe_price`/`mae_price` onto every closed trade, so the MFE
+  distribution will answer this from evidence in a few sessions.
+- **Drawdown lookback window and manual clear.** Only matter with `max_drawdown_block=True`,
+  which nothing now uses.
+- **`_check_max_drawdown` and `_check_daily_loss_limit` take no `side` argument.** Unreachable
+  today — exits go through `close_position`, which never calls `validate_pre_trade` — but an
+  "exits are sacred" gap waiting for someone to reuse those checks.
+
+### 8. Notes
+
+- `take_profit_pct` is inert whenever `trailing_stop_activation <= take_profit_pct`, which is the
+  current config. Raising it to 50/75/100 changes nothing. `trading_safeguards` rejects
+  `take_profit_pct > 100`, dead code today (nothing calls `check_pre_trade_safeguards`) but a
+  landmine if wired up.
+- Both spellings (`_pct` and `_percentage`) and the table columns agree on both strategies — the
+  divergence trap from `negative-expectancy.md` is not present.
+- Tests: `test_max_drawdown_recovery.py` (28 cases) and `test_risk_event_logging.py` (12 cases),
+  both new. Full engine suite green; the pytest DB suites still need Postgres on `localhost:5433`.
+
+### 9. Renamed the strategies — and `strategy_type` turned out to be load-bearing
+
+The strategies were called "0DTE Scalping" but do not scalp. Live hold times are 6.7 / 12.2 / 14.3 /
+32.5 / 37.0 minutes — intraday momentum, not scalping. (The 5.8-second sandbox holds were the
+fake-fill artifact: options priced below intrinsic made everything look instantly +90%, so the
+target fired at once.) Renamed to **"SPY 0DTE Momentum (Calls)" / "(Puts)"**.
+
+Renaming `strategy_type` is NOT cosmetic. Two engine sites decide **options vs shares** by
+string-matching it:
+
+```python
+_is_options = any(k in strategy.strategy_type.lower() for k in ('option', '0dte', 'scalping'))
+```
+
+Measured on the live account ($1,214.25, 50% risk, $3.00 contract):
+
+| `strategy_type` | position |
+|---|---|
+| `scalping_0dte` | 1 contract (~$300) |
+| `momentum` | **3 contracts (~$900)** |
+| `momentum_0dte` | 1 contract ✅ |
+
+The share formula reads "$3.00" as $3 rather than $300, computes 202 contracts, and only
+`max_contracts: 3` brings it down to 3. The sizing logic would ask for **$60,600 of options on a
+$1,214 account** — what protects you is the cap and Tradier's buying-power rejection, not the code.
+
+Went with `momentum_0dte` and verified sizing byte-identical before and after.
+
+**Then found the trap the rename created:** the strategy form's type dropdown is built from the UI
+`StrategyType` enum, which contained `momentum` but not `momentum_0dte`. Opening the form on a
+strategy now called "Momentum" and picking the obvious dropdown entry would have tripled position
+size silently. Added `MOMENTUM_0DTE` to the enum with a warning comment, plus a hint on the form
+field saying options strategies must use a type containing `0dte`, `option` or `scalping`.
+
+**On the "dead code" delta check** (`trading_safeguards.py:79`): it matches `'option'` alone, which
+neither the old nor the new type contains, so it has never run here — and the function it lives in
+is dead anyway. Wiring it up would have changed nothing: the configured band is
+`delta_min 0.6 / delta_max 0.85`, inside the validator's `[0.30, 0.90]`. It only validates the
+CONFIGURED band, never a contract. **The contract-level delta check is live and always has been** —
+`stream_driven_worker.py:1217` rejects out-of-band contracts at selection, `:1523` drops an armed
+contract that drifts out. Left the dead validator alone; enabling an untested all-or-nothing gate
+before a live session is the wrong trade. Logged as **E9**, along with the real fix: store the
+instrument as a field rather than inferring it from words in a name.
+
+### 10. Finished the deferred items — with the app down
+
+Monday being a holiday meant two clear days, not one night, so the three "worth doing" items got
+done properly.
+
+**Exits are sacred, everywhere.** `_check_daily_loss_limit`, `_check_max_drawdown` and
+`_check_position_limits` now take `side` and return approved for anything that is not a buy,
+matching `_check_user_trading_halt` and `_check_user_daily_loss_limit`. The position cap was
+included deliberately: being AT the cap is exactly when you most need to close something. Still
+unreachable today — exits run through `close_position`, which never calls `validate_pre_trade` —
+but closing the gap partially would have been worse than not closing it, because the next reader
+would assume it was covered. 8 new cases in `test_risk_event_logging.py`.
+
+**The 09-02 results doc is marked.** F1 carries a stale warning pointing at the live evidence; §6's
+"never ran — and per F1, cannot" is struck through. That doc is what made me wrong twice earlier
+today.
+
+**E9 — instrument is now a stored fact.** `strategies.instrument_type`, migration `b7c3d9e4f2a8`,
+read through one `Strategy.trades_options` property with a NULL fallback to the old string match.
+Both call sites converted. Live prod verified: `trades_options=True`, 1 contract, identical to
+before. 24 new cases including "bare `momentum` + `instrument_type='option'` -> 1 contract", which
+is the footgun itself, closed.
+
+**Two process findings, both nearly costly:**
+
+1. **`alembic/env.py:25` ignores `APP_ENV`.** It reads `DATABASE_URL` only. `APP_ENV=prod alembic
+   upgrade head` silently migrated **dev**, twice, and reported success. Caught only because the
+   column was verified afterwards rather than trusting alembic's output. Prod needs
+   `DATABASE_URL="$(grep '^DATABASE_PROD_URL=' .env | cut -d= -f2-)"` passed explicitly. This is the
+   same shape as the "wrong-database hour" in the 09-05 entry, and it is still armed.
+
+2. **The DDL lock hazard is real on `strategies`, not just `trades`.** With the app up, the prod
+   ALTER failed on `lock_timeout`:
+
+   ```
+   psycopg2.errors.LockNotAvailable: canceling statement due to lock timeout
+   pid 21033  idle in transaction  SELECT strategies...  AccessShareLock  granted
+   pid 21034  idle in transaction  SELECT strategies...  AccessShareLock  granted
+   ```
+
+   Those are the two strategy workers. **Running with `PGOPTIONS='-c lock_timeout=5000'` is what
+   made this safe** — it failed fast and left prod completely untouched instead of queueing for the
+   exclusive lock and blocking every subsequent reader behind it. Ran clean in under a second once
+   the app was stopped. Make the lock_timeout standard for any DDL here.
+
+Also worth recording: the prod app was running with **auto-reload on** for this entire session
+(`APP_ENV=prod`, started 23:00 09-05), so every edit made today was hot-loaded into the live
+process. Harmless with the market closed and every change import-checked, but `models.py` was
+deliberately left untouched until after the migration — adding a column to the model while the DB
+lacked it would have broken the running app on the next strategy query.
+
+### 11. Closed both process findings
+
+**`alembic/env.py` now resolves the database the same way the app does.** `APP_ENV` selects
+`DATABASE_{DEV,PROD,TEST}_URL`; an unrecognised `APP_ENV` raises rather than silently guessing;
+`DATABASE_URL` stays a last-resort fallback. It also prints the target before doing anything:
+
+```
+[alembic] APP_ENV=dev  -> DATABASE_DEV_URL  -> ...:5432/vegapunkr_dev
+[alembic] APP_ENV=prod -> DATABASE_PROD_URL -> ...:5432/vegapunkr_prod
+```
+
+Host and database only — credentials never printed. The failure this prevents is not a crash, it is
+a migration that succeeds against the wrong database and says so cheerfully.
+
+**New strategies are no longer born NULL.** `Strategy.instrument_type` now defaults to `'option'`.
+NULL was a migration-safety device — it let rows that predated the column keep working — and both
+databases are backfilled with 0 NULLs of 5 rows. But both creation paths (`create_strategy` and the
+template cloner) never set the field, so every new strategy would have been NULL and fallen back to
+guessing from its name: the exact bug E9 removed, re-entering through the front door.
+
+Chose a flat `'option'` default over deriving it from `strategy_type` at creation. Deriving would
+reproduce the footgun — a strategy named "momentum" would get `'equity'` stored and size 3x. Every
+strategy this engine runs is options, every template is 0DTE options, and the harm is asymmetric:
+guessing "shares" for an options strategy triples the position, while the reverse case does not
+currently exist. An equity strategy has to declare itself.
+
+The NULL fallback in `trades_options` stays as defence in depth, and is now tested against a row
+NULLed with raw SQL — because the default makes one impossible to create any other way, which is
+the point.
+
+### 12. Three things established today that are not written down anywhere else
+
+None of these changed code. All three came up as questions and the answers are worth keeping,
+because they are the kind of thing that gets re-derived badly six months later.
+
+**How the engine picks calls vs puts: it does not.** Both strategies run concurrently and are
+mirror images of each other, with `wants_upside` flipped by the `direction` param in
+`signal_generator.check_entry_signal`:
+
+| | enters when SPY is |
+|---|---|
+| strategy 3 (calls) | **above** its 9-EMA |
+| strategy 4 (puts) | **below** its 9-EMA |
+
+(plus the VWAP bound when `use_vwap` is on AND `entry_signal` names vwap — it is deliberately
+advisory otherwise). Whichever condition the market satisfies after 10:00 ET fires. Observed both
+ways already: 09-02 SPY rallied and all three trades were calls, with the put strategy arming a
+contract once and never entering; 09-04 both trailing-stop exits were puts.
+
+**Consequence worth remembering:** settled cash means whichever side fires FIRST consumes the
+money. On a choppy day the first signal wins and the other side may never trade — not because it
+was wrong, but because there is nothing left to buy with. 321 signals, capacity for 3.
+
+**What this engine actually is: intraday momentum, not scalping, and nowhere near HFT.**
+
+| | measured |
+|---|---|
+| hold times (live) | 6.7 / 12.2 / 14.3 / 32.5 / 37.0 min — **median ~14** |
+| trades per day | 3–5, hard-capped near 3 by settled cash |
+| order path | REST to a retail broker, with a preview call before every order |
+| rate limit | **5 seconds** minimum between orders per symbol |
+| signals | 9-EMA / VWAP on streamed quotes |
+
+Scalping means seconds to a couple of minutes. The strategies were *named* "0DTE Scalping" and the
+name described behaviour that only ever existed in the broken sandbox — 5.8-second median holds,
+38 seconds between entries, 64 round trips in a day, all of it produced by fills priced below
+intrinsic making every position look instantly +90%. With real fills it is a 14-minute hold. Hence
+the rename in §9.
+
+HFT is microsecond latency, colocation, direct exchange feeds, thousands of orders a day. The gap
+from a retail REST API is five to six orders of magnitude and no account size closes it. **The
+binding constraint here is capital and T+1 settlement, not speed** — more speed buys nothing, more
+settled cash buys sample size.
+
+**What the trailing stop actually pays.** With a 10% trail you always hand back 10% of the peak
+PRICE, so:
+
+```
+realised = 0.9 x (1 + peak) - 1
+```
+
+Run through `check_exit_signal` with the live params, entry $3.00:
+
+| peak | exits at | realised | per contract |
+|---|---|---|---|
+| +15% | $3.10 | +3.3% | +$10 |
+| +25% | $3.37 | +12.3% | +$37 |
+| +50% | $4.05 | +35.0% | +$105 |
+| +75% | $4.72 | +57.3% | +$172 |
+| +100% | $5.40 | +80.0% | +$240 |
+| +200% | $8.10 | +170.0% | +$510 |
+
+So **"take 50%" needs a +67% peak**, which has happened (09-04 peaked +66%, realised +49%), and the
+09-02 call ran +96% and would realise +76% under today's config. There is no ceiling to raise — the
+trail has no target, only a give-back. `take_profit_pct` is inert whenever
+`trailing_stop_activation <= take_profit_pct`, so raising it to 50/75/100 changes nothing; the only
+lever on how much of a run you keep is `trailing_stop_distance`. That is the number E8 will tune
+once the MFE distribution exists, and the reason E8 is blocked on data rather than on effort.
+
+---
+
+## Session Date: September 6, 2026 (Part 2) — LAN web access, logged after the fact
+
+**Not this session's work.** Another chat built same-WiFi access to the UI and API; it landed in the
+working tree partway through the 09-06 session. Written up here because a check found it **neither
+committed nor documented** — `grep` for `allowedHosts`, `allow_origin_regex`, `apiHost` or `mDNS`
+across JOURNAL.md returned nothing, and `git log -S` for the CORS regex and the hostname derivation
+returned nothing either. The combination of undocumented *and* uncommitted is how a change quietly
+disappears: the next reader finds `0.0.0.0` binds and a CORS regex with no explanation of why either
+exists. Everything below was verified against the running system before writing, not read off a
+diff alone.
+
+### What it does
+
+Open `http://192.168.1.7:4200` or `http://Lulusia.local:4200` from a phone or laptop on the same
+WiFi and the app works, with no rebuild and no per-device config.
+
+### The three pieces
+
+**1. Both servers bind every interface.** `app.py:224` runs uvicorn on `host="0.0.0.0"`;
+`ui/angular.json` adds `"host": "0.0.0.0"` to the serve target plus an `allowedHosts` list
+(`localhost`, `127.0.0.1`, `lulusia.local`, `Lulusia.local`, `192.168.1.7`) — the dev server rejects
+Host headers it does not recognise, so binding alone is not enough.
+
+**2. The API URL is derived, not hardcoded** — `ui/src/environments/environment.ts`:
+
+```ts
+const apiHost = `${window.location.protocol}//${window.location.hostname}:8000`;
+```
+
+This is the piece that makes one build work everywhere:
+
+```
+http://localhost:4200      -> http://localhost:8000/api/v1
+http://Lulusia.local:4200  -> http://Lulusia.local:8000/api/v1
+http://192.168.1.7:4200    -> http://192.168.1.7:8000/api/v1
+```
+
+The comment records the failure that motivated it, and it is the good kind of comment: a hardcoded
+`localhost` broke the moment the page was opened on a phone, because **`localhost` on the phone
+means the phone**. Touching `window` at module scope is safe here only because the app has no SSR
+or prerender step.
+
+**3. CORS accepts LAN origins** — a same-WiFi device loads the page from a hostname or private IP,
+so its `Origin` is not localhost. `allow_origin_regex` covers `localhost`, `127.0.0.1`, any
+`*.local` mDNS name, and the three private IPv4 blocks (192.168/16, 10/8, 172.16-31/12), scoped to
+port 4200. Never a wildcard. The code notes, correctly, that CORS is not the security boundary here
+— the bearer token is — and that this only stops the browser refusing its own requests.
+
+### Verified 2026-09-06
+
+```
+http://192.168.1.7:8000/docs                  -> 200
+http://192.168.1.7:8000/api/v1/system/health  -> {"status":"healthy",...}
+http://192.168.1.7:4200                       -> 200
+http://Lulusia.local:4200                     -> 200
+
+OPTIONS preflight, Origin: http://192.168.1.7:4200
+  -> 200  access-control-allow-origin: http://192.168.1.7:4200
+          access-control-allow-credentials: true
+```
+
+Host is `Lulusia` at `192.168.1.7` — the same machine named in the RDS migration entry.
+
+### Three things to know about it
+
+- **The firewall is untested.** Those curls ran from the host itself, and a host reaching its own
+  LAN IP does not necessarily traverse the same rules an external device hits; `ufw status` needs
+  sudo. The real test is opening `http://192.168.1.7:4200` on a phone. If it *hangs* rather than
+  erroring, it is the firewall —
+  `sudo ufw allow from 192.168.0.0/16 to any port 4200,8000 proto tcp`.
+- **The trading API is now reachable from anything on the WiFi.** The bearer token protects it and
+  the CORS regex is not a wildcard, but the exposure changed from one machine to one network. Worth
+  holding in mind rather than rediscovering.
+- **There is no `environment.prod.ts`** — only `environment.ts`, so every build carries
+  `production: false` and the hardcoded `:8000`. Fine while the API always runs on 8000 on the same
+  host as the UI; it breaks the moment either assumption does. Related: the port is already
+  configurable on the API side (`--port`), so the two can disagree.
+
+### Still open
+
+`api/app.py`'s working-tree diff is **mixed** — it carries this CORS change *and* the launch-flag
+work (`--env` / `--log` / `--no-reload`) already covered in the 09-05 entry. Committing the file
+commits both. Untouched by this session beyond reading it.
+
+---
+
+## Session Date: September 6-7, 2026 — Phone access, and an equity curve that was never empty
+
+### 1. Serving the UI to phone/laptop on the LAN
+
+Three parts, and only one of them was the real problem.
+
+- `ui/angular.json` — dev server binds `0.0.0.0` with an `allowedHosts` list. Vite's host check is an
+  exact string match against the `Host` header, and **browsers lowercase it**, so the first attempt
+  (`"Lulusia.local"`) still produced "blocked host". Both spellings are listed now. Verified:
+  `lulusia.local` 200, `Lulusia.local` 200, bare IP 200, `evil.example.com` **403** — the rebinding
+  protection is widened, not disabled.
+- `api/app.py` — CORS gained `allow_origin_regex` for `localhost`, any `*.local` mDNS name and the
+  three private IP ranges on port 4200. Never a wildcard. CORS is not the security boundary here
+  (the bearer token is); this only stops the browser refusing its own requests.
+- `ui/src/environments/environment.ts` — `apiUrl` is derived from `window.location.hostname` instead
+  of hardcoded `localhost`, so one build works from every device with no per-device config.
+
+### 2. "Login failed, check credentials" on the phone — it was never the credentials
+
+The password was right. Three services **never used `environment.apiUrl`** and hardcoded their own:
+
+```
+auth.service.ts:22           'http://localhost:8000/api/v1'   <- login
+strategy.service.ts:15       'http://localhost:8000/api/v1'
+market-stream.service.ts:29  'http://localhost:8000/api/v1'
+```
+
+On a phone, `localhost` is **the phone**. The login POST went to a server on the handset that does
+not exist, and the UI reports a refused connection and a rejected password identically — so a
+network failure presented as a credentials failure.
+
+Ruled out along the way, both worth recording: the prod and dev password hashes are **identical**,
+so running on the prod DB was never the cause; and the API was reachable from the LAN the whole
+time (`/health` 200 from `192.168.1.7`, CORS preflight echoing the origin back).
+
+**The lesson is the one this journal keeps relearning**: changing the config point is not the same
+as changing the behaviour. Fixing `environment.ts` did nothing for the three services that bypassed
+it. The check that would have caught it immediately is
+`grep -rn "localhost:8000" ui/src --include=*.ts`, which now returns nothing.
+
+### 3. The performance page's equity curve was never empty — we were reading the wrong keys
+
+The chart was fully built — both modes (daily account value, intraday cumulative realized P&L),
+theme-aware colours, the lot. It rendered nothing because `client.get_historical_balances` read
+`data["balances"]` and the live response is:
+
+```json
+{"historical_balances": {
+   "balances": {"balance": [{"date": "2026-08-07", "value": 1060.0}, ...]},
+   "delta": 154.07,
+   "delta_percent": 14.53}}
+```
+
+Two levels deeper, and `delta_percent` in snake_case. `.get("balances", [])` therefore returned `[]`
+for every period, and an empty curve looks exactly like "no history yet" — so it never read as a bug.
+
+**The client was not written carelessly.** `docs/tradier/accounts/balance_overtime.md:74-97`
+documents precisely the flat shape it was reading; the published OpenAPI example is simply wrong.
+The doc now carries an observed-response note at the top so the next reader is not misled, and the
+client accepts both shapes plus either spelling of deltaPercent.
+
+After the fix, from production:
+
+```
+WEEK     5 points   delta $154.07  (+14.53%)   08-31 -> 09-04   $1060.00 -> $1214.07
+MONTH   21 points   delta $154.07  (+14.53%)   08-07 -> 09-04
+YTD     96 points   delta $1114.07             04-21 -> 09-04   $100.00  -> $1214.07
+```
+
+Which also answers a question left open earlier in the week: **Friday 09-04 closed at $1,214.07**,
+up from $1,202.46 after Wednesday.
+
+### 4. Smaller
+
+`Largest Win / Loss` and `Hold Time (win / loss)` overflowed their cards — one long string at
+`--fs-xl` in a 200px grid cell. `MetricCard.parts` renders the two figures as separate spans in a
+wrapping flex row at `--fs-lg`, breaking at the slash rather than overflowing.

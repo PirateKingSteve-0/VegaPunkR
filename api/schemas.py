@@ -3,7 +3,7 @@ Pydantic schemas for request/response validation.
 """
 from datetime import date, datetime
 from typing import Optional, List, Dict, Any, Literal
-from pydantic import BaseModel, EmailStr, Field, field_validator
+from pydantic import computed_field, BaseModel, EmailStr, Field, field_validator
 
 from notifications.discord import is_valid_discord_webhook
 
@@ -39,6 +39,10 @@ class DiscordPrefs(BaseModel):
     webhook_url: Optional[str] = None
     notify_open: bool = True
     notify_close: bool = True
+    # Risk alerts: a strategy that is still Active but has silently stopped
+    # opening positions. Defaults on — the whole point is that this failure has
+    # no other symptom, so it must not be opt-in.
+    notify_risk: bool = True
 
     @field_validator("webhook_url")
     @classmethod
@@ -230,6 +234,19 @@ def _validate_direction(params: Optional[Dict[str, Any]]) -> Optional[Dict[str, 
     return params
 
 
+class EntryBlockStatus(BaseModel):
+    """Why the engine would refuse a new entry for this strategy right now.
+
+    Computed per-request by `RiskManager.get_entry_block_status`; it is not a
+    column. Exists so the strategies page can say "Active but blocked" instead
+    of showing a healthy-looking Active chip on a strategy that has silently
+    stopped trading.
+    """
+    blocked: bool
+    code: Optional[str] = None
+    reason: Optional[str] = None
+
+
 class StrategyBase(BaseModel):
     """Base strategy schema."""
     name: str
@@ -283,6 +300,10 @@ class StrategyResponse(StrategyBase):
     backtest_results: Optional[Dict[str, Any]] = None
     created_at: datetime
     updated_at: Optional[datetime] = None
+    # Attached by the router, absent on writes. `None` means "not evaluated"
+    # (e.g. the create/update responses), which the UI renders the same as
+    # "not blocked" — a badge that is merely unknown must never look alarming.
+    entry_block: Optional[EntryBlockStatus] = None
 
     class Config:
         from_attributes = True
@@ -369,7 +390,13 @@ class TradeResponse(TradeBase):
 # ===== Performance Metrics Schemas =====
 
 class PerformanceMetricsResponse(BaseModel):
-    """Performance metrics response."""
+    """Performance metrics response.
+
+    The gross/avg/largest/consecutive fields below were already being COMPUTED and
+    STORED by `calculate_performance_metrics` — they were simply never exposed, so
+    the UI could not show them. Adding them here needs no migration; the columns
+    exist on `PerformanceMetrics`. (2026-09-02)
+    """
     id: int
     strategy_id: int
     period: str
@@ -378,11 +405,49 @@ class PerformanceMetricsResponse(BaseModel):
     winning_trades: int
     losing_trades: int
     total_pnl: float
+    gross_profit: float = 0.0
+    gross_loss: float = 0.0
     total_commission: float = 0.0
     total_fees: float = 0.0
     win_rate: Optional[float] = None
+    profit_factor: Optional[float] = None
     sharpe_ratio: Optional[float] = None
     max_drawdown: Optional[float] = None
+    avg_win: Optional[float] = None
+    avg_loss: Optional[float] = None
+    largest_win: Optional[float] = None
+    largest_loss: Optional[float] = None
+    consecutive_wins: Optional[int] = None
+    consecutive_losses: Optional[int] = None
+
+    @computed_field
+    @property
+    def expectancy(self) -> Optional[float]:
+        """Expected P&L per trade: (win% x avgWin) + (loss% x avgLoss).
+
+        `avg_loss` is stored NEGATIVE, so this is a sum, not a difference. Derived
+        rather than stored so it needs no column and cannot drift from its inputs.
+
+        The single most useful one-line read on whether an edge exists: positive
+        means the average trade makes money, regardless of win rate. A 30%-win
+        strategy with large winners can beat a 70%-win strategy with large losers.
+        """
+        if self.win_rate is None or self.avg_win is None or self.avg_loss is None:
+            return None
+        loss_rate = 1.0 - self.win_rate
+        return round(self.win_rate * self.avg_win + loss_rate * self.avg_loss, 2)
+
+    @computed_field
+    @property
+    def payoff_ratio(self) -> Optional[float]:
+        """avgWin / |avgLoss| — how much bigger the average winner is.
+
+        Read WITH win_rate, never alone: 0.5 is fine at a 70% win rate and ruinous
+        at 30%. Expectancy above folds both into one number.
+        """
+        if not self.avg_win or not self.avg_loss:
+            return None
+        return round(self.avg_win / abs(self.avg_loss), 4)
 
     class Config:
         from_attributes = True
