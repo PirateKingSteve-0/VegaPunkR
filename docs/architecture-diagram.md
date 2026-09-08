@@ -465,6 +465,16 @@ sequenceDiagram
 
 ## 5. Component Dependency Graph
 
+> **Which client a module uses is the thing to get right here.** Account-scoped calls
+> (orders, balances, positions, account history, the account event socket) go through
+> `TradingClientManager.get_client(user)` and follow the user's paper/live selection.
+> Market data goes through `get_market_client()`, which is always live. Getting this
+> backwards is what put the account stream on the sandbox account — see §8.
+>
+> `services/market_data/` exists but nothing imports it. `services/reconciliation.py`
+> does not exist; the real one is `services/tradier_reconcile.py`.
+
+
 ```mermaid
 graph LR
     subgraph "Core Models"
@@ -484,6 +494,7 @@ graph LR
         R3[trades.py]
         R4[execution.py]
         R5[admin.py]
+        R6[auth.py, performance.py,<br/>risk_events.py, system.py,<br/>trading.py, events.py]
     end
 
     subgraph "Engine Core"
@@ -502,14 +513,15 @@ graph LR
     end
 
     subgraph "Broker Clients"
-        TC[tradier_integration/<br/>client.py<br/>router.py]
+        TC[tradier_integration/client.py<br/>TWO factories:<br/>get_market_client - always LIVE<br/>get_tradier_client - env singleton,<br/>non-account calls only]
+        TR[tradier_integration/router.py<br/>uses _client per user]
     end
 
     subgraph "Services"
-        MKT[services/market_data.py<br/>Quotes, Chains]
         RPT[notifications/reports.py<br/>Email Reports]
         SCHED[services/email_report_scheduler.py<br/>APScheduler]
-        RECON[services/reconciliation.py<br/>Broker Sync]
+        RECON[services/tradier_reconcile.py<br/>account history to<br/>commission and fees]
+        DISC[notifications/discord.py<br/>per-user webhook<br/>from the USER row]
     end
 
     %% Dependencies
@@ -556,6 +568,11 @@ graph LR
 
     RECON --> TCM
     RECON --> M
+    OM --> DISC
+    TAS --> TCM
+    TSM --> TC
+    SDW --> TC
+    SE --> TC
 
     classDef core fill:#e3f2fd,stroke:#1565c0,stroke-width:2px
     classDef engine fill:#fff3e0,stroke:#e65100,stroke-width:2px
@@ -563,7 +580,7 @@ graph LR
 
     class M,DB,CFG,SCH core
     class SDW,TSM,SR,SE,RM,SG,OM,TCM engine
-    class TC broker
+    class TC,TR broker
 ```
 
 ## 6. Multi-Environment Database Routing
