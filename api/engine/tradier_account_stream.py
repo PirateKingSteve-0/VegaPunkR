@@ -38,7 +38,7 @@ over REST to read fill price/qty. Push tells us *when*; REST tells us *what*.
 import asyncio
 import json
 import logging
-from typing import Dict, Optional
+from typing import Any, Callable, Dict, Optional
 
 import websockets
 
@@ -60,6 +60,16 @@ class TradierAccountStreamManager:
         self._task: Optional[asyncio.Task] = None
         self._ws = None
         self._session_id: Optional[str] = None
+        # Resolves the client whose ACCOUNT this stream should watch. Injected by
+        # app.py at startup because this manager is a process-wide singleton with
+        # no user of its own. Without it we fall back to the env singleton, which
+        # is how this stream ended up watching the sandbox account through two
+        # live sessions (TODO F1).
+        self._client_provider: Optional[Callable[[], Any]] = None
+
+    def set_client_provider(self, provider: Optional[Callable[[], Any]]) -> None:
+        """Supply the account whose order events we want. Call before start()."""
+        self._client_provider = provider
 
     # ---------------------------------------------------------------- lifecycle
 
@@ -127,11 +137,38 @@ class TradierAccountStreamManager:
     # ---------------------------------------------------------------- internals
 
     def _create_session_sync(self) -> Dict[str, str]:
-        # Account events are per-account, so this MUST use the trading env's client
-        # (sandbox when paper) — unlike market data, which is forced to live.
+        # Account events are per-account, so the client MUST be the one the orders
+        # go through — i.e. routed by the user's live/paper selection. It used to
+        # call get_tradier_client(), the env singleton built from TRADIER_ENV, so
+        # a live session opened a socket on the SANDBOX account and no live fill
+        # was ever pushed. Verified 2026-09-07: orders on 6YB***56 @ api.tradier.com,
+        # stream on VA8***04 @ sandbox.tradier.com.
         from tradier_integration.client import get_tradier_client
 
-        return get_tradier_client().create_account_stream_session()
+        client = None
+        if self._client_provider is not None:
+            try:
+                client = self._client_provider()
+            except Exception as exc:
+                logger.error(f"Account stream client provider failed: {exc}")
+
+        if client is None:
+            client = get_tradier_client()
+            logger.warning(
+                "Account stream falling back to the TRADIER_ENV client (%s). "
+                "If the engine is trading live, this socket is watching the WRONG "
+                "account and fills will only confirm via REST polling.",
+                getattr(client, "_env", "unknown"),
+            )
+
+        self._env_label = getattr(client, "_env", "unknown")
+        try:
+            acct = client._resolve_account_id()
+            self._account_label = f"{acct[:3]}***{acct[-2:]}" if acct else "unknown"
+        except Exception:
+            self._account_label = "unknown"
+
+        return client.create_account_stream_session()
 
     def _handle(self, event: dict) -> None:
         order_id = event.get("id")
@@ -166,7 +203,12 @@ class TradierAccountStreamManager:
                         "sessionid": self._session_id,
                         "excludeAccounts": [],
                     }))
-                    logger.info(f"Account event stream connected: {url}")
+                    logger.info(
+                        "Account event stream connected: %s "
+                        "(env=%s account=%s)",
+                        url, getattr(self, "_env_label", "unknown"),
+                        getattr(self, "_account_label", "unknown"),
+                    )
 
                     async for message in ws:
                         # `linebreak` is not documented for the account stream, but

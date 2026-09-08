@@ -362,6 +362,68 @@ currently checks the total.
 
 ---
 
+### F1. ~~The account event stream watches the SANDBOX account during live trading~~ *(FIXED 2026-09-07)*
+
+> **Fixed and verified in the live process the same evening.** Connect line now reads
+> `wss://ws.tradier.com/v1/accounts/events (env=live account=6YB***56)` — the account the orders
+> actually go to.
+>
+> Three changes: `TradierAccountStreamManager` takes a client provider, injected by `app.py` from
+> the same per-user routing the order path uses; `reconcile_user_history` uses
+> `TradingClientManager.get_client(user)`; and six market-data callers moved to a new
+> `get_market_client()` that forces the live endpoint, so paper mode reads real prices and a live
+> process never reads market data over a sandbox host.
+>
+> Two things that let it hide are now closed: the connect log prints `env=` and a masked account,
+> and a missing provider logs a WARNING rather than falling back silently. `get_tradier_client()`
+> carries a docstring saying it is only safe for non-account calls.
+>
+> Tests: `api/tests/test_account_stream_account_routing.py` — live provider gets the live socket,
+> paper still gets sandbox (not force-live), no provider falls back, a throwing provider cannot
+> take the stream down.
+
+`tradier_account_stream._create_session_sync` calls `get_tradier_client()` — a module-level
+singleton built from `settings.TRADIER_ENV` in `.env`, currently `sandbox`. Orders route
+per-user through `TradingClientManager.get_client(user)` on `user.selected_trading_mode`,
+currently `live`. The two disagree, and nothing reconciles them:
+
+```
+orders            -> LIVE account 6YB70356
+account WS stream -> wss://sandbox-ws.tradier.com  (sandbox account)
+```
+
+Confirmed in the 09-02 and 09-06 engine logs: `Account event stream connected:
+wss://sandbox-ws.tradier.com/v1/accounts/events` while the session traded real money.
+
+**Effect:** live fills are never pushed. Confirmation falls back to the 30s REST poll — the
+exact path this stream was built to backstop after 2026-07-13, when two orders filled while
+the poll expired and left the engine holding 6 unrecorded contracts. All 09-02 fills
+reconciled correctly via REST, so this is latent rather than broken, and the code comment at
+`tradier_account_stream.py:130` asserts the opposite of what happens.
+
+**Second site, same bug:** `services/tradier_reconcile.reconcile_user_history` (line 118) also
+calls `get_tradier_client()`. It pulls account history and writes commission/fees onto local
+`Trade` rows — so run against a live account it reads SANDBOX history and reconciles fees from
+the wrong account. Only reachable from the manual `POST /account/reconcile-fees` endpoint, not
+the engine loop, so it misfires only when someone calls it.
+
+**The fix already exists in the router.** `tradier_integration/router.py:29` added `_client(user)`
+for exactly this reason — its docstring says the singleton "always hit sandbox regardless of the
+user's live/paper selection". Both remaining sites need the same treatment.
+
+**Market data is NOT affected — verified 2026-09-07.** Sandbox and live return byte-identical
+quotes, greeks and open interest (`SPY 769.42/769.55`, `SPY260908C00768000 bid 3.00 ask 3.03
+oi 1193 delta 0.6736` from both). Tradier's sandbox serves real market data and only fabricates
+fills, so the six singleton callers that read quotes, chains, the clock and greeks are correct.
+Only the two account-touching sites above are wrong.
+
+**Fix:** the stream needs the same per-user client the order path uses, not the env singleton.
+That means giving `TradierAccountStreamManager` a user (or a client factory) rather than
+letting it resolve its own — worth care, since it is a singleton shared across strategies and
+the market stream is deliberately always-live.
+
+---
+
 ## E. Exit rule structure *(from the 2026-09-02 live session)*
 
 Full write-up: `docs/live-test-results-2026-09-02.md`.

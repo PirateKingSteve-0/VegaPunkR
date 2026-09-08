@@ -48,6 +48,39 @@ async def lifespan(app: FastAPI):
 
     stream_mgr = get_stream_manager()
     account_stream = get_account_stream_manager()
+
+    # The account event stream is a process-wide singleton with no user, so it
+    # cannot route itself. Give it the same client the ORDERS use — routed by the
+    # user's live/paper selection — or it opens a socket on whatever TRADIER_ENV
+    # says and silently watches the wrong account (TODO F1).
+    def _account_stream_client():
+        from database import SessionLocals, default_environment
+        from models import Strategy, User
+        from engine.trading_client_manager import TradingClientManager
+
+        db = SessionLocals[default_environment()]()
+        try:
+            user_ids = [
+                uid for (uid,) in db.query(Strategy.user_id)
+                .filter(Strategy.is_active == True)  # noqa: E712
+                .distinct().all()
+            ]
+            if not user_ids:
+                return None
+            if len(user_ids) > 1:
+                # One socket, one account. Tradier's account stream cannot watch
+                # several, so say so rather than picking silently.
+                logger.warning(
+                    "Active strategies span %d users %s — the account stream can "
+                    "only watch one account; using user_id=%s.",
+                    len(user_ids), user_ids, user_ids[0],
+                )
+            user = db.query(User).filter(User.id == user_ids[0]).first()
+            return TradingClientManager().get_client(user) if user else None
+        finally:
+            db.close()
+
+    account_stream.set_client_provider(_account_stream_client)
     worker = get_stream_driven_worker()
     email_scheduler = get_email_report_scheduler()
 

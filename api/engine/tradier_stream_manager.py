@@ -101,8 +101,8 @@ class TradierStreamManager:
         return list(self._refcount.keys())
 
     def _create_session_sync(self) -> str:
-        from tradier_integration.client import get_tradier_client
-        session = get_tradier_client().create_stream_session()
+        from tradier_integration.client import get_market_client
+        session = get_market_client().create_stream_session()
         return session["sessionid"]
 
     async def _run(self):

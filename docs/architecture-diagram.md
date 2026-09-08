@@ -17,6 +17,10 @@ graph TB
         ADMIN[Admin Router<br/>User Management]
         SYS[System Router<br/>Environment Switch]
         EXEC[Execution Router<br/>Start/Stop]
+        RISKR[Risk Events Router<br/>Cap Trips + Halt]
+        TRADING[Trading Router<br/>Manual Actions]
+        EVENTS[Events Router<br/>System Event Feed]
+        TRDR[Tradier Router<br/>Quotes, Chains, Balances]
     end
 
     subgraph "Trading Engine - Event Driven"
@@ -39,7 +43,7 @@ graph TB
     end
 
     subgraph "Data Layer"
-        DB[(PostgreSQL<br/>TimescaleDB<br/><br/>3 Databases:<br/>dev:5435<br/>test:5433<br/>prod:5434)]
+        DB[(AWS RDS PostgreSQL 16<br/>us-west-1, port 5432<br/><br/>vegapunkr_dev<br/>vegapunkr_prod<br/><br/>test still local on 5433)]
     end
 
     subgraph "External Services"
@@ -77,6 +81,7 @@ graph TB
     OM -->|Route Order| TCM
 
     %% Broker routing — paper vs live is Tradier SANDBOX vs Tradier LIVE.
+    %% ACCOUNT calls only. Market data always uses the live endpoint.
     %% TradingClientManager is not a broker abstraction: both branches return TradierClient.
     TCM -->|Paper Mode - sandbox| TC
     TCM -->|Live Mode - live| TC
@@ -135,6 +140,9 @@ erDiagram
         decimal account_size_usd
         decimal max_trade_percentage
         decimal daily_loss_limit_pct
+        date trading_halted_on "NULL means not halted"
+        string trading_halt_mode "ride|flatten"
+        string timezone "display only, gates use ET"
         enum selected_environment "dev|test|prod"
         enum selected_trading_mode "paper|live"
         boolean trading_window_enabled
@@ -149,7 +157,8 @@ erDiagram
         uuid user_id FK
         string name
         string strategy_type
-        jsonb params_json "EMA, VWAP, TP, SL, etc"
+        string instrument_type "stored fact, not inferred"
+        jsonb params_json "EMA, VWAP, TP, SL, trail, direction"
         array instruments "symbols[]"
         string timeframe
         int max_positions
@@ -170,8 +179,8 @@ erDiagram
         decimal avg_entry_price
         decimal current_price
         decimal unrealized_pnl
-        decimal peak_price
-        decimal trough_price
+        decimal peak_price "high-water mark, arms the trail"
+        decimal trough_price "low-water mark"
         timestamp opened_at
         timestamp closed_at
     }
@@ -190,7 +199,10 @@ erDiagram
         decimal commission
         decimal fees
         decimal pnl
-        timestamp timestamp "PARTITION KEY"
+        decimal mfe_price "max favorable excursion"
+        decimal mae_price "max adverse excursion"
+        timestamp exit_timestamp
+        timestamp timestamp "entry fill time"
         string status "filled|rejected|canceled"
         jsonb notes
     }
@@ -288,11 +300,13 @@ sequenceDiagram
     RM-->>SE: qty = 1 contract
 
     SE->>RM: validate_pre_trade(user, strategy, qty)
+    RM->>RM: Check trading halt for today
     RM->>RM: Check account daily loss cap
     RM->>RM: Check strategy daily loss limit
     RM->>RM: Check max drawdown
     RM->>RM: Check position limits
     RM->>RM: Check trading mode consistency
+    Note over RM: Every gate blocks BUYS only.<br/>A sell is always allowed through<br/>so a position stays closeable.
     RM-->>SE: ✓ All checks passed
 
     %% Execute order
@@ -306,11 +320,21 @@ sequenceDiagram
     OM->>OM: check_rate_limit(user, symbol)
     Note over OM: ✓ Last order > 5s ago
 
+    %% Settled-cash precheck BEFORE any broker call
+    OM->>OM: estimate = qty x price x 100 + fees
+    OM->>OM: available = cached_settled_cash - reservations
+    Note over OM: Buys only. If clearly unaffordable,<br/>skip WITHOUT calling the broker.<br/>Cash cached 60s, invalidated on fill.<br/>Sells skip this entirely.
+
     %% Preview order
     OM->>TCM: preview_order(symbol, qty, side)
     TCM->>TC: POST /v1/accounts/123/orders/preview
-    TC-->>TCM: {commission: $0.35, buying_power_ok: true}
+    TC-->>TCM: {commission: $0.35, cost: $123.35}
     TCM-->>OM: preview_result
+
+    %% Authoritative cash gate — still decides
+    OM->>TC: GET /v1/accounts/123/balances
+    TC-->>OM: {cash.cash_available: $1214.07}
+    OM->>OM: required = cost + fee_buffer vs settled - reservations
 
     %% Cash reservation
     OM->>OM: reserve_cash(user_id, amount, 60s TTL)
@@ -378,22 +402,33 @@ sequenceDiagram
     SE->>SE: calculate_unrealized_pnl(position, current_price)
     Note over SE: Entry: $1.23<br/>Current: $1.35<br/>P&L: +9.76%
 
+    %% High-water mark, kept on the CONTRACT not the underlying
+    SE->>SE: peak_price = max of peak_price and exit_price
+    Note over SE: Marked off the held contract's bid.<br/>Marking off the underlying inflated<br/>unrealized P&L by roughly 100x.
+
     %% Check exit signals
     SE->>SG: check_exit_signal(position, market_state, params)
 
-    %% Take profit check
-    SG->>SG: pnl_pct >= take_profit_pct?
-    Note over SG: 9.76% >= 10%? NO
-
-    %% Stop loss check
+    %% 1. Stop loss — evaluated first, never gated behind anything
     SG->>SG: pnl_pct <= -stop_loss_pct?
-    Note over SG: 9.76% <= -5%? NO
+    Note over SG: 9.76% vs -15%? NO
 
-    %% Trailing stop check
-    SG->>SG: trailing_stop_triggered(peak_price, current_price)?
-    Note over SG: Peak: $1.40, Trail: 3%<br/>$1.35 < ($1.40 * 0.97)? YES
+    %% 2. Trailing stop — armed off the PEAK, and it latches
+    SG->>SG: peak_pnl_pct >= trailing_stop_activation?
+    Note over SG: Armed on the high-water mark, not the<br/>live P&L. The old form re-tested live<br/>P&L each tick, so the trail switched OFF<br/>during the very pullback it exists for.
+    SG->>SG: current_price <= peak_price x 0.90?
+    Note over SG: Peak $1.40, trail 10 percent<br/>$1.35 vs $1.26? NO, hold
 
-    SG-->>SE: SIGNAL: SELL (trailing_stop)
+    %% 3. Take profit — SUPPRESSED while the trail is armed
+    SG->>SG: take_profit_pct AND NOT trail_armed?
+    Note over SG: A flat target and a trail both claim<br/>the upside. The target fires on the way<br/>UP before any pullback exists, so it has<br/>to stand down or the trail never governs.
+
+    %% 4. Max hold, 5. time of day
+    SG->>SG: max_hold_time_minutes reached?
+    SG->>SG: forced_exit_time_et reached?
+    Note over SG: Earliest of the EOD floor, the strategy<br/>window, the account window, and a<br/>flatten-mode halt. Most restrictive wins.
+
+    SG-->>SE: SIGNAL: SELL trailing stop
 
     %% Execute sell order
     SE->>OM: execute_signal(strategy, sell_signal, position.qty)
@@ -412,7 +447,7 @@ sequenceDiagram
     TC-->>OM: {status: "filled", avg_fill_price: $1.35}
 
     %% Update database
-    OM->>DB: INSERT INTO trades<br/>(side: sell, price: $1.35, pnl: $12.00)
+    OM->>DB: INSERT INTO trades<br/>side sell, price $1.35, pnl $12.00,<br/>mfe_price and mae_price from the position
     OM->>DB: UPDATE positions SET<br/>qty = 0, closed_at = NOW()
     OM->>DB: INSERT INTO system_events<br/>(event_type: position_closed)
     OM->>DB: UPDATE performance_metrics
@@ -546,10 +581,13 @@ graph TB
         APPENV[APP_ENV<br/>Environment Variable]
     end
 
-    subgraph "Docker PostgreSQL Instances"
-        DEV[(dev Database<br/>Port 5435<br/>vegapunk_dev)]
-        TEST[(test Database<br/>Port 5433<br/>vegapunk_test)]
-        PROD[(prod Database<br/>Port 5434<br/>vegapunk_prod)]
+    subgraph "AWS RDS PostgreSQL 16 - us-west-1"
+        DEV[(vegapunkr_dev<br/>port 5432)]
+        PROD[(vegapunkr_prod<br/>port 5432)]
+    end
+
+    subgraph "Local leftover"
+        TEST[(vegapunk_test<br/>port 5433<br/>NOT migrated to RDS)]
     end
 
     %% API routing
@@ -597,7 +635,10 @@ stateDiagram-v2
     EntryLockout --> RateLimit: Lockout<br/>Acquired
 
     RateLimit --> Idle: Last Order<br/>< 5s ago
-    RateLimit --> Preview: Rate Limit<br/>Passed
+    RateLimit --> CashPrecheck: Rate Limit<br/>Passed
+
+    CashPrecheck --> Idle: BUY clearly unaffordable —<br/>skipped with NO broker call.<br/>SELLS bypass this entirely
+    CashPrecheck --> Preview: Estimate fits<br/>cached settled cash
 
     Preview --> Idle: Buying Power<br/>Insufficient
     Preview --> CashReserve: Preview<br/>Successful
@@ -695,10 +736,29 @@ socket — so both coexist. Verified against sandbox 2026-07-13.
 
 - **Market stream** (`tradier_stream_manager.py`) — price/quote ticks. Always LIVE endpoint;
   sandbox has no market-data WS host.
-- **Account stream** (`tradier_account_stream.py`) — order lifecycle events. Uses the
-  *trading* env, so paper mode connects to `sandbox-ws.tradier.com`. Exists so fills are
-  **pushed** rather than polled: on 2026-07-13 two orders filled while the engine's 30s
+
+**All market data is live, in every mode.** Quotes, option chains, greeks, open interest and the
+market clock go through `get_market_client()`, which forces the live endpoint whenever a live key
+is configured. Sandbox fabricates *fills*, not prices — verified 2026-09-07, sandbox and live
+return byte-identical quotes and greeks — so there is never a reason to read prices from it, and
+paper mode gets real market data. Only account-scoped calls follow the paper/live selection.
+- **Account stream** (`tradier_account_stream.py`) — order lifecycle events. Exists so fills
+  are **pushed** rather than polled: on 2026-07-13 two orders filled while the engine's 30s
   `get_order` poll expired, leaving it holding 6 contracts it had no record of.
+
+The account stream follows the **user's live/paper selection**, so it watches the same account
+the orders go to. `app.py` injects a client provider at startup; the manager is a process-wide
+singleton with no user of its own and cannot route itself.
+
+> **Fixed 2026-09-07 — it used to watch the wrong account.** `_create_session_sync` called
+> `get_tradier_client()`, the singleton built from `settings.TRADIER_ENV` (`sandbox`), while
+> orders routed per-user on `selected_trading_mode` (`live`). A live session therefore opened a
+> socket on the SANDBOX account — orders on `6YB***56` at `api.tradier.com`, stream on `VA8***04`
+> at `sandbox.tradier.com` — so no live fill was ever pushed and confirmation fell back to the
+> 30s REST poll this stream exists to backstop. It hid for two live sessions because connecting
+> to sandbox *succeeds*, and the log printed only the URL. The connect line now carries
+> `env=` and a masked account number, and a missing provider logs a WARNING instead of falling
+> back silently. Tests: `api/tests/test_account_stream_account_routing.py`.
 
 The account stream is an **accelerator, not a replacement** — REST polling remains the
 fallback, so if it drops the engine behaves exactly as it did before.
@@ -707,7 +767,7 @@ fallback, so if it drops the engine behaves exactly as it did before.
 graph TB
     subgraph "Tradier WebSockets (two sessions, one per type)"
         WS[wss://ws.tradier.com<br/>/v1/markets/events<br/>MARKET DATA - always live]
-        WSA[wss://sandbox-ws OR ws.tradier.com<br/>/v1/accounts/events<br/>ORDER EVENTS - follows trading env]
+        WSA[wss://sandbox-ws OR ws.tradier.com<br/>/v1/accounts/events<br/>ORDER EVENTS - follows the USER's<br/>live or paper selection]
     end
 
     subgraph "TradierAccountStreamManager (Singleton)"
@@ -799,12 +859,22 @@ graph TB
 
 ## 9. Risk Management Hierarchy
 
+> Every gate below blocks **buys only**. A sell is allowed through at every level,
+> so a cash shortfall, a tripped cap or a role change can never strand an open
+> position. Level 12 is checked *before* the broker preview — it used to run
+> after, which cost 214 wasted round trips in one session.
+
+
 ```mermaid
 graph TB
     START[Order Request] --> L1{Level 1:<br/>Role-Based Access}
 
-    L1 -->|user or admin| L2{Level 2:<br/>Trading Mode Gate}
+    L1 -->|user or admin| LH{Level 1b:<br/>Done For The Day Halt}
     L1 -->|viewer auditor<br/>strategy_author| REJECT1[Reject: Read-Only Role]
+
+    LH -->|Not halted| L2{Level 2:<br/>Trading Mode Gate}
+    LH -->|Halted ride mode| REJECTH[Reject: Stopped for today.<br/>Open positions keep SL TP and trail]
+    LH -->|Halted flatten mode| REJECTH
 
     L2 -->|Paper strategy<br/>in paper mode| L3{Level 3:<br/>Account Daily Loss Cap}
     L2 -->|Live strategy<br/>in live mode| L3
@@ -817,7 +887,7 @@ graph TB
     L4 -->|Loss over 5%| REJECT4[Reject: Strategy<br/>daily loss limit]
 
     L5 -->|Drawdown under 10%| L6{Level 6:<br/>Position Limits}
-    L5 -->|Drawdown over 10%| REJECT5[Reject: Max<br/>drawdown exceeded]
+    L5 -->|Drawdown over 10%| REJECT5[Reject: Max drawdown exceeded.<br/>A limit, not a latch: it clears when<br/>equity recovers above the band]
 
     L6 -->|Count under Max| L7{Level 7:<br/>Entry Trading Window}
     L6 -->|Count at Max| REJECT6[Reject: Max positions<br/>reached]
@@ -838,7 +908,7 @@ graph TB
     L11 -->|Last order under 5s| REJECT11[Reject: 5s rate<br/>limit per symbol]
 
     L12 -->|Settled cash available| PREVIEW[Preview Order<br/>via Tradier]
-    L12 -->|Insufficient cash| REJECT12[Reject: Insufficient<br/>settled cash]
+    L12 -->|Clearly unaffordable| REJECT12[Skip: insufficient settled cash.<br/>No broker call is made. Logged once<br/>on entry, then counted quietly]
 
     PREVIEW --> L13{Level 13:<br/>Buying Power Check}
 
@@ -852,8 +922,8 @@ graph TB
     classDef check fill:#fff3e0,stroke:#e65100,stroke-width:2px
     classDef success fill:#e8f5e9,stroke:#2e7d32,stroke-width:2px
 
-    class REJECT1,REJECT2,REJECT3,REJECT4,REJECT5,REJECT6,REJECT7,REJECT8,REJECT9,REJECT10,REJECT11,REJECT12,REJECT13 reject
-    class L1,L2,L3,L4,L5,L6,L7,L8,L9,L10,L11,L12,L13 check
+    class REJECT1,REJECTH,REJECT2,REJECT3,REJECT4,REJECT5,REJECT6,REJECT7,REJECT8,REJECT9,REJECT10,REJECT11,REJECT12,REJECT13 reject
+    class L1,LH,L2,L3,L4,L5,L6,L7,L8,L9,L10,L11,L12,L13 check
     class PLACE,SUCCESS success
 ```
 
@@ -1014,7 +1084,7 @@ stateDiagram-v2
 | **Optimistic Polling** | Poll Tradier for terminal status before DB write | Fail-safe against partial fills |
 | **In-Memory Cash Ledger** | Temporary holds with TTL | Prevent double-spend on concurrent orders |
 | **Re-Entry Cooldown** | 30s lockout after close | Prevent flip-flop trading loops |
-| **Multi-Environment DB Routing** | 3 separate PostgreSQL instances | Complete data isolation (dev/test/prod) |
+| **Multi-Environment DB Routing** | One RDS instance, separate databases per env | Data isolation without three servers. Process-level: `APP_ENV` pins the whole process |
 | **Role-Based Access Control** | JWT claims + FastAPI dependencies | Fine-grained permissions (user/admin/viewer/auditor) |
 | **Strategy Market State** | Per-strategy accumulator of stream events | Maintain real-time pricing, greeks, volume |
 
@@ -1024,13 +1094,17 @@ stateDiagram-v2
 
 - **Latency**: Stream tick → Order placed: ~50-150ms (network-dependent)
 - **Throughput**: Single WebSocket handles 100+ symbols simultaneously
-- **Concurrency**: Supports 10+ active strategies per process
-- **Database**: TimescaleDB hypertable partitions trades by timestamp
+- **Concurrency**: 10+ active strategies per process, but **exactly one engine process**.
+  The cash reservation ledger, settled-cash cache, order throttles and unconfirmed-order
+  map are all in-memory class state — a second instance would double-spend the same
+  settled cash and fire duplicate orders
+- **Database**: plain PostgreSQL 16 on RDS. No TimescaleDB, no partitioning — the
+  extension list is `plpgsql` only and `trades` is an ordinary table
 - **Live-Test Logging**: JSONL append-only logs for post-trade analysis
 - **Fail-Safe**: Auto-reconnect on WebSocket disconnect (5s backoff)
 - **Recovery**: Startup reconciliation syncs DB against Tradier positions
 
 ---
 
-*Generated: 2026-07-11*
+*Generated: 2026-07-11 — sections 1, 2, 3, 4, 6, 7, 9 verified against code 2026-09-07*
 *Codebase: VegaPunkR Options Trading Automation Platform*

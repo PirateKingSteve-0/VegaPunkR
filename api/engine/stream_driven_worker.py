@@ -1159,9 +1159,10 @@ class StreamDrivenWorker:
         """
         try:
             from datetime import date
-            from tradier_integration.client import get_tradier_client
+            from tradier_integration.client import get_market_client
 
-            client = get_tradier_client()
+            # Market data, not account data — always live. See TODO F1.
+            client = get_market_client()
             params = strategy.params_json
             # Same resolver the entry-signal path uses, so the contract we arm
             # and the signal that fires can never disagree about direction.
@@ -1497,9 +1498,9 @@ class StreamDrivenWorker:
         min_oi = params.get("min_open_interest", 0)
 
         try:
-            from tradier_integration.client import get_tradier_client
+            from tradier_integration.client import get_market_client
 
-            quotes = await asyncio.to_thread(get_tradier_client().get_quotes, [sym], True)
+            quotes = await asyncio.to_thread(get_market_client().get_quotes, [sym], True)
         except Exception as e:
             logger.warning(f"Drift check failed for {sym}: {e} — keeping contract armed")
             return

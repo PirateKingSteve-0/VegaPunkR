@@ -191,8 +191,8 @@ class MarketHours:
         if now < self._clock_error_until:
             return None  # still in backoff window, use local fallback
         try:
-            from tradier_integration.client import get_tradier_client
-            clock = get_tradier_client().get_market_clock()
+            from tradier_integration.client import get_market_client
+            clock = get_market_client().get_market_clock()
             self._clock_cache = clock
             self._clock_cache_time = now
             self._clock_error_until = 0.0  # clear any previous backoff

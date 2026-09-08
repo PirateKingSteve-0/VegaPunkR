@@ -20,7 +20,7 @@ from typing import Any, Dict, List, Optional
 from sqlalchemy.orm import Session
 
 from models import Trade, User
-from tradier_integration.client import get_tradier_client
+from engine.trading_client_manager import TradingClientManager
 
 logger = logging.getLogger(__name__)
 
@@ -115,7 +115,11 @@ def reconcile_user_history(
     Pull Tradier account history for the date range and update local Trade rows
     with commission/fees. Returns a summary of what was written.
     """
-    client = get_tradier_client()
+    # Account history is account-scoped, so it MUST follow the user's live/paper
+    # selection. This used the env singleton, which is built from TRADIER_ENV and
+    # ignores the user — so reconciling a LIVE account pulled SANDBOX history and
+    # wrote its commissions onto live trades. See TODO F1.
+    client = TradingClientManager().get_client(user)
 
     trade_events: List[Dict[str, Any]] = []
     fee_events: List[Dict[str, Any]] = []

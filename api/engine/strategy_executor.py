@@ -723,8 +723,8 @@ class StrategyExecutor:
         """
         try:
             import asyncio as _asyncio
-            from tradier_integration.client import get_tradier_client
-            client = get_tradier_client()
+            from tradier_integration.client import get_market_client
+            client = get_market_client()
 
             def _get_quote():
                 live_url = client._base_url if 'live' in getattr(client, '_base_url', '') else None

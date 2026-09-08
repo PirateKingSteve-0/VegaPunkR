@@ -51,5 +51,50 @@ $(echo "$staged" | grep '^api/engine/' | sed 's/^/    /')
 MSG
 fi
 
+# --- mermaid diagrams -------------------------------------------------------
+#
+# A broken diagram fails SILENTLY: GitHub renders the fence as an error box and
+# nothing else complains, so it can sit wrong for weeks. The validator catches
+# the syntax that actually breaks rendering (pipes in node labels, parens and
+# slashes in edge labels, multi-colon state transitions).
+#
+# Scoped to staged markdown that actually contains a mermaid fence, so a commit
+# touching no diagram pays nothing. Errors block; warnings are printed and
+# ignored, because the checks are regex heuristics and a false positive must
+# not train the --no-verify reflex.
+mermaid_files=$(
+    git diff --cached --name-only --diff-filter=ACM -- '*.md' \
+        | while read -r f; do
+            [ -f "$f" ] && grep -lq '```mermaid' "$f" && echo "$f"
+          done
+)
+
+if [ -n "$mermaid_files" ]; then
+    echo "pre-commit: validating mermaid in $(echo "$mermaid_files" | wc -l) file(s)..."
+    # shellcheck disable=SC2086
+    if ! python3 scripts/validate_mermaid.py $mermaid_files; then
+        cat <<'MSG'
+
+  COMMIT BLOCKED — a mermaid diagram will not render.
+
+  Fix the syntax above, or if you believe the validator is wrong:
+      git commit --no-verify
+
+MSG
+        exit 1
+    fi
+fi
+
+# --- advisory: does this change make a diagram stale? -----------------------
+#
+# diagram_agent maps changed source files to the architecture-diagram sections
+# they affect. It does NOT rewrite the diagram — auto-update is unimplemented
+# — so this can only tell you what has drifted. Never blocks: a stale diagram
+# is worth knowing about, not worth stopping a commit for.
+if [ -n "$staged" ]; then
+    # shellcheck disable=SC2086
+    python3 scripts/diagram_agent.py $staged || true
+fi
+
 echo "pre-commit: OK"
 exit 0

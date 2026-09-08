@@ -865,7 +865,43 @@ _client: Optional[TradierClient] = None
 
 
 def get_tradier_client() -> TradierClient:
+    """The env-configured singleton — built from settings.TRADIER_ENV.
+
+    ONLY safe for calls that do not touch an account. It ignores the user's
+    live/paper selection entirely, so anything account-scoped (balances,
+    positions, orders, account history, the account event stream) must use
+    `TradingClientManager.get_client(user)` instead. Two sites got this wrong
+    and read the SANDBOX account while the engine traded live — see TODO F1.
+    """
     global _client
     if _client is None:
         _client = TradierClient()
     return _client
+
+
+_market_client: Optional[TradierClient] = None
+
+
+def get_market_client() -> TradierClient:
+    """Client for MARKET data — quotes, chains, greeks, the clock.
+
+    Always live when a live key is configured. Market data is not account
+    scoped, sandbox and live return identical quotes/greeks/OI (verified
+    2026-09-07), and `create_stream_session` already forces live because
+    sandbox has no market-data WS host. Reading market data over the sandbox
+    HTTP host in a live process was inconsistent with all of that.
+
+    Falls back to the env singleton when no live key is set, so a sandbox-only
+    machine keeps working.
+    """
+    global _market_client
+    if _market_client is None:
+        if settings.TRADIER_LIVE_API_KEY:
+            _market_client = TradierClient(env="live")
+        else:
+            logger.warning(
+                "No TRADIER_LIVE_API_KEY — market data falls back to "
+                "the %s endpoint.", settings.TRADIER_ENV,
+            )
+            _market_client = get_tradier_client()
+    return _market_client
