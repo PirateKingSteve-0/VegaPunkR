@@ -80,7 +80,7 @@ class StrategyTemplates:
 
                 # Risk management
                 "risk_per_trade_pct": 1.5,
-                "max_position_size_usd": 500,
+                "max_position_size_usd": None,   # opt-in dollar ceiling; None = no cap
                 "max_contracts": 3,
 
                 # Exit conditions
@@ -96,8 +96,8 @@ class StrategyTemplates:
                 "max_hold_time_minutes": 30,
 
                 # Filters
-                "avoid_economic_news": True,
-                "check_market_regime": True,
+                "avoid_economic_news": True,   # DECLARED, NOT IMPLEMENTED — see docs/econ-calendar.md
+                "check_market_regime": True,   # DECLARED, NOT IMPLEMENTED — see TODO.md E12
             },
             "max_positions": 2,
             "stop_loss_percentage": 50.0,
@@ -135,7 +135,7 @@ class StrategyTemplates:
                 "entry_signal": "price_above_9ema_and_vwap",
                 "confirmation_required": True,
                 "risk_per_trade_pct": 1.0,
-                "max_position_size_usd": 400,
+                "max_position_size_usd": None,   # opt-in dollar ceiling; None = no cap
                 "max_contracts": 2,
                 "take_profit_pct": 30,
                 "stop_loss_pct": 40,
@@ -145,8 +145,8 @@ class StrategyTemplates:
                 "entry_after_open_minutes": 30,
                 "exit_before_close_minutes": 20,
                 "max_hold_time_minutes": 20,
-                "avoid_economic_news": True,
-                "check_market_regime": True,
+                "avoid_economic_news": True,   # DECLARED, NOT IMPLEMENTED — see docs/econ-calendar.md
+                "check_market_regime": True,   # DECLARED, NOT IMPLEMENTED — see TODO.md E12
                 "gamma_scalping_mode": True,
             },
             "max_positions": 1,
@@ -185,7 +185,7 @@ class StrategyTemplates:
                 "entry_signal": "price_above_9ema_and_vwap",
                 "confirmation_required": True,
                 "risk_per_trade_pct": 1.5,
-                "max_position_size_usd": 500,
+                "max_position_size_usd": None,   # opt-in dollar ceiling; None = no cap
                 "max_contracts": 3,
                 "take_profit_pct": 25,
                 "stop_loss_pct": 50,
@@ -195,8 +195,8 @@ class StrategyTemplates:
                 "entry_after_open_minutes": 30,
                 "exit_before_close_minutes": 15,
                 "max_hold_time_minutes": 30,
-                "avoid_economic_news": True,
-                "check_market_regime": True,
+                "avoid_economic_news": True,   # DECLARED, NOT IMPLEMENTED — see docs/econ-calendar.md
+                "check_market_regime": True,   # DECLARED, NOT IMPLEMENTED — see TODO.md E12
             },
             "max_positions": 2,
             "stop_loss_percentage": 50.0,
@@ -234,7 +234,7 @@ class StrategyTemplates:
                 "entry_signal": "price_above_9ema_and_vwap",
                 "confirmation_required": True,
                 "risk_per_trade_pct": 1.0,
-                "max_position_size_usd": 400,
+                "max_position_size_usd": None,   # opt-in dollar ceiling; None = no cap
                 "max_contracts": 2,
                 "take_profit_pct": 35,
                 "stop_loss_pct": 40,
@@ -244,8 +244,8 @@ class StrategyTemplates:
                 "entry_after_open_minutes": 30,
                 "exit_before_close_minutes": 20,
                 "max_hold_time_minutes": 20,
-                "avoid_economic_news": True,
-                "check_market_regime": True,
+                "avoid_economic_news": True,   # DECLARED, NOT IMPLEMENTED — see docs/econ-calendar.md
+                "check_market_regime": True,   # DECLARED, NOT IMPLEMENTED — see TODO.md E12
                 "gamma_scalping_mode": True,
             },
             "max_positions": 1,
@@ -284,7 +284,7 @@ class StrategyTemplates:
                 "entry_signal": "price_above_9ema_and_vwap",
                 "confirmation_required": True,
                 "risk_per_trade_pct": 1.5,
-                "max_position_size_usd": 500,
+                "max_position_size_usd": None,   # opt-in dollar ceiling; None = no cap
                 "max_contracts": 3,
                 "take_profit_pct": 25,
                 "stop_loss_pct": 50,
@@ -294,8 +294,8 @@ class StrategyTemplates:
                 "entry_after_open_minutes": 30,
                 "exit_before_close_minutes": 15,
                 "max_hold_time_minutes": 30,
-                "avoid_economic_news": True,
-                "check_market_regime": True,
+                "avoid_economic_news": True,   # DECLARED, NOT IMPLEMENTED — see docs/econ-calendar.md
+                "check_market_regime": True,   # DECLARED, NOT IMPLEMENTED — see TODO.md E12
             },
             "max_positions": 2,
             "stop_loss_percentage": 50.0,
@@ -333,7 +333,7 @@ class StrategyTemplates:
                 "entry_signal": "price_above_9ema_and_vwap",
                 "confirmation_required": True,
                 "risk_per_trade_pct": 1.5,
-                "max_position_size_usd": 500,
+                "max_position_size_usd": None,   # opt-in dollar ceiling; None = no cap
                 "max_contracts": 3,
                 "take_profit_pct": 30,
                 "stop_loss_pct": 45,
@@ -343,8 +343,8 @@ class StrategyTemplates:
                 "entry_after_open_minutes": 30,
                 "exit_before_close_minutes": 15,
                 "max_hold_time_minutes": 25,
-                "avoid_economic_news": True,
-                "check_market_regime": True,
+                "avoid_economic_news": True,   # DECLARED, NOT IMPLEMENTED — see docs/econ-calendar.md
+                "check_market_regime": True,   # DECLARED, NOT IMPLEMENTED — see TODO.md E12
             },
             "max_positions": 2,
             "stop_loss_percentage": 45.0,
@@ -382,7 +382,7 @@ class StrategyTemplates:
                 "entry_signal": "price_above_9ema_and_vwap",
                 "confirmation_required": True,
                 "risk_per_trade_pct": 1.5,
-                "max_position_size_usd": 500,
+                "max_position_size_usd": None,   # opt-in dollar ceiling; None = no cap
                 "max_contracts": 3,
                 "take_profit_pct": 25,
                 "stop_loss_pct": 50,
@@ -392,8 +392,8 @@ class StrategyTemplates:
                 "entry_after_open_minutes": 30,
                 "exit_before_close_minutes": 15,
                 "max_hold_time_minutes": 30,
-                "avoid_economic_news": True,
-                "check_market_regime": True,
+                "avoid_economic_news": True,   # DECLARED, NOT IMPLEMENTED — see docs/econ-calendar.md
+                "check_market_regime": True,   # DECLARED, NOT IMPLEMENTED — see TODO.md E12
             },
             "max_positions": 2,
             "stop_loss_percentage": 50.0,
@@ -431,7 +431,7 @@ class StrategyTemplates:
                 "entry_signal": "price_above_9ema_and_vwap",
                 "confirmation_required": True,
                 "risk_per_trade_pct": 1.5,
-                "max_position_size_usd": 500,
+                "max_position_size_usd": None,   # opt-in dollar ceiling; None = no cap
                 "max_contracts": 3,
                 "take_profit_pct": 25,
                 "stop_loss_pct": 50,
@@ -441,8 +441,8 @@ class StrategyTemplates:
                 "entry_after_open_minutes": 30,
                 "exit_before_close_minutes": 15,
                 "max_hold_time_minutes": 30,
-                "avoid_economic_news": True,
-                "check_market_regime": True,
+                "avoid_economic_news": True,   # DECLARED, NOT IMPLEMENTED — see docs/econ-calendar.md
+                "check_market_regime": True,   # DECLARED, NOT IMPLEMENTED — see TODO.md E12
             },
             "max_positions": 2,
             "stop_loss_percentage": 50.0,

@@ -252,12 +252,98 @@
       margin-bottom: var(--sp-3);
     }
 
-    .placeholder {
-      text-align: center;
-      padding: var(--sp-12) var(--sp-6);
-      color: var(--text-faint);
-      font-size: var(--fs-sm);
-    }
+  }
+}
+
+/* The curve component draws its own heading, so the card is just the surface. */
+.curve-card {
+  ::ng-deep .mat-mdc-card-content {
+    padding: var(--sp-4);
+  }
+}
+
+/* -----------------------------------------------------------------------------
+   Today's activity
+   -------------------------------------------------------------------------- */
+
+.activity-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  /* Roughly ten rows before it scrolls — enough to read a session at a glance
+     without the card pushing the rest of the page off screen. */
+  max-height: 420px;
+  overflow-y: auto;
+}
+
+.activity-row {
+  display: grid;
+  grid-template-columns: auto auto 1fr;
+  align-items: start;
+  gap: var(--sp-3);
+  padding: var(--sp-3) var(--sp-1);
+  border-bottom: 1px solid var(--border-subtle);
+
+  &:last-child {
+    border-bottom: none;
+  }
+}
+
+.activity-time {
+  font-size: var(--fs-xs);
+  color: var(--text-muted);
+  padding-top: 2px;
+  white-space: nowrap;
+}
+
+.activity-icon {
+  font-size: 18px;
+  width: 18px;
+  height: 18px;
+  color: var(--text-faint);
+
+  .activity-row--profit & { color: var(--color-profit); }
+  .activity-row--loss & { color: var(--color-loss); }
+  .activity-row--warning & { color: var(--color-error-fg); }
+}
+
+.activity-body {
+  min-width: 0;
+}
+
+.activity-title {
+  display: flex;
+  align-items: baseline;
+  gap: var(--sp-2);
+  flex-wrap: wrap;
+  font-size: var(--fs-sm);
+  color: var(--text);
+}
+
+.activity-pnl {
+  font-weight: var(--fw-semibold);
+
+  .activity-row--profit & { color: var(--color-profit); }
+  .activity-row--loss & { color: var(--color-loss); }
+}
+
+.activity-meta {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: var(--sp-1) var(--sp-3);
+  margin-top: var(--sp-1);
+  font-size: var(--fs-xs);
+  color: var(--text-muted);
+}
+
+.activity-detail {
+  color: var(--text-faint);
+}
+
+.activity-card {
+  .empty-state {
+    padding: var(--sp-8) var(--sp-6);
   }
 }
 

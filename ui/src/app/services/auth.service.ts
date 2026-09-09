@@ -28,7 +28,21 @@ export class AuthService {
   private currentUserSubject = new BehaviorSubject<User | null>(this.getUserFromStorage());
   public currentUser$ = this.currentUserSubject.asObservable();
 
-  constructor() {}
+  constructor() {
+    // Re-read the user on boot whenever we hold a token.
+    //
+    // `currentUser` is otherwise only ever written at login, so a role changed
+    // server-side never reaches the UI and a user stored by an older build
+    // sticks around indefinitely. Both show up as an admin seeing no Users nav
+    // row and a disabled "Done for the day" button. Non-fatal by design: on
+    // failure we keep whatever is stored rather than bouncing a working session
+    // to the login page, and the backend gates remain the real boundary.
+    if (this.isAuthenticated) {
+      this.refreshMe().subscribe({
+        error: err => console.warn('Could not refresh current user on boot:', err),
+      });
+    }
+  }
 
   private getUserFromStorage(): User | null {
     const userStr = localStorage.getItem('currentUser');
@@ -64,10 +78,20 @@ export class AuthService {
 
     return this.http.post<LoginResponse>(`${this.apiUrl}/auth/login`, formData).pipe(
       tap(response => {
-        // Store token and user info
         localStorage.setItem('access_token', response.access_token);
-        localStorage.setItem('currentUser', JSON.stringify(response.user));
-        this.currentUserSubject.next(response.user);
+        // `JSON.stringify(undefined)` is undefined, which setItem coerces to
+        // the STRING "undefined" — that is how a missing user field used to
+        // poison storage and pin every role check to 'user' for the session.
+        // If the API ever stops sending the user, fall back to /auth/me rather
+        // than writing a value that only looks like a user.
+        if (response.user) {
+          localStorage.setItem('currentUser', JSON.stringify(response.user));
+          this.currentUserSubject.next(response.user);
+        } else {
+          this.refreshMe().subscribe({
+            error: err => console.error('Login returned no user and /auth/me failed:', err),
+          });
+        }
       })
     );
   }

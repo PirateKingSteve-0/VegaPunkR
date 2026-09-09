@@ -90,6 +90,12 @@
     </div>
 
     <!-- Error Message -->
+    <div class="banner banner-warning restart-notice" *ngIf="restartNotice">
+      <span>{{ restartNotice }}</span>
+      <button type="button" class="restart-dismiss" (click)="restartNotice = null"
+              aria-label="Dismiss">✕</button>
+    </div>
+
     <div class="error-message" *ngIf="error">
       <span class="error-icon">❌</span>
       <span>{{ error }}</span>

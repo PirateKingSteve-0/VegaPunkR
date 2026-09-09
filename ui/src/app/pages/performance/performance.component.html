@@ -186,12 +186,20 @@
              [class.is-today]="cell.isToday"
              [class.profit]="cell.pl !== null && cell.pl > 0"
              [class.loss]="cell.pl !== null && cell.pl < 0"
-             [matTooltip]="cell.pl !== null
-               ? (fmtCurrency(cell.pl) + ' • ' + cell.trades + ' trade' + (cell.trades === 1 ? '' : 's'))
-               : ''"
-             [matTooltipDisabled]="cell.pl === null">
+             [class.market-closed]="cell.marketClosed"
+             [class.is-holiday]="cell.holiday"
+             [matTooltip]="cell.holiday
+               ? cell.holiday + ' — market closed'
+               : (cell.earlyClose
+                   ? 'Early close ' + cell.earlyClose + ' ET'
+                   : (cell.pl !== null
+                       ? (fmtCurrency(cell.pl) + ' • ' + cell.trades + ' trade' + (cell.trades === 1 ? '' : 's'))
+                       : ''))"
+             [matTooltipDisabled]="cell.pl === null && !cell.holiday && !cell.earlyClose">
           <div class="cell-day">{{ cell.date.getDate() }}</div>
           <div class="cell-pl" *ngIf="cell.pl !== null">{{ fmtCalendarPL(cell.pl) }}</div>
+          <div class="cell-note" *ngIf="cell.holiday && cell.pl === null">{{ cell.holiday }}</div>
+          <div class="cell-note early" *ngIf="cell.earlyClose">½ day</div>
         </div>
       </div>
     </mat-card-content>

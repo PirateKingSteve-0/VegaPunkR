@@ -1,0 +1,20 @@
+// Layout only — colour comes from the shared .banner / .banner-warning classes
+// in styles.scss so this stays correct in dark and colourblind modes.
+.cash-pause {
+  align-items: flex-start;
+
+  mat-icon {
+    margin-top: 1px;
+  }
+}
+
+.cash-pause-text {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-1);
+}
+
+.cash-pause-detail {
+  font-size: var(--fs-xs);
+  opacity: 0.85;
+}

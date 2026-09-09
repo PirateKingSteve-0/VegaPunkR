@@ -10,7 +10,7 @@ from sqlalchemy.orm import Session
 from database import get_db
 from models import User
 from schemas import (
-    Token,
+    LoginResponse,
     UserCreate,
     UserResponse,
     UserUpdate,
@@ -82,7 +82,7 @@ def register(user_data: UserCreate, db: Session = Depends(get_db)):
     return db_user
 
 
-@router.post("/login", response_model=Token)
+@router.post("/login", response_model=LoginResponse)
 def login(
     form_data: OAuth2PasswordRequestForm = Depends(),
     db: Session = Depends(get_db)
@@ -93,7 +93,9 @@ def login(
     - **username**: User's email address
     - **password**: User's password
 
-    Returns a JWT access token valid for 24 hours.
+    Returns a JWT access token valid for 24 hours, plus the authenticated
+    user. The user is part of the response because the client has no other way
+    to learn its own role at login time, and every UI role gate depends on it.
     """
     user = authenticate_user(db, form_data.username, form_data.password)
     if not user:
@@ -111,7 +113,7 @@ def login(
         expires_delta=access_token_expires
     )
 
-    return {"access_token": access_token, "token_type": "bearer"}
+    return {"access_token": access_token, "token_type": "bearer", "user": user}
 
 
 @router.get("/me", response_model=UserResponse)

@@ -369,3 +369,30 @@
     width: 100%;
   }
 }
+
+// Market-calendar context on the P&L grid. Holidays are named; weekends are
+// only dimmed, since the grid already shows which columns they are and
+// labelling them would be noise on every row.
+.calendar-cell {
+  &.market-closed {
+    background: var(--surface-sunken);
+    color: var(--text-faint);
+  }
+
+  &.is-holiday {
+    border-color: var(--border-strong);
+  }
+
+  .cell-note {
+    font-size: var(--fs-micro);
+    line-height: var(--lh-tight);
+    color: var(--text-muted);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+
+    &.early {
+      color: var(--color-loss);
+    }
+  }
+}

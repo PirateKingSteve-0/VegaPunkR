@@ -1,0 +1,65 @@
+.equity-curve {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-3);
+}
+
+.equity-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--sp-4);
+  flex-wrap: wrap;
+}
+
+.equity-titles {
+  min-width: 0;
+}
+
+.equity-title {
+  display: flex;
+  align-items: baseline;
+  gap: var(--sp-2);
+  font-size: var(--fs-lg);
+  font-weight: var(--fw-semibold);
+  color: var(--text);
+  letter-spacing: var(--ls-tight);
+}
+
+.equity-delta {
+  font-family: var(--font-mono);
+  font-size: var(--fs-sm);
+  font-weight: var(--fw-semibold);
+
+  &--profit { color: var(--color-profit); }
+  &--loss { color: var(--color-loss); }
+}
+
+.equity-subtitle {
+  margin-top: var(--sp-1);
+  font-size: var(--fs-xs);
+  color: var(--text-muted);
+  line-height: var(--lh-snug);
+}
+
+.equity-ranges {
+  flex: 0 0 auto;
+}
+
+.chart-host {
+  position: relative;
+}
+
+.empty-state {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: var(--sp-2);
+  text-align: center;
+  color: var(--text-muted);
+
+  small {
+    color: var(--text-faint);
+  }
+}

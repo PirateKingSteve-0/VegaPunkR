@@ -10222,3 +10222,109 @@ up from $1,202.46 after Wednesday.
 `Largest Win / Loss` and `Hold Time (win / loss)` overflowed their cards — one long string at
 `--fs-xl` in a 200px grid cell. `MetricCard.parts` renders the two figures as separate spans in a
 wrapping flex row at `--fs-lg`, breaking at the slash rather than overflowing.
+
+---
+
+## Session Date: September 7, 2026 (evening) — The account stream was watching the wrong account
+
+Labor Day, market closed. Started as "update the architecture diagram" and turned into finding a
+real defect, because auditing a diagram against code is a code review with extra steps.
+
+### 1. The account event stream watched the SANDBOX account through two live sessions
+
+`tradier_account_stream._create_session_sync` called `get_tradier_client()` — a module-level
+singleton built from `settings.TRADIER_ENV` (`sandbox`) that takes no user. Orders route per-user
+through `TradingClientManager.get_client(user)` on `selected_trading_mode` (`live`). Nothing
+reconciled the two. Verified by execution, not by reading:
+
+```
+ORDERS  -> account 6YB***56  on  https://api.tradier.com       (real money)
+STREAM  -> account VA8***04  on  https://sandbox.tradier.com   (sandbox)
+same client object? False    same account id? False
+```
+
+**Effect:** live fills were never pushed. Confirmation fell back to the 30s REST poll — the exact
+path this stream was added in July to backstop, after two orders filled past the poll window and
+left the engine holding 6 contracts it had no record of. All 09-02 fills reconciled correctly over
+REST, so nothing broke; the safety net simply was not attached.
+
+**Why it hid for two live sessions:** connecting to sandbox *succeeds*, and the log line printed
+only the URL. Nothing in the system said which account it was watching.
+
+### 2. Market data was being read over the sandbox host too
+
+Six callers used the same singleton for quotes, chains, greeks and the market clock. Sandbox and
+live return **byte-identical** market data (`SPY 769.42/769.55`, `SPY260908C00768000 bid 3.00 ask
+3.03 oi 1193 delta 0.6736` from both) — Tradier's sandbox fabricates fills, not prices — so no
+decision was ever made on bad numbers. It was still wrong in principle: a live process should not
+read market data through a sandbox host.
+
+### 3. What shipped
+
+- `get_market_client()` — always live when a live key is configured, falling back to the env client
+  otherwise so a sandbox-only machine still runs. Six market-data callers moved to it.
+  `create_stream_session` already forced live, so this makes REST consistent with the WS.
+- `TradierAccountStreamManager` takes a **client provider**, injected by `app.py` from the same
+  per-user routing the orders use. It is a process-wide singleton with no user, so it cannot route
+  itself; the provider resolves the account from the users owning active strategies and warns if
+  they span more than one, because one socket can only watch one account.
+- `reconcile_user_history` uses `TradingClientManager.get_client(user)` — it had the user all along
+  and was pulling sandbox history to write commissions onto live trades.
+- The two things that let it hide are closed: the connect line now prints `env=` and a masked
+  account, and a missing provider logs a WARNING instead of falling back silently.
+
+Confirmed in the live process the same evening:
+
+```
+BEFORE  Account event stream connected: wss://sandbox-ws.tradier.com/v1/accounts/events
+AFTER   Account event stream connected: wss://ws.tradier.com/... (env=live account=6YB***56)
+```
+
+Tests: `api/tests/test_account_stream_account_routing.py` — live provider gets the live socket,
+paper still gets sandbox (not force-live), no provider falls back, a throwing provider cannot take
+the stream down. Suite at 15 passing.
+
+### 4. The routing rule, written down because it was nowhere
+
+| | Paper mode | Live mode |
+|---|---|---|
+| Orders, balances, positions, account history, account WS | sandbox | live |
+| Quotes, chains, greeks, market clock, market WS | **live** | **live** |
+
+Account-scoped calls follow the user's selection. Market data is always live. `get_tradier_client()`
+now carries a docstring saying it is only safe for non-account calls.
+
+### 5. A mode switch still needs a restart, and that stopgap has an expiry date
+
+The stream resolves its account at connect and holds it, so flipping paper/live mid-session leaves
+orders on the new account and the socket on the old one until restart. Shipped a dismissible
+warning in the environment controls.
+
+**That banner assumes the person clicking the toggle can restart the process** — true only while the
+engine runs on the same laptop as the browser. The plan is to move prod (and probably dev) to a
+server, at which point the UI cannot restart anything and the banner instructs someone to do
+something they cannot do. Written up as **TODO F2** with three options; **(c) make trading mode a
+launch flag like `--env`** is the one that fits a server deployment, since the engine is already a
+single pinned process by necessity — the cash ledger, settled-cash cache, throttles and
+unconfirmed-order map are all in-memory class state.
+
+### 6. The architecture diagram was wrong about the infrastructure, not just the code
+
+Audited all 13 sections against the running system. Beyond the flows already fixed on 09-05:
+
+- Claimed **TimescaleDB hypertables partitioning trades**. Reality: extensions are `plpgsql` only,
+  zero hypertables, zero partitioned tables.
+- Claimed **three Docker Postgres instances** on ports 5435/5433/5434. Reality: one RDS PostgreSQL
+  16 in us-west-1 on 5432, databases `vegapunkr_dev` / `vegapunkr_prod` — and the names in the
+  diagram were missing the `r`.
+- §5 named two modules that do not exist (`services/market_data.py`, `services/reconciliation.py`)
+  and listed 5 of the 11 routers.
+
+**`DATABASE_TEST_URL` still points at local `vegapunk_test` on 5433** — it never moved to RDS. That
+retracts advice given on 09-05 to disable local postgres: doing so would break the test
+environment. Dev and prod are unaffected.
+
+Also wired mermaid validation back into `scripts/hooks/pre-commit`: staged markdown containing a
+mermaid fence is validated, errors block, warnings pass, and a commit touching no diagram pays
+nothing. Plus the `diagram_agent` advisory naming which sections a change makes stale. Nothing
+regenerates diagrams — auto-update remains unimplemented — so the notice is detection only.

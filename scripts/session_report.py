@@ -9,7 +9,7 @@ Baselines to beat, from the two broken sessions:
     2026-08-27  100 round trips   median hold ~5s     95/100 exits mismatched
 """
 import argparse, os, sys
-from datetime import date
+from datetime import date, datetime
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'api'))
 from dotenv import load_dotenv
@@ -31,7 +31,67 @@ MISMATCH_PTS = 8.0          # claimed vs realised gap that counts as broken
 #
 # So on sandbox these two can never pass, and a red BAD is misleading. They stay
 # useful as diagnostics — a big gap is expected, a SMALL one would be news.
-SANDBOX = os.getenv("TRADIER_ENV", "sandbox").strip().lower() != "live"
+#
+# Resolved PER SESSION from the database, not from the environment. This used to
+# read TRADIER_ENV off .env, which is NOT what the engine routes on: the client
+# is picked per user from `users.selected_trading_mode` ('paper' → Tradier
+# sandbox, 'live' → Tradier live) at trading_client_manager.py:61. On 2026-09-08
+# the engine traded LIVE the whole session while .env still said
+# TRADIER_ENV=sandbox, so this report stamped "fills are invented ... P&L not
+# meaningful" over three real round trips and a real +$46. Dismissing real money
+# is the worse of the two errors, so an ambiguous answer resolves to LIVE.
+SANDBOX = False   # assigned by main() from resolve_mode(); never read before that
+
+
+def resolve_mode(conn, day):
+    """Which broker filled this day's trades. Returns (sandbox, note, known).
+
+    Mirrors trading_client_manager.py:61 exactly, including its `or "paper"`
+    default for a NULL column, so this can never disagree with the routing the
+    engine performed *right now*.
+
+    The catch, and why `users.updated_at` is consulted: this reads PRESENT state
+    to describe a PAST session, and nothing on the trade or the ORDER_PLACED
+    event records which broker actually filled it. The dev database is the live
+    example — its user row reads 'live' with updated_at=2026-09-02, but dev
+    stopped trading on 09-01, so every dev session predates the flag it would be
+    labelled with. Reporting those sandbox fills as "real money" is precisely the
+    bug this function exists to kill, so a row touched on or after the session
+    downgrades the answer to SUSPECT rather than asserting it.
+    """
+    rows = conn.execute(text("""
+        SELECT DISTINCT u.email, COALESCE(u.selected_trading_mode, 'paper'),
+               u.updated_at
+        FROM trades t
+        JOIN strategies s ON s.id = t.strategy_id
+        JOIN users u      ON u.id = s.user_id
+        WHERE t.timestamp::date = :d"""), {"d": day}).fetchall()
+
+    modes = {m for _, m, _ in rows}
+    if not modes:
+        # Nothing traded, so nothing to attribute. Say so rather than asserting a
+        # broker — a confident wrong label is the bug this function exists to fix.
+        return False, "no trades to attribute", False
+
+    # Any user row edited on or after the session day could have been a different
+    # mode while the session ran. updated_at moves on ANY column change, so this
+    # over-warns rather than under-warns — the safe direction for this question.
+    day_start = datetime.fromisoformat(f"{day}T00:00:00")
+    touched = [(e, u) for e, _, u in rows if u and u >= day_start]
+
+    if modes == {"paper"}:
+        sandbox, label = True, "users.selected_trading_mode=paper"
+    elif modes == {"live"}:
+        sandbox, label = False, "users.selected_trading_mode=live"
+    else:
+        detail = ", ".join(f"{e}={m}" for e, m, _ in sorted(rows))
+        sandbox = False
+        label = f"MIXED modes in one session ({detail}) — treating as LIVE"
+
+    if touched:
+        when = ", ".join(f"{e} updated {u:%Y-%m-%d}" for e, u in sorted(touched))
+        return sandbox, f"SUSPECT: {label}, but {when} — on/after this session", True
+    return sandbox, label, True
 
 
 def claimed_pct(reason):
@@ -46,6 +106,7 @@ def claimed_pct(reason):
 
 
 def main():
+    global SANDBOX
     ap = argparse.ArgumentParser()
     ap.add_argument('--date', default=date.today().isoformat())
     ap.add_argument('--env', default='DEV', choices=['DEV', 'PROD'])
@@ -73,8 +134,20 @@ def main():
             SELECT DISTINCT strategy_id, notes->>'option_symbol' FROM trades
             WHERE timestamp::date = :d AND notes->>'option_symbol' IS NOT NULL
             """), {"d": a.date}).fetchall()
+        SANDBOX, mode_note, mode_known = resolve_mode(c, a.date)
 
     print(f"=== {a.env} {a.date} ===\n")
+    broker = ("Tradier SANDBOX (paper)" if SANDBOX else "Tradier LIVE (real money)"
+              ) if mode_known else "unknown"
+    if mode_note.startswith("SUSPECT"):
+        broker += "  (?)"
+    print(f"broker: {broker}   [{mode_note}]")
+    env_raw = os.getenv("TRADIER_ENV", "(unset)")
+    if mode_known and (env_raw.strip().lower() != "live") != SANDBOX:
+        print(f"{WARN} .env TRADIER_ENV={env_raw} disagrees with the database. "
+              f"The engine\n       routes per user from the DB, so this report "
+              f"follows the DB.")
+    print()
     if not sells:
         print("  no closed trades")
         return
@@ -158,7 +231,7 @@ def main():
     print(f"\nP&L {tot_pnl:+.2f} over {len(sells)} closes, {wins} winners "
           f"({100*wins/len(sells):.0f}%)")
     if SANDBOX:
-        print("\n(TRADIER_ENV=sandbox: fills are invented, so 1, 2 and P&L are "
+        print("\n(Tradier sandbox: fills are invented, so 1, 2 and P&L are "
               "not\n meaningful. Checks 3-5 measure engine behaviour and still "
               "hold.)")
     else:

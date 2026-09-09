@@ -18,6 +18,7 @@ import { ThemeService } from '../../services/theme.service';
 import { ProfileDialogComponent } from '../../components/profile-dialog/profile-dialog.component';
 import { TradingHaltDialogComponent } from '../../components/trading-halt-dialog/trading-halt-dialog.component';
 import { RiskService } from '../../services/risk.service';
+import { CashPauseBannerComponent } from '../../components/cash-pause-banner/cash-pause-banner.component';
 
 @Component({
   selector: 'app-dashboard',
@@ -35,7 +36,8 @@ import { RiskService } from '../../services/risk.service';
     MatChipsModule,
     MatSlideToggleModule,
     MatDialogModule,
-    MatTooltipModule
+    MatTooltipModule,
+    CashPauseBannerComponent
   ],
   templateUrl: './dashboard.component.html',
   styleUrls: ['./dashboard.component.scss']

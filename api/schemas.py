@@ -145,6 +145,22 @@ class UserResponse(UserBase):
         from_attributes = True
 
 
+class LoginResponse(Token):
+    """What POST /auth/login returns.
+
+    The token alone is not enough for the client. Every role gate in the UI —
+    the admin-only Users nav row, `adminGuard`, the "Done for the day" control —
+    reads `role` off the stored user, and the only other source of it is
+    GET /auth/me. Returning `Token` here meant the frontend stored the string
+    "undefined" as its current user and fell back to role 'user' for the whole
+    session, hiding admin surfaces from actual admins.
+
+    No wider exposure than before: this is the same UserResponse that
+    GET /auth/me already hands the same caller holding the same token.
+    """
+    user: UserResponse
+
+
 class TradingHaltRequest(BaseModel):
     """Body for POST /auth/me/trading-halt — "done trading for today".
 

@@ -121,6 +121,13 @@ export interface Quote {
   [key: string]: any;
 }
 
+export interface MarketCalendarDay {
+  date: string;                 // yyyy-mm-dd
+  status: 'open' | 'closed';
+  description?: string;         // "Market is closed for Labor Day"
+  open?: { start: string; end: string };   // ET, e.g. "09:30" / "16:00"
+}
+
 @Injectable({ providedIn: 'root' })
 export class TradierService {
   private http = inject(HttpClient);
@@ -146,6 +153,17 @@ export class TradierService {
   getHistoricalBalances(period: BalancePeriod = 'MONTH'): Observable<HistoricalBalances> {
     const params = new HttpParams().set('period', period);
     return this.http.get<HistoricalBalances>(`${this.apiUrl}/account/historical-balances`, {
+      headers: this.headers(),
+      params,
+    });
+  }
+
+  /** Trading days for a month. `description` is the only place Tradier says
+   *  WHY a day is closed, and a non-16:00 `open.end` is the only signal of an
+   *  early close — both matter for 0DTE. */
+  getMarketCalendar(month: number, year: number): Observable<{ days: MarketCalendarDay[] }> {
+    const params = new HttpParams().set('month', month).set('year', year);
+    return this.http.get<{ days: MarketCalendarDay[] }>(`${this.apiUrl}/market/calendar`, {
       headers: this.headers(),
       params,
     });

@@ -293,11 +293,39 @@ class RiskManager:
         strategy_max = strategy.params_json.get('max_contracts', 3)
         final_qty = min(max_contracts, strategy_max)
 
+        one_unit_cost = current_price * 100 if _is_options else current_price
+
         # Ensure at least 1 if we have enough capital for one unit
-        if final_qty < 1:
-            one_unit_cost = current_price * 100 if _is_options else current_price
-            if effective_capital >= one_unit_cost:
-                final_qty = 1
+        if final_qty < 1 and effective_capital >= one_unit_cost:
+            final_qty = 1
+
+        # Absolute dollar ceiling on the position.
+        #
+        # APPLIED LAST, ON PURPOSE. The "at least 1" rule above is a floor that
+        # ignores cost — it grants one unit whenever `effective_capital` covers
+        # it. A cap checked before that floor would be silently overridden by it
+        # and enforce nothing. Most-restrictive-bound wins, so the ceiling has to
+        # be the final word, and it must be allowed to take the answer to zero.
+        #
+        # OPT-IN. Absent, None, or non-positive means NO CAP — not "cap at zero".
+        # This matters: the key shipped in every template but was read by no code
+        # (audited 2026-09-08), so every existing strategy carries a value that
+        # has never been enforced. Turning enforcement on with those values live
+        # would have silently blocked real trades — on 2026-09-08 the $500
+        # template value would have rejected the session's best entry, a single
+        # SPY 773 put at $5.72 ($572 > $500). Existing strategies are therefore
+        # set to None, and the cap is something you switch on deliberately when
+        # the account is large enough for it to bind on purpose.
+        max_usd = strategy.params_json.get('max_position_size_usd')
+        if max_usd is not None and float(max_usd) > 0:
+            affordable = int(float(max_usd) / one_unit_cost)
+            if affordable < final_qty:
+                logger.info(
+                    f"Position capped by max_position_size_usd=${float(max_usd):,.2f}: "
+                    f"{final_qty} -> {affordable} "
+                    f"(one unit costs ${one_unit_cost:,.2f})"
+                )
+            final_qty = min(final_qty, affordable)
 
         logger.info(
             f"Position sizing: account=${account_size}, risk={effective_risk_pct}%, "

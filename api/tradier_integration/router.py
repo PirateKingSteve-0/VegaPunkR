@@ -20,7 +20,7 @@ from database import SessionLocals, get_db
 from config import Environment
 from models import User
 from services.tradier_reconcile import reconcile_user_history
-from tradier_integration.client import get_tradier_client
+from tradier_integration.client import get_tradier_client, get_market_client
 from engine.trading_client_manager import trading_manager
 
 router = APIRouter(prefix="/tradier", tags=["Tradier Brokerage"])
@@ -212,6 +212,30 @@ def get_historical_balances(
     """
     try:
         return _client(current_user).get_historical_balances(account_id, period=period)
+    except Exception as e:
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(e))
+
+
+@router.get("/market/calendar")
+def get_market_calendar(
+    month: Optional[int] = Query(None, ge=1, le=12),
+    year: Optional[int] = Query(None, ge=2000, le=2100),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    GET /v1/markets/calendar — trading days for a month.
+
+    Each entry: `date`, `status` ('open' | 'closed'), `description`, and on open
+    days `open.start` / `open.end` in ET. Tradier distinguishes a weekend
+    ("Market is closed") from a holiday ("Market is closed for Labor Day") only
+    in `description`, and an early close only by a non-16:00 `open.end` — both
+    matter to a 0DTE strategy, so both are passed through untouched.
+
+    Not account-scoped, and the client forces the live endpoint because the
+    sandbox calendar lags.
+    """
+    try:
+        return {"days": get_market_client().get_market_calendar(month=month, year=year)}
     except Exception as e:
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(e))
 

@@ -29,6 +29,7 @@ import {
   HistoricalBalances,
   TradeEvent,
   TradierBalances,
+  MarketCalendarDay,
 } from '../../services/tradier.service';
 import { SystemService } from '../../services/system.service';
 import { ThemeService } from '../../services/theme.service';
@@ -63,6 +64,14 @@ interface CalendarCell {
   isToday: boolean;
   pl: number | null;
   trades: number;
+  /** Holiday name, when the market was closed for one. Weekends are excluded —
+   *  the grid already shows those, and labelling them is noise. */
+  holiday: string | null;
+  /** Closed for any reason, weekends included. Dims the cell. */
+  marketClosed: boolean;
+  /** Early close, e.g. "13:00" ET. Matters for 0DTE: the forced-exit floor
+   *  moves with the bell, so a half day is a materially shorter session. */
+  earlyClose: string | null;
 }
 
 @Component({
@@ -134,6 +143,8 @@ export class PerformanceComponent implements OnInit, OnDestroy {
 
   // Anchored to the first of the displayed month
   calendarMonth = signal<Date>(this.startOfMonth(new Date()));
+  /** yyyy-mm-dd -> the day's calendar entry, for the month on screen. */
+  marketDays = signal<Map<string, MarketCalendarDay>>(new Map());
   readonly weekdayLabels = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
 
   dailyPL = computed<Map<string, { pl: number; trades: number }>>(() => {
@@ -163,16 +174,44 @@ export class PerformanceComponent implements OnInit, OnDestroy {
       const d = new Date(start.getFullYear(), start.getMonth(), start.getDate() + i);
       const key = this.toDateKey(d);
       const entry = pl.get(key);
+      const day = this.marketDays().get(key);
+      const closed = day?.status === 'closed';
+      // Tradier says WHY only in `description`; a weekend reads "Market is
+      // closed" and a holiday "Market is closed for Labor Day". Anything past
+      // that bare phrase is the holiday name.
+      const holiday = closed && day?.description && day.description !== 'Market is closed'
+        ? day.description.replace(/^Market is closed for\s*/i, '')
+        : null;
+      const end = day?.open?.end;
       cells.push({
         date: d,
         inMonth: d.getMonth() === month,
         isToday: key === todayKey,
         pl: entry ? entry.pl : null,
         trades: entry ? entry.trades : 0,
+        holiday,
+        marketClosed: closed,
+        earlyClose: day?.status === 'open' && end && end !== '16:00' ? end : null,
       });
     }
     return cells;
   });
+
+  /** Trading days for the month on screen. Best-effort: a failure leaves the
+   *  map empty so the calendar still renders its P&L, just without holidays. */
+  private loadMarketDays(): void {
+    const anchor = this.calendarMonth();
+    this.tradier.getMarketCalendar(anchor.getMonth() + 1, anchor.getFullYear()).subscribe({
+      next: (res) => {
+        const map = new Map<string, MarketCalendarDay>();
+        for (const d of res?.days ?? []) {
+          if (d?.date) map.set(d.date, d);
+        }
+        this.marketDays.set(map);
+      },
+      error: () => this.marketDays.set(new Map()),
+    });
+  }
 
   calendarSummary = computed(() => {
     const anchor = this.calendarMonth();
@@ -528,6 +567,7 @@ export class PerformanceComponent implements OnInit, OnDestroy {
 
   ngOnInit(): void {
     this.loadAll();
+    this.loadMarketDays();
     this.settingsSub = this.systemService.settings$
       .pipe(
         skip(1),
@@ -954,15 +994,18 @@ export class PerformanceComponent implements OnInit, OnDestroy {
   prevMonth(): void {
     const a = this.calendarMonth();
     this.calendarMonth.set(new Date(a.getFullYear(), a.getMonth() - 1, 1));
+    this.loadMarketDays();
   }
 
   nextMonth(): void {
     const a = this.calendarMonth();
     this.calendarMonth.set(new Date(a.getFullYear(), a.getMonth() + 1, 1));
+    this.loadMarketDays();
   }
 
   thisMonth(): void {
     this.calendarMonth.set(this.startOfMonth(new Date()));
+    this.loadMarketDays();
   }
 
   fmtCalendarPL(value: number): string {

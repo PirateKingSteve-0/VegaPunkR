@@ -1,0 +1,60 @@
+<div class="equity-curve">
+  <div class="equity-head">
+    <div class="equity-titles">
+      <div class="equity-title">
+        {{ title() }}
+        <span
+          class="equity-delta"
+          *ngIf="hasData()"
+          [class.equity-delta--profit]="delta() >= 0"
+          [class.equity-delta--loss]="delta() < 0">
+          {{ fmtSignedCurrency(delta()) }}
+        </span>
+      </div>
+      <div class="equity-subtitle">{{ range().label }} — {{ subtitle() }}</div>
+    </div>
+
+    <mat-button-toggle-group
+      *ngIf="rangeButtons().length > 1"
+      class="equity-ranges"
+      [value]="activeRange()"
+      (change)="selectRange($event.value)"
+      hideSingleSelectionIndicator>
+      <mat-button-toggle *ngFor="let b of rangeButtons()" [value]="b.id">
+        {{ b.label }}
+      </mat-button-toggle>
+    </mat-button-toggle-group>
+  </div>
+
+  <div *ngIf="error()" class="banner banner-error">
+    <mat-icon>error</mat-icon>
+    {{ error() }}
+  </div>
+
+  <div class="chart-host" [style.height.px]="height" *ngIf="hasData(); else curveEmpty">
+    <canvas baseChart
+      [type]="chartType"
+      [data]="chartData()"
+      [options]="chartOptions">
+    </canvas>
+  </div>
+
+  <ng-template #curveEmpty>
+    <div class="empty-state" [style.min-height.px]="height">
+      <mat-spinner *ngIf="loading()" diameter="28"></mat-spinner>
+      <ng-container *ngIf="!loading()">
+        <mat-icon>show_chart</mat-icon>
+        <p *ngIf="range().intraday">
+          No closed trades in this session yet.
+          <br />
+          <small>The intraday curve is built from your own fills, so it starts at the first exit.</small>
+        </p>
+        <p *ngIf="!range().intraday">
+          No balance history for this range.
+          <br />
+          <small>Tradier sandbox accounts do not return historical data.</small>
+        </p>
+      </ng-container>
+    </div>
+  </ng-template>
+</div>

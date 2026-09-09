@@ -362,6 +362,49 @@ currently checks the total.
 
 ---
 
+### F2. A trading-mode switch needs a process restart — and a UI banner will not survive the move to a server *(2026-09-07)*
+
+`TradierAccountStreamManager` resolves its account **once**, when the socket connects, and holds
+it for the life of the process. Order routing follows the paper/live toggle within ~30s (the
+worker re-reads the user row each loop), so after a mid-session switch:
+
+```
+orders  -> new account, within ~30s
+stream  -> OLD account, until the process restarts
+```
+
+Degraded, not dangerous: fills confirm over the 30s REST poll, which is the documented fallback
+and how everything ran before F1. But it is exactly the protection F1 restored, silently absent
+again.
+
+**Stopgap shipped 2026-09-07:** the environment controls show a dismissible warning after a mode
+switch telling the user to restart the engine.
+
+**Why that stopgap expires.** It assumes the person clicking the toggle can restart the process —
+true only while the engine runs on the same laptop as the browser. Once prod (and likely dev) move
+to a server, EC2/ECS or otherwise, the UI has no idea the engine exists and no way to restart it.
+The banner then instructs someone to do something they cannot do, which is worse than no banner.
+
+**Real fix, needed before the server move:** the stream must re-resolve its account when the mode
+changes, rather than relying on a human. Options, roughly in order of preference:
+
+- **(a) Reconnect on change.** The worker already re-reads the user row every loop and calls
+  `db.refresh(user)`. When `selected_trading_mode` differs from the account the stream connected
+  with, tear the socket down and reconnect through the provider. The manager already records
+  `_env_label` / `_account_label`, so the comparison is cheap and needs no new state.
+- **(b) Reject the switch while positions are open**, restarting the stream on the next flat tick.
+  Safer, more annoying, and it does not remove the human step — it moves it.
+- **(c) Refuse mode switches from the UI entirely** once the engine is remote, making the mode a
+  launch flag like `--env`. Most honest for a server deployment: the process gets pinned to an
+  account the way it is already pinned to a database.
+
+This interacts with the single-instance rule: the engine cannot scale horizontally (cash ledger,
+settled-cash cache, throttles and unconfirmed-order map are all in-memory class state), so a
+server deployment is one pinned process anyway. That argues for **(c)**, with **(a)** as the
+fallback if the UI toggle must keep working.
+
+---
+
 ### F1. ~~The account event stream watches the SANDBOX account during live trading~~ *(FIXED 2026-09-07)*
 
 > **Fixed and verified in the live process the same evening.** Connect line now reads
@@ -694,6 +737,35 @@ before adjusting it. Recorded so the decision is made on evidence:
 - Cheap interim: log a daily one-liner of best-in-band OI per side, so the distribution accumulates
   without anyone watching for it.
 
+### E12. `check_market_regime` is declared on every strategy and read by nothing *(2026-09-08)*
+
+A full audit of all 32 `params_json` keys against the engine (`api/engine/`, `api/routers/`,
+`api/services/`, `models.py`, `schemas.py`) found exactly three with no reader:
+
+| key | status |
+|---|---|
+| `max_position_size_usd` | **resolved 2026-09-08** — enforcement added at `risk_manager.py:302`, applied last so it beats the "at least 1 contract" floor. Every strategy set to `None` (no cap) by `scripts/null_position_size_cap.py`; all 8 templates now seed `None`. Covered by `tests/test_position_size_cap.py`. |
+| `avoid_economic_news` | **not a lie** — in flight. `docs/econ-calendar.md` states plainly "nothing consumes it yet", and BRAINSTORM.md carries the design. |
+| `check_market_regime` | **this item.** No reader anywhere, and no design written down. |
+
+**Keeping the key deliberately.** A regime filter is wanted; the flag records that intent and both
+live strategies set it `True`. But until this is written, `check_market_regime: True` is a claim the
+system does not honour — anyone reading the config (including a future session of Claude, which is
+how this was found) will reasonably believe a regime check is gating entries. It is not. Nothing
+about entry selection currently considers whether the market is trending, chopping or reverting.
+
+Documented rather than deleted, following the `avoid_economic_news` precedent: an unimplemented
+flag is honest as long as the gap is written down somewhere the reader will find it.
+
+- Decide what "regime" means for a 0DTE momentum book before writing any code. Candidates: SPY vs
+  its own opening range, realised vs implied vol, VIX level or term structure, breadth (the `tick`
+  plumbing already exists but `use_tick_indicator` is `False` on both strategies).
+- Note the interaction with E7: the OI floor already appears to starve whichever side is
+  counter-trend on a given day (2026-09-03 blocked puts, 2026-09-08 blocked calls, both times the
+  side the VWAP rule was rejecting anyway). A regime filter may partly duplicate an effect the
+  system already has by accident. Measure that before adding a second one.
+- Whatever lands must compose as a *narrowing* gate on entries only, never on exits.
+
 ### E8. Consider a tiered (tightening) trailing stop *(idea — needs data first)*
 
 A fixed 10% trail hands back 10% of the **peak price**, so the give-back in P&L points grows with
@@ -1003,13 +1075,15 @@ leave an untested branch in the exit path.
 
 - **`scripts/update_account_size.py` is broken and untracked.** It writes `User.account_size` — **that column does not exist** on the model. Either add the column or delete the script; right now it will `AttributeError` on the first run. Same review needed for `scripts/test_user_update.py` (untracked, unread).
 
-- **News-outlook column on the strategies table.** Per-strategy "today's news outlook" chip combining news sentiment for the strategy's symbol(s) with the strategy's direction (long-call/long-stock strategies use raw sign; long-put/short-call invert). Pure observation column — no signal consumption, no auto-disable. Same data-first pattern as B2 (entry-drift) and A1 (GFV reservations): would collect "outlook said X / strategy did Y" pairs before deciding whether news ever feeds a real gate. Promote to the numbered list once a provider is picked and the direction-mapping question below is answered.
-    - **News source — pick before building:** Tradier does not return narrative news, need an external provider. Candidates: Benzinga (paid, sentiment included), Polygon (cheap, sentiment on Stocks Starter), Finnhub (free tier with sentiment), Marketaux (cheap). Lean toward starting on a free tier — observation-only column is hard to justify paid spend on until correlation with PnL is shown.
-    - **Strategy-direction mapping is the real design problem.** Raw symbol sentiment isn't useful — a long-put on bearish news is a *good* outlook, not bad. Either infer direction from `strategy_type` / `params_json` legs, or add an explicit `bias: 'long' | 'short' | 'neutral'` field on the strategy. Decide this before any UI work, otherwise the chip lies.
-    - **Outlook computation:** average today's per-article sentiment for each symbol in the strategy's symbol list, then orient against strategy direction. Multi-symbol strategies show worst-case symbol so the chip is conservative. Bucket into Good / Neutral / Bad with a dead band so neutral noise doesn't flicker.
-    - **Backend sketch:** new `GET /strategies/news-outlook` returning `[{strategy_id, outlook, score, top_headlines: [{title, url, ts}]}]`. Cache per (symbol, ET-date) so reload doesn't re-bill the news API; in-process refresh every ~15 min during market hours.
-    - **UI sketch:** new "Outlook" column rendered as a colored chip themed via existing `--color-profit` / `--color-warning` / `--color-loss` tokens (no new palette work). Tooltip = top 2–3 headlines; click → drawer with all of today's articles + per-article sentiment so the chip is auditable.
-    - **Open questions:** does "today" mean ET-calendar-day or last-24h-rolling? Should pre-market news flip the outlook before open, or only RTH?
+- **Economic-event awareness — record first, gate later.** Log every scheduled macro release (CPI, PPI, NFP, FOMC, ISM) with its **exact ET release timestamp**, plus a 09:00 ET morning summary of what is scheduled today. Report-only: no signal consumption, no auto-disable, engine untouched. Same data-first pattern as B2 (entry-drift) and A1 (GFV reservations). **Design is settled — see BRAINSTORM.md, "Economic-event awareness".** Promote to the numbered list once the release-tier question below is answered.
+    - **A calendar, not a news feed.** SPY dilutes single-name news to nothing; macro hits every position in the same second. The upstream source (Fed FOMC dates, BLS release schedule) publishes a year ahead and is free, so v1 seeds ~20 entries in a repo YAML rather than taking a vendor key and a network dependency. Narrative-news vendors (Benzinga / Polygon / Finnhub / Marketaux) are **deferred, not rejected** — their real value is *unscheduled* events, a category that is essentially empty for an index ETF, and becomes real the day the book holds single names.
+    - **Windows, not days — and the ranking is backwards from intuition.** Danger to *this* book is **FOMC 14:00 > 10:00 releases (ISM/sentiment/JOLTS) >> CPI 08:30**. We enter after `entry_after_open_minutes` and are flat by 15:45, so an 08:30 print resolves *before* we ever have a position — we buy after the IV crush, not into it. The Fed is the one we hold long premium straight through.
+    - **Store timestamps, not dates.** A row saying "today had CPI" can never test a window size. With exact release times we can go back through fills and ask whether entries within 15 / 30 / 60 min of a release did worse, and let the data pick the window — and since MFE/MAE is captured per trade, measure *how hard* they went against us, not just whether they lost.
+    - **Verdict is per-DAY, not per-strategy.** A CPI print is true for every strategy at once. Any future per-strategy column reads the day's row rather than computing its own. New table ⇒ **migrate dev *and* prod before editing `models.py`** (`reload=True` hits the shared DB instantly).
+    - **Scheduler:** copy the two-stage anchor in `services/email_report_scheduler.py` — 03:00 ET cron reads Tradier `markets/calendar`, then a one-shot at `open.start − 30min`. Holidays fall out for free; a flat `CronTrigger(hour=9)` fires on them.
+    - **~~Strategy-direction mapping~~ — already solved.** `engine/signal_generator.py:60` `resolve_direction()` is the single resolver and `schemas.py:211` validates it on write. No `bias` column needed. (Moot for a per-day verdict; unblocks the story-news half if ever built.)
+    - **Deferred gate — `avoid_economic_news` is a lie today.** All eight templates set it (`strategy_templates.py:99,148,198,247,297,346,395,444`) and nothing reads it; the engine advertises the behavior and does not have it. Wiring it up is a **blackout window**, which inherits the engine rules: compose most-restrictive-wins with `signal_generator.py:289` (`entry_after_open_minutes` ∧ `user.trading_window_start` ∧ forced-exit time), never widen them, and let `side='sell'` through so a blackout cannot trap an open position.
+    - **Open:** which release tiers to seed (Fed-only, the big four, or the full ~20 including 10:00 second-tier prints); whether to cross-check the annual seed against a free vendor or trust the published schedules. **Note the evidence limit:** CP-1 makes trades ≤ 2905 untrustworthy and the 174 churn trades drag everything until filtered, so clean history starts 2026-08-25 — roughly one CPI and one FOMC. This cannot be answered retroactively; the value of v1 is starting the clock.
 
 ---
 
@@ -1090,3 +1164,194 @@ names a different one. Exit pricing is safe (`_check_exit_signals` compares the 
 `position.option_symbol` and falls back to REST on mismatch), but that REST fallback then runs on
 every 1s eval tick — ~60 quote calls/minute for a position that could have been streamed. The
 declined branch could arm the strategy's own open contract instead.
+
+---
+
+## I. Broker-document reconciliation (confirm/statement import + calendar)
+
+Tradier's portal exposes statements, trade confirmations and tax documents under Documents, but
+**there is no retail API for them** — the `documents` endpoint (`documentDate`, `documentType` one of
+`STATEMENT`/`TAX`/`CONFIRM`, `documentDescription`, `url`) lives in the *Advisor* API, which is
+gated to registered RIAs and partners. So the only way to get the clearing firm's record of our
+fills is to download the PDFs by hand and import them.
+
+Worth doing because confirms are the one **independent** source of truth we have. `Trade` rows are
+written by our own engine, so a bug in the engine corrupts the evidence and the record of it at the
+same time — which is exactly what CP-1 is (`scripts/verify_data_checkpoint.sql`, trades id <= 2905
+partly untrustworthy). `scripts/reconcile_2026_07_13.py` proved the shape of the fix on a single day
+and found four distinct engine bugs from a $232 gap; this generalises that to every day we traded,
+sourced from PDFs instead of an API we cannot reach.
+
+**Scale (measured 2026-09-07).** Only *live* days have a counterpart document, so only they are in
+scope: PROD holds 16 trades over 3 days (2026-09-02 to 09-04, the live-test window). The 2,841 DEV
+trades across 50 ET days (2026-04-23 → 2026-09-01) are all sandbox and can never be reconciled —
+see I5. The calendar is therefore a handful of cells growing by one per trading day, so per-day
+reconciliation is computed on read and needs no cache.
+
+### I1. ~~PDF parser~~ *(prototype done 2026-09-07 — `scripts/parse_broker_confirm.py`)*
+
+Confirms are **Apex Clearing** "Postedge" documents — Tradier clears through Apex — and the PDFs are
+text-based, so `pdftotext -layout` extracts them cleanly with no OCR. Verified against the 2026-09-02
+and 2026-09-04 confirms: 6 fills each, both checksum-clean.
+
+Record layout is four lines per fill:
+
+    Type B/S TradeDate SettleDate QTY SYM PRICE Principal COMM TranFee Fees Tag NetAmount Trade# M/K C/A
+    1    B   09/02/26  09/03/26   1       3.2700000 327.00  0.00 0.02  0.09 S6637 327.11  TNB0903 5 1
+    Desc:  CALL SPY 09/02/26 760 STATE STREET SPDR S&P 500 ETF UNSOLICITED OPEN CONTRACT ... CUSIP: 8GTXKB7
+    Currency: USD   ReportedPX:                MarkUp/Down:
+    Trailer: UNSOLICITED, OPEN CONTRACT
+
+What the layout forces on the design:
+
+- **The SYM column is blank for options.** The contract is only in the `Desc:` line
+  (`CALL SPY 09/02/26 760`), so the OCC symbol has to be reconstructed —
+  `SPY` + `260902` + `C` + `00760000`. Verified to reproduce our stored `option_symbol` exactly.
+- **Buy/sell open/close is in the `Desc:`/`Trailer:` text**, not the B/S column: `OPEN CONTRACT` vs
+  `CLOSING CONTRACT` gives `buy_to_open` / `sell_to_close`.
+- **Page 1 is a cover sheet** (clearing-firm address block); fills start on the following page. Parse
+  by content, never by page index.
+- **The `SUMMARY` block is a free checksum** — `TOTAL DOLLARS BOUGHT`/`SOLD` must equal the sum of
+  parsed net amounts. Both test confirms reconcile to the cent. `--strict` makes a mismatch fatal, so
+  a silent layout change from Apex cannot import bad data.
+- **CUSIP is per contract** (`8GTXKB7` = SPY 09/02 760C) and stable — a candidate secondary key,
+  though we do not store CUSIPs today.
+- **One confirm covers one trade date.** Filenames carry the account and a generation timestamp, not
+  the trade date, so the date must come from the parse.
+
+Remaining: equity fills are handled on inference only (`SYM` populated, no `Desc:` option line) — we
+have not traded equities, so that branch is unverified. Monthly **statements** are still unparsed;
+take them for the cash/settled-balance roll-forward that cross-checks A1.
+
+### I2. Data model — parse on upload, never store the PDF
+
+Explicit requirement: **no PDF bytes are persisted**, so no S3/blob store and no new infra.
+(Why, and what the S3 option would actually have cost: `BRAINSTORM.md`.) The file
+is parsed in-request and the bytes are dropped; only extracted rows survive. Consequence to accept
+up front: re-importing after a parser fix means re-uploading the file. That is fine at one
+document per live trading day (3 so far).
+
+- `BrokerDocument` — one row per imported file: `user_id`, `environment`, `doc_type`, `period_start`,
+  `period_end`, `file_sha256`, `source_filename`, `parser_version`, `imported_at`, row counts.
+  `file_sha256` is the idempotency key: re-uploading the same file is detected and offered as a
+  replace instead of silently double-importing.
+- `BrokerFill` — one row per fill line: `document_id`, `user_id`, `trade_date`, `symbol`,
+  `option_symbol`, `side`, `action`, `qty`, `price`, `principal`, `commission`, `tran_fee`,
+  `fees`, `net_amount`, `settle_date`, `cusip`, `tag_number`, `trade_number`, `raw_line`,
+  `matched_trade_id` (nullable FK), `match_status`. Note `tag_number`/`trade_number` are Apex's
+  identifiers and are stored for traceability only — they are **not** joinable to our order ids
+  (I3), so do not index them as if they were keys.
+- **No third table for the calendar.** Per-day status is derived on read — the live-day count is in
+  the single digits and grows one row per trading day. Only add a cached `ReconciliationDay` if a
+  query actually proves slow.
+- **PII:** confirms carry account number, name and address. Store the account's **trailing digits
+  only** (the confirm prints five — `70356`); do not persist name or address at all. Not storing the
+  PDF is what keeps this cheap — don't undo it by copying the header block into a column.
+- **PREREQUISITE — stamp the trading mode on the `Trade` row.** The calendar cannot be built without
+  this. A confirm exists only for a fill that actually cleared at Apex, so a *sandbox* day has no
+  counterpart document and must render as "not applicable", never as "needs import". Today nothing
+  on a `Trade` says which it was: `selected_trading_mode` lives on the **`User`** row
+  (`models.py:47`) as a mutable current setting, so it says what the user has selected *now*, not
+  what was true when the fill was written. The only way to classify existing rows is the external
+  fact that live trading began 2026-09-02 — a hardcoded date in the UI, which is exactly the kind of
+  thing that rots.
+  - Add `trading_mode` to `trades` (`'paper'` | `'live'`), written at Trade-creation time from
+    `user.selected_trading_mode` in `order_manager`. Additive metadata on the write path — it gates
+    nothing and changes no order behaviour — but it is still an engine edit, so it needs its own
+    stated reason and a look at every site that constructs a `Trade`.
+  - Backfill: DEV rows → `'paper'` (all 2,841 are sandbox, see I5); PROD rows from 2026-09-02 →
+    `'live'`. After the backfill the 2026-09-02 date lives in a one-off migration, not in the UI.
+  - Consider the same stamp on `Position` if the reconcile ever needs to classify open rows.
+  - Per `feedback_migrate_before_model_edit`, this is precisely a case where DEV **and** PROD must be
+    migrated before `models.py` is edited — `reload=True` means a model save hits the shared DB.
+
+### I3. Matching rules
+
+> **2026-09-07 — the original plan here was wrong and has been rewritten.** It assumed the broker
+> order id would be the join key. **There is no order id anywhere on the confirm.** The only
+> identifiers Apex prints are its own: a per-fill `Tag Number` (`S6637`, `W2124`) and a batch
+> `Trade#` (`TNB0903`), neither of which relates to the Tradier order id we store in
+> `Trade.notes['order_id']` (`144248409`). Nothing to join on directly.
+
+- **Match as a per-day multiset**, not row-by-row. The confirm carries **no execution time** — only a
+  trade date — and it groups fills by contract rather than chronologically. So the unit of
+  reconciliation is: for one ET trade date, does the bag of (option_symbol, action, qty, price)
+  from the confirm equal the bag from `trades`? Price to the cent, qty exact.
+- **`option_symbol` is NULL on our buy rows** — `notes['option_symbol']` is only written on the sell
+  leg. Verified in prod: all six buy rows on 09/02 and 09/04 have it empty. Either backfill it from
+  the paired `Position`, or match buys on (date, action, qty, price) and let the contract come from
+  the round trip. Worth fixing at the source regardless.
+- **Round-trip pairing is ours, not theirs.** On 09/02 two buys (3.27, 4.23) and two sells
+  (4.11, 5.28) hit the same 760C. The confirm never says which sell closed which buy; our DB asserts
+  a pairing. Reconcile the legs independently and treat pairing as an unverifiable assumption.
+- **Fees are the one field that will not match today — and that is a real finding, not noise.**
+  Apex charges a Tran Fee (0.02 buy / 0.04–0.05 sell) plus 0.09 Fees per contract. Our prod rows
+  record `commission = 0` and `fees = 0` on **every** fill, despite the `models.py` comment claiming
+  fees are populated from `/account/history type=fee`. So P&L is overstated by the full fee load:
+  09/02 booked +143.00 against a broker net of +142.27, 09/04 booked +96.00 against +95.28 — about
+  $0.24 per round trip. Small per trade, but it is unidirectional and never nets out. See I6.
+
+### I4. Calendar page + report
+
+New page under `ui/src/app/pages/`, one cell per calendar day, state derived from the above:
+
+| State | Meaning |
+|---|---|
+| neutral | no trades and no fills that day — nothing to do |
+| **needs import** | we have `Trade` rows for that ET day and no confirm covering it |
+| **reconciled** | every trade matched a fill; qty and price agree within tolerance |
+| **review** | broker-only fills (a fill we never wrote down), DB-only trades (phantom), or a qty/price disagreement |
+
+Clicking a day opens the per-day report: matched rows, the three mismatch buckets, and the net
+cash/P&L difference for that day — the same output `scripts/reconcile_2026_07_13.py` prints, per day.
+
+- **Day boundary is ET, not UTC** — see `project_pnl_day_boundary_tz`. The confirm's trade date is
+  the broker's ET session; group `trades.timestamp` the same way, never on `utcnow()` midnight.
+- **RBAC:** upload is a write → `Depends(require_can_write_own)`; hide the upload control for
+  `viewer`/`auditor` off `authService.currentUserValue?.role`. Not an order path, so
+  `require_can_place_orders` does not apply. Cross-user read stays admin/auditor observe-only.
+- **Theming:** do not encode day state in colour alone. Green/red here means match/mismatch, which
+  collides with the profit/loss semantics of `--color-profit` / `--color-loss` — and colourblind mode
+  remaps that palette to blue/orange, so a "green = good" cell stops reading as good. Pair every
+  state with a glyph or label and check it in CB mode.
+
+### I5. ~~CP-1 backfill sweep~~ — **not possible, see why**
+
+Originally scoped as "import the confirms covering trades id <= 2905 and settle CP-1 from broker
+records." **That cannot be done.** Apex only issues confirms for fills that actually cleared, and
+every pre-checkpoint trade is a *sandbox* fill: `docs/live-test-2026-09-02.md` states the 09-02 run
+existed to "get the first honest fill data this engine has ever produced," because "sandbox
+fabricates fills, so every price-derived metric to date is meaningless." All 2,841 DEV rows —
+including the 2,480 pre-CP ones and the 253 on 2026-07-13 — are sandbox. No confirm exists for any
+of them, and none ever will.
+
+So CP-1 is not settleable from broker documents. It stays what it already was: an invariant check
+(`scripts/verify_data_checkpoint.sql`) that earns confidence only as clean post-checkpoint live data
+accumulates.
+
+**What this feature actually is, then: a forward check.** Confirms exist from 2026-09-02 onward
+(3 live days, 16 trades so far). Reconcile each live day as it happens, so a recording bug is caught
+against Apex within a day of occurring instead of being discovered months later the way CP-1 was.
+That is also why the calendar only ever needs to cover live days — a sandbox day has no counterpart
+document and should render as "not applicable", never as "needs import".
+
+### I6. Fees and commissions are not recorded on live fills
+
+Surfaced by the first confirm import (2026-09-07), listed separately because it is an **engine data
+bug, not a reconciliation feature** — and it is writing wrong numbers into `trades` right now.
+
+Every prod fill has `commission = 0` and `fees = 0` while the confirm shows a real per-contract
+charge on both legs. `Trade.fees`' comment says it is "populated from /account/history type=fee",
+so either that backfill never runs, runs before the fee rows post, or fails silently. A1 already
+noted that Tradier *sandbox* reports zero fees — this is the **live** account, so that explanation
+does not cover it.
+
+Consequences: reported P&L is overstated on every closed trade; win/loss classification flips for
+any round trip inside ~$0.25; the A1 cash ledger reserves slightly less than a buy actually costs
+(net 327.11 vs principal 327.00). None of it is large, all of it is one-directional.
+
+**Investigate first:** confirm whether the `/account/history type=fee` backfill exists and runs at
+all before changing anything — per `feedback_engine_filter_consumer`, find the consumer before
+touching the producer. Fee rows may post T+1, in which case the fix is a next-day sweep, not a
+change on the fill path.
+

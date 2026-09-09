@@ -1,0 +1,12 @@
+@if (blocked()) {
+  <div class="banner banner-warning cash-pause" role="status">
+    <mat-icon>account_balance_wallet</mat-icon>
+    <div class="cash-pause-text">
+      <strong>New entries paused since {{ since() }} ET — out of settled cash.</strong>
+      <span class="cash-pause-detail">
+        Needed {{ needed() }}, had {{ available() }} available. Open positions still
+        exit normally; entries resume once cash settles.
+      </span>
+    </div>
+  </div>
+}

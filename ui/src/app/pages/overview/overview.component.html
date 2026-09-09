@@ -98,21 +98,63 @@
   </div>
 
   <div class="charts-section">
-    <mat-card>
-      <mat-card-header>
-        <mat-card-title>Portfolio Performance</mat-card-title>
-      </mat-card-header>
+    <mat-card class="curve-card">
       <mat-card-content>
-        <p class="placeholder">Chart visualization coming soon...</p>
+        <!-- Same component the Performance page's curve is built from, so the
+             two pages can never drift into showing different numbers. -->
+        <app-equity-curve [rangeId]="'DAY'" [height]="260"></app-equity-curve>
       </mat-card-content>
     </mat-card>
 
-    <mat-card>
+    <mat-card class="activity-card">
       <mat-card-header>
-        <mat-card-title>Recent Activity</mat-card-title>
+        <mat-card-title>Today's Activity</mat-card-title>
+        <mat-card-subtitle>
+          Fills, position changes and anything that stopped the engine taking entries. Times are ET.
+        </mat-card-subtitle>
       </mat-card-header>
       <mat-card-content>
-        <p class="placeholder">Recent trades and events will appear here...</p>
+        <div *ngIf="activityError()" class="banner banner-error">
+          <mat-icon>error</mat-icon>
+          {{ activityError() }}
+        </div>
+
+        <ul class="activity-list" *ngIf="activity().length > 0; else activityEmpty">
+          <li
+            *ngFor="let e of activity()"
+            class="activity-row"
+            [class.activity-row--profit]="activityTone(e) === 'profit'"
+            [class.activity-row--loss]="activityTone(e) === 'loss'"
+            [class.activity-row--warning]="activityTone(e) === 'warning'">
+            <span class="activity-time mono">{{ activityTime(e) }}</span>
+            <mat-icon class="activity-icon">{{ activityIcon(e) }}</mat-icon>
+            <div class="activity-body">
+              <div class="activity-title">
+                {{ e.title }}
+                <span class="activity-pnl mono" *ngIf="activityPnl(e) !== null">
+                  {{ formatSignedCurrency(activityPnl(e)!) }}
+                </span>
+              </div>
+              <div class="activity-meta">
+                <span class="mono" *ngIf="activityContract(e) as contract">{{ contract }}</span>
+                <span class="mono" *ngIf="activityQty(e) as qty">{{ qty }}</span>
+                <span class="activity-detail" *ngIf="e.detail">{{ e.detail }}</span>
+              </div>
+            </div>
+          </li>
+        </ul>
+
+        <ng-template #activityEmpty>
+          <div class="empty-state">
+            <mat-icon>history</mat-icon>
+            <p *ngIf="activityLoading()">Loading…</p>
+            <p *ngIf="!activityLoading()">
+              Nothing has happened yet today.
+              <br />
+              <small>Fills, exits and entry blocks show up here as the engine works.</small>
+            </p>
+          </div>
+        </ng-template>
       </mat-card-content>
     </mat-card>
   </div>

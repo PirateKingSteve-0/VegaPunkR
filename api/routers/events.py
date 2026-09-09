@@ -18,7 +18,10 @@ router = APIRouter(prefix="/events", tags=["Events"])
 def get_events(
     page: int = Query(1, ge=1),
     limit: int = Query(50, le=200),
-    event_type: Optional[str] = Query(None),
+    event_type: Optional[str] = Query(
+        None,
+        description="One type, or a comma-separated list of types.",
+    ),
     severity: Optional[str] = Query(None),
     symbol: Optional[str] = Query(None),
     strategy_id: Optional[int] = Query(None),
@@ -34,7 +37,14 @@ def get_events(
     q = db.query(SystemEvent).filter(SystemEvent.user_id == current_user.id)
 
     if event_type:
-        q = q.filter(SystemEvent.event_type == event_type)
+        # Comma-separated list, so a caller can ask for a curated set in one
+        # request. The Overview's activity feed needs this: ORDER_RATE_LIMITED
+        # outnumbers real fills ~30:1 on a busy session, so a plain "newest N"
+        # window would be all throttle noise and no trades. A single type still
+        # works exactly as before.
+        types = [t.strip() for t in event_type.split(",") if t.strip()]
+        if types:
+            q = q.filter(SystemEvent.event_type.in_(types))
     if severity:
         q = q.filter(SystemEvent.severity == severity)
     if symbol:

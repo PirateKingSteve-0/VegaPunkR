@@ -142,6 +142,9 @@
     <!-- Main Content -->
     <mat-sidenav-content class="dashboard-content">
       <div class="content-wrapper">
+        <!-- Portal-wide: the engine stops buying when settled cash runs out and
+             then skips quietly, so this is the only thing that says so. -->
+        <app-cash-pause-banner />
         <router-outlet></router-outlet>
       </div>
     </mat-sidenav-content>

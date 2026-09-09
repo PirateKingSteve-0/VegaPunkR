@@ -65,10 +65,14 @@ export class EnvironmentControlsComponent implements OnInit {
   /**
    * Switch trading mode with confirmation for live mode
    */
+  /** Set after a mode switch: the engine needs a restart for it to fully apply. */
+  restartNotice: string | null = null;
+
   changeTradingMode(mode: 'paper' | 'live') {
     if (this.settings?.trading_mode === mode) {
       return; // Already in this mode
     }
+    this.restartNotice = null;
 
     // Show confirmation dialog for live mode
     if (mode === 'live') {
@@ -92,6 +96,16 @@ export class EnvironmentControlsComponent implements OnInit {
           alert(response.warning);
         }
         this.loading = false;
+        // Order routing follows this within ~30s (the engine re-reads the user
+        // row each loop), but the ACCOUNT EVENT STREAM does not: it resolves its
+        // account once, when the socket connects, and holds it for the life of
+        // the process. Until the app restarts, fills on the new mode confirm via
+        // the 30s REST poll instead of being pushed. Not dangerous — that is the
+        // documented fallback — but it is the protection you think you have.
+        this.restartNotice =
+          `Trading mode is now ${mode.toUpperCase()}. Restart the engine so fill ` +
+          `confirmations follow the new account — the account event stream keeps ` +
+          `the account it connected with until the process restarts.`;
         // Settings will auto-refresh via service tap()
       },
       error: (err) => {
