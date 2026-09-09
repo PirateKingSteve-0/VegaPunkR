@@ -10328,3 +10328,422 @@ Also wired mermaid validation back into `scripts/hooks/pre-commit`: staged markd
 mermaid fence is validated, errors block, warnings pass, and a commit touching no diagram pays
 nothing. Plus the `diagram_agent` advisory naming which sections a change makes stale. Nothing
 regenerates diagrams — auto-update remains unimplemented — so the notice is detection only.
+
+---
+
+## Session Date: September 8, 2026 (evening) — Three good arguments the engine won, and a login that told the UI you were nobody
+
+First live session since the account-stream fix. Started as "how did today look" and turned into a
+config audit, because explaining the day meant explaining why it stopped.
+
+### 1. The session: +$46, and it ended at 10:30 for a reason that was already logged
+
+Three round trips on strategy 4 (SPY 0DTE puts), all live, all real money.
+
+| Entry ET | Contract | In | SPY | Out ET | Out | Reason | P&L |
+|---|---|---|---|---|---|---|---|
+| 10:00:50 | `SPY260908P00773000` | 5.72 | 767.34 | 10:13:40 | 6.27 | trailing stop | **+$55** |
+| 10:17:10 | `SPY260908P00769000` | 2.72 | 766.51 | 10:23:59 | 2.33 | stop loss −15.07% | **−$39** |
+| 10:25:09 | `SPY260908P00769000` | 2.24 | 767.04 | 10:29:40 | 2.54 | trailing stop | **+$30** |
+
+Fills landed within a penny of the engine's estimate. Median hold 6.8 minutes.
+
+Then at 10:30:23 — `Insufficient settled cash (pre-preview): estimate=$252.50 > available=$145.53`.
+Cash account, T+1, three round trips is the whole day's buying power. **The engine fired 378 entry
+signals and filled 3.** The 09-05 pre-preview cash gate did its job: 09-02 and 09-04 logged 450 and
+478 `ORDER_PREVIEW_FAILED` rows hammering Tradier with "not enough buying power"; today logged one
+`ENTRY_SKIPPED_NO_CASH` and went quiet.
+
+Leverage, for the record: on trade 1 SPY moved **−0.08%** and the option made **+9.6%**.
+
+### 2. `session_report.py` stamped "sandbox — fills are invented" over a real +$46
+
+`SANDBOX` was read from `TRADIER_ENV` in `.env`, which is not what the engine routes on — the client
+is picked per user from `users.selected_trading_mode` at `trading_client_manager.py:61`. `.env` said
+sandbox; the user row said `live`; every `orders-*.jsonl` line carried `"trading_mode": "live"`.
+
+Now resolved per session from the database via `resolve_mode()`, mirroring the routing exactly
+including its `or "paper"` default. An ambiguous answer resolves to **live** — dismissing real money
+is the worse of the two errors.
+
+### 3. The login response has been telling the UI you are role `user`
+
+`POST /auth/login` returned `response_model=Token` — `{access_token, token_type}`. The frontend's
+`LoginResponse` interface declares `user: User` as required, so `auth.service.ts` did:
+
+```ts
+localStorage.setItem('currentUser', JSON.stringify(response.user));   // undefined
+```
+
+`JSON.stringify(undefined)` is `undefined`, which `setItem` coerces to the **string** `"undefined"` —
+which is precisely what `getUserFromStorage()` has a guard for on line 35. So `currentUserValue` was
+`null` for the entire session and every role check fell back to `'user'`:
+
+- the admin-only **Users** nav row was filtered out of the sidenav
+- `adminGuard` bounced `/dashboard/admin/users` back to overview
+- the name/email/role block at the top of the user menu never rendered
+- `canWrite()` returned false, so **"Done for the day" was disabled for an admin**
+
+TypeScript could not catch it: the interface claimed a field the API never sent. Found because the
+user asked why they could not see a menu option.
+
+Fixed both ends — new `LoginResponse(Token)` schema carrying `user: UserResponse`, and
+`AuthService` now refuses to write a non-user into storage and calls `refreshMe()` on boot so a
+server-side role change reaches the UI without a re-login. Backend gates were never affected; they
+read the role from the DB via the JWT, which is why live trading worked all day.
+
+### 4. Overview stopped saying "coming soon"
+
+Both placeholder cards replaced. `EquityCurveComponent` was extracted from the Performance page so
+there is one implementation of a chart that plots two different quantities — cumulative realized
+P&L intraday (Tradier publishes account value once nightly, with a date and no time), daily account
+value over longer ranges. **Only Overview uses it so far**; Performance still carries its own inline
+copy, which is exactly the drift the extraction was meant to prevent. Migration outstanding.
+
+One bug fixed in the port rather than carried across: `range` was a `computed` keyed only on the
+range id, so its `end` bound froze at first render. On a page that sits open all session, every fill
+after page load would have fallen outside the window and silently vanished from the curve.
+
+"Today's Activity" is a real feed off `/events`. The type list is curated because today's raw log is
+114 rows, **98 of them `ORDER_RATE_LIMITED`** — an unfiltered "newest 40" would have been almost
+entirely throttle noise. `GET /events` now accepts a comma-separated `event_type` (backward
+compatible) to make that one request instead of over-fetching and filtering client-side.
+`POSITION_OPENED` is deliberately excluded: it is written in the same second as `ORDER_PLACED` with
+strictly less information.
+
+### 5. Config that lies — an audit of all 32 `params_json` keys
+
+Three had no reader anywhere in `api/engine/`, `api/routers/`, `api/services/`, `models.py`,
+`schemas.py`:
+
+| key | verdict |
+|---|---|
+| `max_position_size_usd` | dead — shipped in all 8 templates, read by nothing |
+| `check_market_regime` | dead — no reader, no design written down |
+| `avoid_economic_news` | **not a lie** — in flight; `docs/econ-calendar.md` says "nothing consumes it yet" |
+
+**`max_position_size_usd` is now enforced** at `risk_manager.py:302`, applied **last** — after the
+"at least 1 contract" floor, which ignores cost and would otherwise silently override a ceiling
+checked before it. Absent / `None` / non-positive means **no cap**, never "cap at zero".
+
+That default matters more than it sounds. Turning enforcement on with the shipped `500` would have
+**blocked today's best trade** — one SPY 773 put at $5.72 is $572. So
+`scripts/null_position_size_cap.py` set every strategy to `None` (5 rows, DEV + PROD, refuses to run
+with a position open) and all 8 templates now seed `None`. A cap is now something switched on
+deliberately when the account is large enough for it to bind on purpose.
+
+**A second, more dangerous find while checking that one.** The `Strategy.stop_loss_percentage`
+*column* (`models.py:94`) is never read by the engine — `signal_generator.py:581` reads
+`params_json['stop_loss_pct'] or params_json['stop_loss_percentage']`. Three copies of one number.
+`PATCH {"stop_loss_percentage": 30}` set the column, returned 200, and changed nothing about
+trading. The UI form already handled this (its comments record the prod divergence: column 15,
+params 50) — the hole was every caller that does not go through the form.
+
+`_reconcile_risk_fields` now runs on clone, create and update: a column-only edit is pushed into
+`params_json` under both spellings so the intent takes effect; a contradictory write is refused with
+422 rather than silently resolved; otherwise the column is rewritten to mirror what the engine will
+apply, so it heals on the next save of any kind. `_engine_value` reproduces `:581` exactly,
+falsy-zero quirk included — resolving a zero differently here would put the column straight back to
+disagreeing with what trades.
+
+### 6. Three arguments I lost to the engine's own records
+
+Worth writing down, because the pattern is the point.
+
+**"Lower `risk_per_trade_pct` so two strategies fit."** Wrong. Replaying all 11 historical entries
+showed every one already sizes to **qty 1** — the floor. Between `safety_factor = 2.0` and the
+at-least-1 fallback, the percentage never sizes anything at this account size; it acts purely as a
+**price ceiling** on which contracts are affordable. At 40% today's +$55 winner is untradeable; at
+15% nothing trades at all.
+
+**"The opposite-side gate is blocking multi-strat."** `ENTRY_SKIPPED_OPPOSITE_SIDE` has fired
+**zero times in the entire history**. The gate built to arbitrate call-vs-put has never been
+exercised, because cash runs out before the two can contend.
+
+**"The OI floor is miscalibrated, drop it to 500."** TODO §E7 had already diagnosed it more
+precisely, with an explicit *"do not change the floor on this."* And the week's data says the gain
+would be ~zero — see below.
+
+### 7. E7 was right about the mechanism and wrong about the direction
+
+E7 (09-03) concluded the OI floor bites **puts** harder, because deep-ITM puts sit above spot where
+interest has not accumulated. Today was the exact mirror:
+
+```
+calls 762-768  (in band, ITM)   OI   773 - 1,846   all FAIL   <- 679 rejection ticks, ALL for low OI
+calls 769-774  (OTM)            OI 4,022 - 8,716   pass
+puts  762-773                   OI 3,094 - 8,717   pass
+```
+
+So it is not biased against puts. It starves **whichever side is deep in the money**, and that flips
+with where price has been. Per-session, from the logs:
+
+| | calls blocked | puts blocked | who traded | P&L |
+|---|---|---|---|---|
+| 09-02 | 1 tick | 117 ticks | calls | +143 |
+| 09-03 | 89 ticks | 855 ticks | calls | −73 |
+| 09-08 | 678 ticks | 1 tick | puts | +46 |
+
+**On every session observed, the starved side was also the side the VWAP rule was rejecting.** The
+OI floor and the trend filter kept agreeing. Whether that is mechanism or three sessions of
+coincidence is unknown — and is precisely the measurement E7 already asks for. It also means
+loosening the floor could admit exactly the counter-trend trades the strategy does not want.
+
+Nothing changed. One useful discovery for the research: **Tradier's chain endpoint returns final OI
+and volume for expired expirations**, so E7's distribution can be backfilled instead of waiting a
+month of forward logging. (It drops after roughly a day — 09-08 returned 330 contracts, 09-02/03/04
+returned zero.)
+
+Also worth recording: SPY's 767 call settled with **OI 1,406 against volume 645,502** — 459x
+turnover. Open interest counts positions held *overnight*, and nobody holds a contract that expires
+that afternoon. It is a poor liquidity proxy for 0DTE by construction.
+
+### 8. Multi-strat has not been tested
+
+Both strategies have been active four sessions and have **never both traded on the same day**. Not
+for want of signals — on 09-03 the engine fired 731 call and 587 put entry signals, and only the
+calls converted. Whichever fires first consumes the day's settled cash, which contaminates both
+records: 09-03's call result is not "calls beat puts", it is "calls got there first".
+
+Not a tuning problem. $1,259 against 0DTE contracts at $2–6, non-replenishing under T+1, is 2–5
+contracts of buying power for a whole day. Written up as the sequential alternative — calls only for
+N sessions, then puts only — which needs no capital and removes the race.
+
+### 9. Underlying survey, since TSLA "should be cheaper"
+
+It is not. TSLA trades at half SPY's share price and its contracts cost 2.3x as much, because
+**IV 42% vs SPY's 12%**. An index is a basket whose components partly cancel; a single name carries
+its own full risk. Holds at every expiry tested (front, ~1wk, ~1mo).
+
+```
+IV:  SPY 12%   QQQ 17%   AAPL 28%   AMZN 31%   NVDA 34%   META 38%   TSLA 42%   AMD 52%
+```
+
+Only **SPY and QQQ have daily expirations**; every single name is M/W/F, so a 0DTE strategy cannot
+trade them Tuesdays or Thursdays. Of the index vehicles, SPX ($3,740/contract) and NDX ($19,320) are
+out of reach; XSP fits at $383 and carries the 1256 tax treatment but quotes at a 6.2% spread, which
+at this trade frequency costs far more than the tax saves. **SPY stays right; QQQ is the only
+defensible second.**
+
+Spread numbers taken after hours are unreliable — SPY's own front-month read 0.7% but a far
+expiry read 24.3%, which is a stale-book artifact. The trustworthy figure is the engine's own
+`bid_ask_spread` on today's three entries: **0.7%, 0.9%, 1.2%**.
+
+### 10. Housekeeping
+
+- **TODO §E12** records `check_market_regime` as declared-not-implemented, with the design questions
+  and the E7 interaction. Kept rather than deleted, per the `avoid_economic_news` precedent, and all
+  8 templates annotated `# DECLARED, NOT IMPLEMENTED` at the key itself — TODO.md is where you look
+  once you suspect; the comment is where you trip over it while forming a wrong belief.
+- Architecture diagram updated for §1, §3, §9, §10. §5 needed nothing — the hook flagged it because
+  files changed, not because dependencies moved. Two claims caught mid-edit that described intent
+  rather than reality (Performance using the shared curve; Trades using `EventService`) and one
+  pre-existing error (`PERF --> AccountService`; it injects Tradier and Strategy).
+- Tests: `test_position_size_cap.py` (the cap works), `test_position_size_no_regression.py` (the cap
+  is **invisible** with live config — differential against the pre-change function across 5,500
+  (account, price) pairs, plus a live-DB check that no strategy carries a cap), and
+  `test_strategy_risk_field_sync.py` (all three reconcile rules, replaying the real prod
+  divergence). **Suite at 18 passing.**
+- Correction to something said mid-session: the backend suite runs fine. `pytest` directly is the
+  wrong entry point; `scripts/run_tests.sh` is the harness, and it excludes the two tests that need
+  live services.
+
+### 11. Open, in priority order
+
+1. **Settled cash may not have rolled overnight.** At 21:59 ET the broker reported
+   `total_cash $1,259.53` but `cash_available $145.53` and `unsettled_funds $0.00` — the $1,114 gap
+   is not labelled unsettled. If it is still $145 at 9:30, tomorrow ends after one cheap contract.
+   Check the Overview cash tile before the open.
+2. `--no-reload` on the next start. With reload on, saving any `.py` hot-swaps engine code under an
+   open position.
+3. Log out / back in once, to clear the `"undefined"` in `localStorage`.
+4. Migrate the Performance page onto `EquityCurveComponent`.
+5. E7's backfill, now that expired chains turn out to be readable.
+
+---
+
+## Session Date: September 8, 2026 (late) — What "news" actually means when you only trade SPY
+
+Started as "can the engine check the news before the open" and ended up deciding the feature is not
+a news feature. Also a banner, a retraction, and a rule about how to explain things.
+
+### 1. The pre-open news idea became an economic-event calendar
+
+Two unrelated things get called "news", and the distinction decides the build:
+
+- **Scheduled events** — CPI, PPI, NFP, FOMC. Published months ahead by the Fed and BLS. Free.
+- **Story news** — narrative headlines with sentiment, from a paid vendor.
+
+SPY is ~500 names, so any one company's story is diluted to nothing and partly offset by another's.
+The book is structurally immune to single-name news and structurally fully exposed to macro.
+Magnitudes run opposite to intuition — a stock moves 5–10% on its own earnings, SPY ~1% on CPI — so
+single-name news is bigger **per stock** while macro is bigger **per portfolio**, because it hits
+every position in the same direction in the same second. For a single-underlying book only the
+second one exists.
+
+A news vendor's real job is the **unscheduled** event (FDA decision, surprise merger, an 11:40
+guidance cut). Scheduled events come free from a calendar. For SPY that unscheduled category is
+essentially empty — which is why every vendor evaluation kept coming out weak. Deferred, not
+rejected; it becomes real the day the book holds single names.
+
+**TradingView cannot be the source, and it is a licensing wall rather than a missing feature.** Every
+TradingView "API" is one where TradingView is the client and we are the server: the Charting
+Library's Datafeed API and the Broker Integration API are interfaces *we* implement for *them* to
+call, and widgets are display-only iframes. The one outbound path is Pine Script alerts → webhook,
+which carries our own chart condition, not headlines. Their news is licensed from Reuters / Dow Jones
+/ Benzinga for display to a logged-in TradingView user, not for redistribution.
+
+Decision recorded in `BRAINSTORM.md`; the `TODO.md` news-outlook entry was rewritten to match.
+Closed one stale TODO claim in passing: it said strategy-direction mapping was an unsolved design
+problem needing a `bias` column, but `signal_generator.py:60` `resolve_direction()` already is the
+single resolver and `schemas.py:211` validates it on write.
+
+### 2. Windows, not days — and the danger ranking is backwards from intuition
+
+The naive design flags a whole day. The market does not have a bad *day* because of CPI; it has a
+violent *five minutes*. The unit is a window around the release timestamp — and which windows reach
+us depends on when they fire, given we enter after `entry_after_open_minutes` and are flat by 15:45:
+
+| Release | Lands | Held through? |
+|---|---|---|
+| FOMC decision 14:00 + presser 14:30 | mid-session | **Yes — dead centre** |
+| ISM / consumer sentiment / JOLTS 10:00 | mid-morning | **Yes** |
+| CPI / PPI / NFP 08:30 | pre-open | **No — resolves before entry** |
+
+So danger ranks **FOMC 14:00 > 10:00 releases >> CPI 08:30**. CPI is the famous one, but we are never
+in a position when it prints — we enter *after* the IV crush, not into it. The Fed is the one we hold
+long premium straight through. This inverted the original design, whose anchor was the 08:30 print.
+
+Consequence for the seed: **store timestamps, not dates.** A row saying "today had CPI" can never
+test a window size; "CPI released 2026-09-11 08:30:00 ET" lets us walk fills and ask whether entries
+within 15 / 30 / 60 min did worse, and let the data choose. MFE/MAE is already captured per trade, so
+the test can measure how hard those went against us, not just whether they lost.
+
+### 3. Real dates transcribed — and the ones that cannot be
+
+`docs/econ-calendar.md`, from primary sources only. FOMC 2026 + tentative 2027 from
+federalreserve.gov; CPI, PPI, Employment Situation and JOLTS from the BLS per-release schedule pages.
+Deliberately **not** written from memory — a calendar wrong by one day silently mislabels every trade
+in the analysis, which is worse than having none.
+
+Two honest gaps recorded in the file:
+
+- **The most relevant events are the least schedulable.** ISM Manufacturing (1st business day), ISM
+  Services (3rd business day) and UMich sentiment are all **10:00 — all held through** — and none
+  publishes a public annual calendar. ISM's own release-date page redirects to a member login. They
+  are rule-derived and need per-month holiday verification.
+- **The Employment Situation table is flagged unverified.** The reference-month column extracted
+  looked shifted by a month and several dates miss the usual first-Friday pattern. May well be right
+  (BLS schedules do slip) but the extraction was not clean enough to seed blind.
+
+Also noted so nobody "corrects" it later: **JOLTS has a genuinely irregular cadence** — two releases
+in March, two in June, none in April, July or October.
+
+**Nearest held-through event: FOMC Wed 2026-09-16, 14:00 ET**, with SEP and a 14:30 presser, inside
+the window, long premium, not flat until 15:45. Nothing is built to warn about it.
+
+### 4. Cash-pause banner — the visibility half of §11's open item 1
+
+The engine already records the pause: `_record_cash_block` writes one `ENTRY_SKIPPED_NO_CASH` row on
+the transition into the blocked state, then skips quietly. Verified in prod for today — a single row
+at **10:30:22 ET**, `estimate=$252.50 > available=$145.53`. Right for the log, wrong for the operator:
+the account stopped trading at 10:30 and nothing said so. 125 further attempts, silent.
+
+`api/routers/events.py` already serves it, so this needed **no engine change, no new column and no
+migration** — new `CashPauseBannerComponent` mounted in the dashboard shell above the router outlet,
+so it shows on every page.
+
+**Derived, never stored.** There is deliberately no flag on the user row: a stored boolean outlives
+the condition that set it, and a banner claiming the account is blocked when it is not is worse than
+no banner. The rule is *show it when today's newest cash-pause has no `ORDER_PLACED` after it*, so a
+single real fill clears it on the next 60s poll with nothing to reset. This reads the absence of a
+later order because the resume path logs to stdout only (`order_manager.py:502`) and never writes an
+event. Verified against real rows: pause 10:30, last order 10:25 → shows, correctly. ET day boundary,
+so it clears at midnight ET rather than at the bell — flagged as a choice, not an accident.
+
+Angular build passes. Not yet watched rendering in a browser.
+
+### 5. `resolve_mode()` extended — it was reading present state to describe a past session
+
+§2 of the evening entry describes this function; the working tree still carried the `TRADIER_ENV`
+derivation when this session opened the file, so it was implemented here and then found to have a
+defect of its own.
+
+Nothing on the trade row or the `ORDER_PLACED` event records which broker filled it, so the function
+reads `users.selected_trading_mode` **now** to label a session from **then**. The dev database is the
+counter-example: its user row reads `live` with `updated_at = 2026-09-02`, but dev stopped trading
+on 09-01 — so every dev session predates the flag it would be labelled with, and the "fixed" script
+would stamp *"Tradier LIVE (real money)"* over sandbox fills. The same bug, relocated.
+
+Now a user row touched on or after the session downgrades the answer to **SUSPECT** rather than
+asserting it. It over-warns (`updated_at` moves on any column change) which is the safe direction
+here. Pointed at DEV 2026-09-01 the report now reads `Tradier LIVE (real money) (?)` **and** check 1
+shows **61/61 exits mismatched — 100%**, which is the sandbox fingerprint stating itself.
+
+**Correction to a claim made mid-session:** it is not true that nothing records the broker per order.
+`logs/livetest-*/orders-*.jsonl` carries `trading_mode` on every line, alongside `signal_price`,
+`estimated_price`, `filled_price`, `broker_avg_fill_price` and both `ts_et` / `ts_utc`. The ground
+truth exists — it is in the logs, not the DB. That weakens the "stamp the mode onto the trade"
+suggestion: the script could read the orders log instead of guessing from present user state.
+
+### 6. Re-entry after a stop-out — investigated, then retracted
+
+Today's 10:24 stop-out followed by a 10:25 re-entry (which made +$30) prompted a look at the pattern.
+Prod holds 22 trades total, giving **n=4**. So dev was queried instead: post-08-25 window, churn band
+removed, 128 re-entries after a loss totalling **−$762 at a 17% win rate**, against +$284 for
+re-entries after a win, with a clean gradient — under 60s −$479, 60–120s −$296, over 5 min +$123.
+
+**Those numbers are withdrawn.** Dev's fills were invented by the sandbox — the same script documents
+a contract the engine priced at $2.34 and the tape traded at $2.30 being "filled" at $1.20. If the
+fills are fiction then the loss that triggers the re-entry was not a loss and the outcome of the
+re-entry was not an outcome; the table measures a random number generator. Corroborated by §5's
+61/61 mismatch on that exact window.
+
+So the correct status is not *weak evidence* but **no evidence**, and only prod can produce it —
+22 trades since 09-02, ~3 round trips a day, and today it stopped at 10:30. Weeks away, not days.
+Which strengthens "do not touch the engine yet" for a better reason than the one first given.
+
+### 7. `CLAUDE.md` gained an explanation-mode dial
+
+New **Explaining Trading Concepts** section. Scoped explicitly to trading, options, market-structure
+and risk language — **not** to code, architecture or tooling, which need no softening. Four modes
+(`plain`, `learning`, `standard`, `technical`) selected by one word under `## Current mode:`, set to
+**`learning`**: explain plainly, then name the real term once in parentheses, so vocabulary builds
+without gating the meaning. Intended to move right over time.
+
+Rules that hold in every mode: simplify the language and never the substance (no dropped risk,
+caveat or number); numbers lead; never three unexplained finance nouns in one paragraph; always label
+the clock as ET since the reader is on Pacific; and **a request to simplify is not a request to
+shorten**. Also: volunteer the reframe when the plain version exposes a wrong question — §2's whole
+08:30-vs-14:00 finding only surfaced because writing it without jargon made the mismatch obvious.
+
+### 9. Housekeeping — a commit that named a third of itself
+
+At 22:11 PDT everything in the tree was committed as `725c224 "sl column fix, ui changes, max
+position form fix"` — 37 files, 2,921 insertions, sweeping this session's work (BRAINSTORM, the
+calendar doc, the TODO rewrite, both `session_report.py` fixes, the banner and its wiring) in with a
+parallel session's role-fix, position-size cap and equity curve. The message named perhaps a third
+of what it contained.
+
+Reworded, since neither commit had been pushed. `725c224 → 3dcaec8` and `d3e9180 → a74675f`, both
+messages now listing contents by area. **Content is provably unchanged:** the index was set to each
+original commit's exact tree via `git read-tree`, and both new tree hashes match the originals
+(`1772581…`, `1f3344a…`) with `git diff backup/pre-reword-20260908 HEAD` empty. Author and author-date
+preserved. The backup branch is kept until this is pushed.
+
+Worth knowing separately: **`CLAUDE.md` is gitignored** (`.gitignore:21`), so §7's explanation-mode
+dial exists only on this machine. It will not reach the other machine or survive a fresh clone —
+which may or may not be intended, given the RDS move was specifically so both machines share state.
+
+### 8. Open
+
+1. **FOMC Wed 09-16 14:00 ET** — six days out, held through, nothing built. Manual call needed.
+2. **Strategy 3 (calls) took zero trades today.** Every scan: 163 of 165 calls outside the 0.60–0.85
+   delta band, and both in-band strikes rejected on open interest. Structurally shut out, so the book
+   ran put-only by accident rather than by choice. Wants a few days of scan logs before any filter is
+   touched — changing a filter without checking its consumer is the repo's own recurring failure.
+3. Seed the calendar into a repo YAML with exact release times, after a human verifies the
+   Employment Situation dates.
+4. Point `resolve_mode()` at `orders-*.jsonl` so the SUSPECT warning can be resolved rather than
+   merely raised.
+5. Watch the cash banner render; decide whether it should clear at the bell or at midnight ET.
