@@ -5,11 +5,11 @@
 ```mermaid
 graph TB
     subgraph "Client Layer"
-        UI[Angular 20 UI<br/>Dashboard, Strategies,<br/>Positions, Trades,<br/>Performance, Admin]
+        UI[Angular 20 UI<br/>Overview, Strategies,<br/>Positions, Trades,<br/>Performance, Admin]
     end
 
     subgraph "API Layer - FastAPI"
-        AUTH[Auth Router<br/>Login/Register/JWT]
+        AUTH[Auth Router<br/>Login returns JWT + User<br/>Register, Profile, Halt]
         STRAT[Strategies Router<br/>CRUD + Toggle]
         POS[Positions Router<br/>View + Close]
         TRADE[Trades Router<br/>History]
@@ -19,8 +19,8 @@ graph TB
         EXEC[Execution Router<br/>Start/Stop]
         RISKR[Risk Events Router<br/>Cap Trips + Halt]
         TRADING[Trading Router<br/>Manual Actions]
-        EVENTS[Events Router<br/>System Event Feed]
-        TRDR[Tradier Router<br/>Quotes, Chains, Balances]
+        EVENTS[Events Router<br/>System Event Feed<br/>comma separated type filter]
+        TRDR[Tradier Router<br/>Quotes, Chains, Balances<br/>Market Calendar]
     end
 
     subgraph "Trading Engine - Event Driven"
@@ -297,7 +297,9 @@ sequenceDiagram
 
     %% Risk validation
     SE->>RM: calculate_position_size(account, strategy, price)
+    Note over RM: risk pct then max_contracts,<br/>then the at-least-1 floor,<br/>then max_position_size_usd LAST
     RM-->>SE: qty = 1 contract
+    Note over SE: qty 0 returns before any gate<br/>or broker call - a skipped entry,<br/>never a zero quantity order
 
     SE->>RM: validate_pre_trade(user, strategy, qty)
     RM->>RM: Check trading halt for today
@@ -880,11 +882,23 @@ graph TB
 > so a cash shortfall, a tripped cap or a role change can never strand an open
 > position. Level 12 is checked *before* the broker preview — it used to run
 > after, which cost 214 wasted round trips in one session.
+>
+> **Sizing sits upstream of Level 1 and is not a gate.** `calculate_position_size`
+> applies the risk percentage, then `max_contracts`, then the "at least 1 contract"
+> floor, and finally `max_position_size_usd` — last on purpose, because the floor
+> ignores cost and would otherwise override a ceiling checked before it. A zero
+> from sizing ends the entry at `strategy_executor.py:371` before any gate or
+> broker call. The ceiling is **opt-in**: absent, `None` or non-positive means no
+> cap, so every strategy predating its enforcement behaves exactly as before.
 
 
 ```mermaid
 graph TB
-    START[Order Request] --> L1{Level 1:<br/>Role-Based Access}
+    SIZE[Position Sizing<br/>risk_manager.calculate_position_size]
+    SIZE -->|qty one or more| START[Order Request]
+    SIZE -->|qty zero| REJECT0[No order request is built.<br/>max_position_size_usd is the last<br/>bound applied and may reach zero.<br/>Opt-in: absent or None means no cap]
+
+    START --> L1{Level 1:<br/>Role-Based Access}
 
     L1 -->|user or admin| LH{Level 1b:<br/>Done For The Day Halt}
     L1 -->|viewer auditor<br/>strategy_author| REJECT1[Reject: Read-Only Role]
@@ -939,8 +953,8 @@ graph TB
     classDef check fill:#fff3e0,stroke:#e65100,stroke-width:2px
     classDef success fill:#e8f5e9,stroke:#2e7d32,stroke-width:2px
 
-    class REJECT1,REJECTH,REJECT2,REJECT3,REJECT4,REJECT5,REJECT6,REJECT7,REJECT8,REJECT9,REJECT10,REJECT11,REJECT12,REJECT13 reject
-    class L1,LH,L2,L3,L4,L5,L6,L7,L8,L9,L10,L11,L12,L13 check
+    class REJECT0,REJECT1,REJECTH,REJECT2,REJECT3,REJECT4,REJECT5,REJECT6,REJECT7,REJECT8,REJECT9,REJECT10,REJECT11,REJECT12,REJECT13 reject
+    class SIZE,L1,LH,L2,L3,L4,L5,L6,L7,L8,L9,L10,L11,L12,L13 check
     class PLACE,SUCCESS success
 ```
 
@@ -956,16 +970,34 @@ graph TB
 > Period selector now includes **1D** (`DAY`); Tradier has no DAY bucket for historical
 > balances, so `getHistoricalBalances()` sends `WEEK` and the day filtering happens on
 > the closed positions.
+>
+> **The equity curve is one component, used twice.** `EquityCurveComponent` plots two
+> different quantities and the caption has to say which: over a single session it draws
+> **cumulative realized P&L from our own fills**, because Tradier publishes account value
+> once nightly with a date and no time; over longer ranges it draws **daily account value
+> from the broker**. Conflating them would let a day holding an open winner read as flat.
+> **Only Overview uses the component today.** Performance still carries its own copy of
+> the same two-mode logic inline (`performance.component.ts`, `rebuildChart` /
+> `rebuildIntradayChart`) — the component was extracted from it, not yet swapped into it.
+> Two implementations of one chart is exactly the drift this was meant to prevent, so the
+> migration is outstanding, not done.
+>
+> **The cash-pause banner is derived, never stored.** The engine writes one
+> `ENTRY_SKIPPED_NO_CASH` row on entering the blocked state and then skips quietly, and
+> logs the resume to stdout only — so the banner shows when today's newest pause has no
+> `ORDER_PLACED` after it. A single real fill clears it on the next poll with nothing to
+> reset. A stored boolean would outlive the condition that set it.
 
 ```mermaid
 graph TB
     subgraph "Angular 20 UI"
         subgraph "Pages (Lazy Loaded)"
-            DASH[Dashboard Page<br/>Account Balance<br/>Risk Status Tile<br/>Open Positions<br/>Recent Trades<br/>Equity Curve]
+            SHELL[Dashboard Shell<br/>Toolbar + Sidenav<br/>Role-Filtered Nav<br/>Done For The Day<br/>Hosts Cash Pause Banner]
+            OVER[Overview Page<br/>Session Status + Cap<br/>Account Stat Tiles<br/>Equity Curve 1D<br/>Todays Activity Feed]
             STRAT[Strategies Page<br/>Strategy List<br/>Template Gallery<br/>Create/Edit Forms<br/>Toggle Active<br/>Stream Drawer]
             POS[Positions Page<br/>Open Positions Table<br/>Close Position Action<br/>Position Chart Dialog]
             TRADES[Trades Page<br/>Trade History Table<br/>Date/Symbol Filters]
-            PERF[Performance Page<br/>Equity Curve<br/>P&L Summary<br/>Win Rate<br/>Sharpe Ratio]
+            PERF[Performance Page<br/>Equity Curve<br/>P&L Summary<br/>Win Rate<br/>P&L Calendar + Holidays]
             ADMIN[Admin Page<br/>User Management<br/>Create/Edit/Delete<br/>Role Assignment]
         end
 
@@ -977,6 +1009,7 @@ graph TB
             SYS[SystemService<br/>Environment Switch<br/>System Events Stream]
             STRM[MarketStreamService<br/>WebSocket to Tradier<br/>Live Quotes for UI]
             RISK[RiskService<br/>Risk Status<br/>Account Daily Loss]
+            EVTS[EventService<br/>GET /events<br/>comma separated types<br/>ET day scoping]
         end
 
         subgraph "Guards"
@@ -988,6 +1021,8 @@ graph TB
             ENV[Environment Controls<br/>Dev/Test/Prod Toggle<br/>Paper/Live Toggle]
             PROF[Profile Dialog<br/>User Settings<br/>Trading Windows<br/>Notification Prefs]
             RISK_TILE[Risk Status Tile<br/>Daily Loss Progress Bar<br/>OK/WARNING/HALTED]
+            CURVE[EquityCurveComponent<br/>SHARED - one implementation<br/>intraday realized P&L<br/>or daily account value<br/>recolors on theme change]
+            CASHB[CashPauseBannerComponent<br/>Entries paused - no settled cash<br/>DERIVED from events, never stored<br/>60s poll, portal-wide]
         end
     end
 
@@ -995,19 +1030,34 @@ graph TB
         API[FastAPI<br/>/api/v1/*]
     end
 
+    %% Shell hosts the portal-wide banner on every page
+    SHELL --> CASHB
+    SHELL --> RISK
+    SHELL --> ENV
+    SHELL --> PROF
+    CASHB --> EVTS
+
     %% Page to Service connections
-    DASH --> ACCTS
-    DASH --> RISK
-    DASH --> SYS
+    OVER --> ACCTS
+    OVER --> RISK
+    OVER --> SYS
+    OVER --> EVTS
+    OVER --> RISK_TILE
+    OVER --> CURVE
 
     STRAT --> STRATS
     STRAT --> TRAD
     STRAT --> STRM
 
     POS --> ACCTS
-    TRADES --> ACCTS
-    PERF --> ACCTS
+    TRADES -->|bare HttpClient, not EventService| API
+    PERF --> TRAD
+    PERF --> STRATS
     ADMIN --> AUTHS
+
+    %% The shared curve fetches both quantities and picks by range
+    CURVE --> TRAD
+    CURVE --> STRATS
 
     %% Service to API
     AUTHS --> API
@@ -1016,27 +1066,24 @@ graph TB
     TRAD --> API
     SYS --> API
     RISK --> API
+    EVTS --> API
 
     %% Guards
-    DASH -.->|protected| AG
+    SHELL -.->|protected| AG
+    OVER -.->|protected| AG
     STRAT -.->|protected| AG
     POS -.->|protected| AG
     TRADES -.->|protected| AG
     PERF -.->|protected| AG
-    ADMIN -.->|protected + admin only| RG
-
-    %% Components
-    DASH --> ENV
-    DASH --> RISK_TILE
-    DASH --> PROF
+    ADMIN -.->|protected + admin or auditor| RG
 
     classDef page fill:#e3f2fd,stroke:#1565c0,stroke-width:2px
     classDef service fill:#fff3e0,stroke:#e65100,stroke-width:2px
     classDef component fill:#f3e5f5,stroke:#6a1b9a,stroke-width:2px
 
-    class DASH,STRAT,POS,TRADES,PERF,ADMIN page
-    class AUTHS,STRATS,ACCTS,TRAD,SYS,STRM,RISK service
-    class ENV,PROF,RISK_TILE component
+    class SHELL,OVER,STRAT,POS,TRADES,PERF,ADMIN page
+    class AUTHS,STRATS,ACCTS,TRAD,SYS,STRM,RISK,EVTS service
+    class ENV,PROF,RISK_TILE,CURVE,CASHB component
 ```
 
 ---
