@@ -18,7 +18,13 @@
 // an eyebrow — cheaper visually than a boxed sub-card, and it keeps the form
 // reading as one continuous column.
 .form-section {
-  margin-bottom: var(--sp-8);
+  margin-bottom: var(--sp-10);
+
+  // The last control in a section already carries its own bottom margin; the
+  // section rule adds to it, so trim the doubled gap before the next heading.
+  > :last-child {
+    margin-bottom: 0;
+  }
 
   h2 {
     font-size: var(--fs-micro);
@@ -38,14 +44,22 @@
 
 .full-width {
   width: 100%;
-  margin-bottom: var(--sp-3);
+  margin-bottom: var(--sp-6);
 }
 
 .form-row {
   display: grid;
   grid-template-columns: 1fr 1fr;
-  gap: var(--sp-4);
-  margin-bottom: var(--sp-3);
+  gap: var(--sp-5);
+  // Generous, because almost every field carries a multi-line hint and the
+  // subscript now GROWS to fit it (subscriptSizing="dynamic" on all 22 fields).
+  // With the default fixed-height subscript a two-line hint overflowed its
+  // reserved box and collided with the row beneath.
+  margin-bottom: var(--sp-6);
+  // Cells must not stretch to the tallest sibling: a field with a three-line
+  // hint next to one with none would otherwise drag the shorter control's box
+  // taller and float its label away from its input.
+  align-items: start;
 
   mat-form-field {
     margin-bottom: 0;
@@ -58,8 +72,124 @@
   }
 }
 
+// Hint and error text sit in Material's subscript wrapper. Left alone it is
+// clamped tight under the input and, on a wrapped line, reads as though it
+// belongs to the next field. ::ng-deep is the established pattern in this
+// codebase for structural Material tweaks (see dashboard/overview).
+:host ::ng-deep .mat-mdc-form-field-subscript-wrapper {
+  padding-top: var(--sp-2);
+
+  .mat-mdc-form-field-hint,
+  .mat-mdc-form-field-error {
+    display: block;
+    font-size: var(--fs-micro);
+    line-height: 1.45;
+  }
+}
+
+// The hint under a full-width field has the whole card to run across, so it
+// needs a measure or it becomes a single unreadable line.
+:host ::ng-deep .full-width .mat-mdc-form-field-hint {
+  max-width: 64ch;
+}
+
 mat-chip-grid {
   margin-top: var(--sp-2);
+}
+
+// A checkbox with its explanatory line beneath it.
+//
+// This had NO rule until 2026-09-11, and the markup puts a bare <mat-hint>
+// straight after the <mat-checkbox>. Outside a mat-form-field that renders as
+// an inline element with no layout of its own, so the explanation ran onto the
+// checkbox's own line and collided with whatever followed. Four of these exist
+// on the form.
+.checkbox-row {
+  display: block;
+  margin-bottom: var(--sp-6);
+
+  mat-hint {
+    display: block;
+    // Clears the checkbox's own box so the text starts under its LABEL rather
+    // than under the tick itself.
+    margin: var(--sp-2) 0 0 var(--sp-8);
+    max-width: 64ch;
+    font-size: var(--fs-micro);
+    line-height: 1.45;
+    color: var(--text-muted);
+  }
+
+  + .form-row {
+    margin-top: var(--sp-2);
+  }
+}
+
+// A checkbox sitting in a form-row grid cell beside a text input. Nudged down
+// so it optically aligns with the input's baseline rather than its label.
+.checkbox-cell {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  // Aligns the tick with the input box beside it rather than with its label.
+  padding-top: var(--sp-4);
+
+  .checkbox-hint {
+    margin: 0 0 0 var(--sp-8);
+    max-width: 48ch;
+    font-size: var(--fs-micro);
+    line-height: 1.45;
+    color: var(--text-faint);
+  }
+}
+
+// Engine constants: read-only, account-wide, and deliberately styled as
+// reference material rather than as fields — an inset well with no input
+// affordances, so nothing here reads as editable.
+.engine-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: var(--sp-3);
+  margin: 0;
+
+  .engine-item {
+    background: var(--surface-inset);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-sm);
+    padding: var(--sp-4);
+
+    dt {
+      font-size: var(--fs-micro);
+      font-weight: var(--fw-semibold);
+      text-transform: uppercase;
+      letter-spacing: var(--ls-eyebrow);
+      color: var(--text-faint);
+      margin-bottom: var(--sp-1);
+    }
+
+    dd {
+      margin: 0 0 var(--sp-2);
+      font-family: var(--font-mono);
+      font-size: var(--fs-lg);
+      color: var(--text);
+    }
+
+    p {
+      margin: 0;
+      font-size: var(--fs-micro);
+      line-height: var(--lh-normal);
+      color: var(--text-muted);
+    }
+  }
+}
+
+// Matches the treatment in profile-dialog.component.scss. The class was already
+// used by the Contract Selection band here but had no rule in this component,
+// so it rendered at body size — defining it was the fix, not a restyle.
+.section-hint {
+  color: var(--text-muted);
+  font-size: var(--fs-xs);
+  margin: 0 0 var(--sp-4);
+  line-height: 1.45;
 }
 
 .form-actions {
@@ -87,7 +217,8 @@ mat-chip-grid {
     }
 
     .form-row,
-    .form-row.form-row-3 {
+    .form-row.form-row-3,
+    .engine-grid {
       grid-template-columns: 1fr;
     }
 

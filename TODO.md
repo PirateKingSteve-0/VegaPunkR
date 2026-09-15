@@ -2,6 +2,17 @@
 
 Items are grouped into work-streams so related changes can be tackled together. Within each stream, sub-items are ordered by sequence (A1 before A2, etc.).
 
+**How to read this file** (structure tidied 2026-09-09):
+
+| Section | What it holds |
+|---|---|
+| **A–I** | Open work only. A struck-through heading here means the item is *mostly* done and the remaining part is named in the heading. |
+| **FUTURE CONSIDERATIONS** | Not scheduled. Things to promote into A–I when a trigger fires. |
+| **RESOLVED** | Fixed items whose write-up carries an argument worth keeping — the reasoning behind a change, and in several places a "this was measured, do not undo it" note. Item numbers are unchanged, so `E1`, `D3` etc. still resolve. |
+| **DONE** | One-line summaries of everything else that shipped. |
+
+Nothing is deleted when it is finished — it moves down the file. `BRAINSTORM.md` holds the decisions that shaped a design; this file holds the work.
+
 ---
 
 ## A. Cash Reservation Ledger (T+1 / GFV protection)
@@ -47,15 +58,31 @@ Both items measure "signal price vs realized price" — just on different sides 
 > sells `-411 -530 -252`. Magnitude is the per-contract cost; the sign encodes direction.
 > Exit-drift numbers can now be trusted. See `docs/live-test-results-2026-09-02.md` §F4.
 >
-> The categorisation work (cluster exits by reason) is still open, and see the B2 note below on why
-> the data will not mean anything until fills are live.
+> **2026-09-09 — first exit-drift distribution, n=14 live sells.** Thirteen of fourteen land within
+> **±2.1%** of the signal price. The fourteenth is the outlier this item was opened for:
+>
+> ```
+> 09-09 11:00 ET  SPY260909P00766000   signal 2.20   preview/fill 2.01   -8.6%
+> ```
+>
+> That is a stop-loss on strategy 4. The signal fired at −16.7% from a 2.64 entry, which implies
+> about **−$44**; the fill booked **−$62**. Roughly **$18 of the loss on that contract is slippage
+> between trigger and fill**, not stop distance — exactly the "late exit on a fast move" mechanism
+> described below, now with one live instance instead of zero.
+>
+> **One data point. Do not retune anything on it** (E3's caution applies unchanged). What it does
+> buy is a shape to test against: if the distribution stays 13-in-14 tight with an occasional −8%,
+> the fix is a marketable-limit on SL exits to cap the tail, not a change to `_EVAL_INTERVAL` or to
+> the bid-vs-mid choice — both of which would move all fourteen to fix one.
+>
+> The categorisation work (cluster exits by reason) is still open.
 
 Observed 2026-05-07 — some SL exits realized at ~50% loss when the configured SL was tighter, while others felt premature. Traced two compounding causes:
 
 - **Late exits:** SL signal evaluates against the option **bid** (`strategy_executor.py:382`); the exit then submits as a market sell (`order_manager.py:342`). On a fast SPY 0DTE drop, price keeps falling between trigger and fill, so realized loss exceeds the trigger %. Compounded by `_EVAL_INTERVAL = 1s` (`stream_driven_worker.py:40`) dropping ticks — by the next allowed eval the bid can already be several % past the threshold.
 - **Early exits:** bid-based eval on a wide bid/ask fires SL at a worse-than-mid loss; trailing-stop snap on a transient bid spike (peak_price pinned high) and the account `trading_window_end` cutoff are also suspects.
 - **Investigate first:** categorize today's SPY exits — `position.avg_entry_price`, `Trade.exit_price`, `position.peak_price`, exit `Signal.reason` (`strategy_executor.py:423-427`), wall-clock time. Cluster by reason to see how much is slippage vs. 1s-debounce vs. trailing-snap vs. window-cutoff before changing anything.
-- **Add exit-drift logging while you're here:** mirror the entry-drift `ORDER_PREVIEW_DRIFT` event in `close_position` (pass `signal_price` from SL/TP signals). One-line change, feeds directly into B2's cancel-rule data. Held back from the original entry-drift change to keep scope tight; pick it up now.
+- **~~Add exit-drift logging while you're here.~~ DONE 2026-08-31, and producing data.** `close_position` passes `signal_price` and the emit site no longer skips sells. Verified 2026-09-09: prod holds **28** `ORDER_PREVIEW_DRIFT` rows against 14 buys and 14 sells — both legs of every round trip. The distribution is in the note at the top of this item.
 - **Possible fixes (after data):** switch SL eval to `(bid+ask)/2` or `(bid+last)/2` instead of bare bid; make `_EVAL_INTERVAL` adaptive (tighter on fast tape); convert SL exits from market to marketable-limit to cap slippage (risk: may not fill in a true gap).
 
 ### B2. Preview-based cancel rule for entry drift *(LIVE DATA IN — probably not needed, see 2026-09-02)*
@@ -102,13 +129,120 @@ We need to figure out if we need to preview orders before execution. Whether tha
 
 ## C. Standalone
 
-### C1. Backtesting feature
+### C1. Backtesting feature *(spec 2026-09-14 — Phase 0 is urgent and unblocked)*
 
-We need to add a feature for backtesting data. What im thinking is what if we were able to use an available api call from tradier or a different broker to be able to help us collect data and test strategies. We could make it so when backtesting we can give params or constraints such as account size or other things to see how it might behave based on different things? Equity curves landed 2026-05-09 (DONE) — backtest results can now share the chart shape and overlay against live performance.
+> *Original note:* "We need to add a feature for backtesting data. What im thinking is what if we
+> were able to use an available api call from tradier or a different broker to be able to help us
+> collect data and test strategies. We could make it so when backtesting we can give params or
+> constraints such as account size or other things to see how it might behave based on different
+> things?" Equity curves landed 2026-05-09 (DONE) — backtest results can share the chart shape and
+> overlay against live performance.
+
+**Requirement added 2026-09-14: local-use tool. It may ship to prod, but must not be reachable by
+any other account.** See "Access" below — that requirement only binds Phase 2, and Phase 2 may
+never be needed.
+
+#### The data is perishable, and that reorders the whole item
+
+Tradier's intraday history has a hard horizon (`docs/tradier/market/time_and_sales.md`):
+
+```
+  interval   depth (open)   depth (all)
+  tick          5 days         n/a
+  1min         20 days        10 days
+  5min         40 days        18 days
+```
+
+`/v1/markets/history` **does** accept OCC option symbols
+(`docs/tradier/market/historical_pricing_security.md`) — but it returns *daily* OHLC, which for a
+0DTE contract is a single bar covering its entire life. It cannot order a stop against a target, so
+it cannot backtest an intraday exit.
+
+**Consequence: option intraday history older than ~20 days is gone permanently, and no tool built
+later can recover it.** We currently hold zero option quote history. The only real option prices
+this project owns are the 8 live fills in E11. Every session that passes without a collector is a
+session that can never be backtested.
+
+`docs/tradier/market/option_chains.md`: chains carry greeks and `bid_iv`/`mid_iv`/`ask_iv` (ORATS)
+when `greeks=true`. That is the measured IV and delta the 2026-09-14 cost budget currently has to
+*assume* at 35%, and it is one request per expiration per snapshot.
+
+#### Phase 0 — chain snapshot collector. Do this first, before any tool exists.
+
+A standalone script under `scripts/`, no engine coupling, no DB, no router. Polls the 0DTE chain for
+the traded symbols with `greeks=true` every 15-30s through the session, writes gzipped JSON next to
+the tick logs (`data/backtest/chains/SYMBOL_chain_YYYY-MM-DD.json.gz`). Bound it to a strike window
+around spot (+/-10) so one request covers the whole snapshot; confirm the market-data rate limit
+before choosing the interval.
+
+This is cheap, it is unblocked, it touches nothing in `api/engine/`, and it is the only part of C1
+with a deadline. **It also immediately upgrades `scripts/cost_budget.py` from an IV assumption to a
+measurement**, and supplies the option-chain snapshots `BRAINSTORM.md` 2026-09-11 names as the
+reason implied volatility was left off the candidate list.
+
+#### Phase 1 — local CLI backtester. No API, no UI, no access-control problem.
+
+Productise `scripts/replay_session.py` rather than rewriting it: it already replays a session
+against stop / target / trail / entry-window / cooldown / max-per-day and sweeps them. Four things
+it needs:
+
+1. **A pluggable price source.** `synthetic` (Black-Scholes from the underlying tick log, IV
+   supplied — the pricing core already exists in `scripts/cost_budget.py`) or `recorded` (Phase 0
+   snapshots). **Every synthetic result must be labelled synthetic in its own output.** Constant IV
+   cannot show a volatility collapse, and this book only ever buys premium, so a constant-IV
+   backtest flatters the strategy in precisely the direction that has never been measured.
+2. **The settled-cash ledger.** F3 says settled cash is the binding constraint and caps the account
+   near three trades a day. A backtest that ignores T+1 will report round trips the account could
+   never have funded, and will overstate the trade count — which is the number every expectancy
+   figure is divided by. This is the "account size as a constraint" idea from the original note, and
+   it is not optional decoration.
+3. **A cost model taken from measured data, not assumed.** Entry drift 0.19-0.61% (09-02 F5); exit
+   drift 13 of 14 within +/-2.1% with one -8.6% outlier (B1). `replay_session.py`'s docstring already
+   admits it is optimistic by roughly half the spread; make that an explicit, tunable term and report
+   results at 1x / 2x / 4x friction.
+4. **The real gates, not a copy of them.** Drive `SignalGenerator.check_entry_signal` /
+   `check_exit_signal` directly with an injected clock, the way `api/tests/test_bar_aggregation.py`
+   already does with no network and no DB. A backtester that reimplements the entry logic tests the
+   reimplementation — and G3 (`ema_period: 9` meaning nine *seconds*) is exactly the class of bug a
+   second implementation hides instead of finding.
+
+**Hard boundary: the backtest path must never import `order_manager` or `trading_client_manager`.**
+Execution is a stub that applies the cost model. Nothing under C1 goes near order placement.
+
+#### Phase 2 — API + UI. Optional, and last.
+
+Only if the CLI proves insufficient. The measuring work all happens in Phase 1; a web view adds
+presentation, not evidence.
+
+**Access, when and only when Phase 2 happens.** Layered, same shape as the rest of the app:
+
+- **`User.can_backtest` boolean, default False**, as the sole source of truth — consistent with how
+  per-user settings already work here (no env fallback, no role invention). Adding it is a
+  `models.py` change, so **migrate DEV and PROD before the edit**; `reload=True` means a model save
+  hits the shared DB immediately.
+- **A new `require_can_backtest` dependency in `api/auth.py`** on every backtest route. Do *not*
+  reuse `get_current_active_admin`: admin is deliberately observe-only and shared, and this is a
+  per-account capability, not a role.
+- **`BACKTEST_ENABLED` env flag gating whether the router is mounted at all**, default off. Belt and
+  braces — with it off the routes 404 in prod regardless of any DB flag. This is a deployment
+  switch, not a user setting, so it does not conflict with the rule above.
+- **UI hides the nav entry unless the flag is set.** The dependency is the security boundary; the
+  hidden nav is the UX boundary.
+
+#### Sequencing
+
+Phase 0 today (perishable data). Phase 1 next — it is what answers "does the entry work", and it is
+where E11's sample-size problem gets solved by replay instead of by waiting 70-115 sessions. Phase 2
+only on demand.
 
 ---
 
-## D. ~~A standalone button so we can say hey we are finishing trading today~~ *(built 2026-08-31)*
+## D. Daily gates & risk controls
+
+Everything that bounds a *session* rather than a trade: the manual halt, the daily P&L caps, the
+drawdown gate, and position sizing. D3/D4/D5 are fixed and have moved to **RESOLVED**.
+
+### D1. ~~A standalone button so we can say hey we are finishing trading today~~ *(built 2026-08-31 — `flatten` still unexercised)*
 
 "Done for the day" now lives on the Overview session card **and** the toolbar (reachable from
 every page). Clicking it asks one question — what happens to positions that are already open:
@@ -134,6 +268,22 @@ itself has not fired on real market data.
 
 ### D2. Automatic daily profit target (the upside twin of the loss cap)
 
+> **2026-09-09 — sized against live data, and demoted to second. See G2 and BRAINSTORM.md.**
+> A target near +$150 would have helped over the 14 live round trips: it stops 09-02 after +$189 and
+> 09-04 after +$167, saving the −$46 and the −$71 — roughly **+$436 instead of +$319**.
+>
+> But the two trades it saves are the 09-02 strike-roll re-entry and the 09-04 same-contract
+> re-entry bought at 4.57 after selling at 4.50. **G2's rule catches the same two trades and names
+> the cause**; D2 catches them by proxy — it stops because you have made enough, not because the
+> entry is a chase.
+>
+> **The failure mode is also now visible:** on 09-09 the account was **−$19 on the day** before the
+> final trade made **+$126**. A target-based halt can only ever end a day early, and the largest
+> single trade in this dataset was the last one taken.
+>
+> Still worth building — it bounds the day, which G2 does not. Just build it *after* entry quality,
+> and size the threshold off a real MFE distribution rather than off these five days.
+
 Every daily-scoped gate today is downside-only: `_check_user_trading_halt`,
 `_check_user_daily_loss_limit`, `_check_daily_loss_limit`. There is no upside equivalent, so the
 engine keeps opening positions all session no matter how far ahead it is. `take_profit_pct` is
@@ -158,150 +308,6 @@ real-money session means debugging your own change instead of measuring fills. B
 is live data to size the target against.
 
 ---
-
-### D3. ~~The drawdown gate was a latch, not a limit~~ *(FIXED 2026-09-05)*
-
-> `RiskManager._check_max_drawdown` compared the **worst drawdown ever recorded** against the
-> limit. A running maximum only rises, nothing reset it, and the query had no date filter — so one
-> bad stretch retired the strategy permanently. It kept reading as **Active**, kept evaluating,
-> kept generating signals, and silently refused every entry, with no alert and nothing on screen
-> to explain it. The only way to clear it was to edit the database.
->
-> **Caught at $2.43 of margin.** Measured on prod 2026-09-05:
->
-> | | worst-ever dd | current dd | limit (10% of $1,214.25) | headroom |
-> |---|---|---|---|---|
-> | strategy 3 (calls) | $119.00 | $119.00 | $121.43 | **$2.43** |
-> | strategy 4 (puts) | $71.00 | $71.00 | $121.43 | $50.43 |
->
-> **What changed.** The gate now measures the **current** distance below the strategy's own
-> high-water mark, so winning the drawdown back lifts the block. Trades are also now read
-> `ORDER BY timestamp` — a cumulative running total was previously computed over whatever order
-> the database happened to return, which made `peak` (and therefore the drawdown) arbitrary.
->
-> This is deliberately **more permissive** than before: current drawdown can never exceed
-> worst-ever. That is the point — the old bound was not a risk control, it was a latch.
->
-> **It does not remove the near-miss.** Strategy 3 is currently sitting *at* its trough, so
-> current dd == worst-ever dd == $119.00 and the $2.43 headroom is unchanged. The next losing
-> trade still pauses it. The difference is that it now **un-pauses on recovery** instead of
-> retiring. Open question: 10% of a $1,214 account is ~2 losing trades — decide whether
-> `max_drawdown_pct` is tuned for an account this size.
->
-> **The recovery path is narrower than it first looked.** Current drawdown only shrinks when a
-> trade CLOSES, a trade can only close if it was OPENED, and opening is exactly what the block
-> prevents. A blocked strategy holding nothing therefore *cannot* trade its way out — the only
-> escapes are a position that was already open when the block tripped, or `account_size_usd`
-> growing until 10% of it clears the drawdown (from $1,168 that needs $1,650, +41%, and it would
-> have to come from another strategy). So the fix converted "blocked forever because you EVER had
-> a bad stretch" into "blocked forever because you are CURRENTLY in one" — strictly better, and
-> still a latch while enforcement is on.
->
-> **Hence two settings, not one:**
->
-> | key | meaning |
-> |---|---|
-> | `max_drawdown_pct` | threshold as % of account. **`<= 0` disables everything** — no alert, no block, and no DB query. |
-> | `max_drawdown_block` | `True` (default) crossing it stops entries; `False` it only raises an alert and the strategy keeps trading. |
->
-> Alert-only is the useful mode on a small account: the strategy keeps trading, so it can climb
-> out on its own and the alert is genuinely self-clearing. `max_drawdown_block` defaults to `True`
-> so nothing that has not explicitly opted out changes behaviour.
->
-> Reading the settings now happens BEFORE the trade query, so a disabled gate costs nothing. That
-> query loads the strategy's entire history and runs on every entry attempt — 321 times on
-> 2026-09-02.
->
-> Bleed alerts (`notify_strategy_bleeding` / `notify_strategy_recovered`) fire once on the
-> transition over the threshold, and clear with **hysteresis at 80%** so a strategy sitting on the
-> line does not alternate messages.
->
-> **Still deferred:** the lookback window and a manual clear. Both only matter with
-> `max_drawdown_block=True`, which nothing currently uses.
->
-> Tests: `api/tests/test_max_drawdown_recovery.py` (28 cases: recovery to a new high, recovery to
-> flat, still-in-the-hole, insertion-order independence, badge/gate agreement, account-size
-> scaling, notification safety, the off switch, absent-means-default, alert-only mode, re-alert
-> suppression across 50 evaluations, and the hysteresis band).
-
-### D4. ~~A blocked strategy looked identical to a healthy one~~ *(FIXED 2026-09-05)*
-
-> Every silent entry block had the same symptom: an account that quietly stops trading, which is
-> indistinguishable from a market with no setups. Now surfaced two ways.
->
-> **Discord** — `notify_strategy_blocked` / `notify_strategy_unblocked`, gated on a new
-> `notification_preferences.discord.notify_risk` (defaults True). Fired **once**, on the
-> transition into the blocked state, and once again on recovery with the count of entries skipped
-> in between. Throttling is not optional here: 2026-09-02 produced **321 entry signals in one
-> day**, and this gate is evaluated on every one of them. Mirrors the
-> `OrderManager._cash_block_state` idiom — announce the transition, count the repeats quietly.
->
-> **UI** — the strategies table shows a `Blocked` chip beside `Active`, with the reason on hover.
-> Backed by `RiskManager.get_entry_block_status`, a read-only evaluation that runs the same
-> private checks in the same order as `validate_pre_trade`, so the badge cannot disagree with the
-> engine. It writes nothing and commits nothing; a failure is swallowed and the page renders
-> without a badge rather than 500ing.
->
-> Covered codes — the blocks with no other symptom: `mode_mismatch`, `account_daily_loss`,
-> `strategy_daily_loss`, `max_drawdown`. Deliberately **excluded** as self-evident: an inactive
-> strategy, the manual "done for the day" halt, and the position cap (normal operation, fires
-> constantly). Out-of-cash entries already have their own `ENTRY_SKIPPED_NO_CASH` event.
-
-### D5. ~~`_log_risk_event` raises TypeError — a tripped cap DEACTIVATES the strategy~~ *(FIXED 2026-09-07)*
-
-> **Fixed exactly as prescribed below, verified 2026-09-07.** `_log_risk_event` now writes
-> `details={"reason": message}` instead of `message=`, and wraps the write in the same try/except
-> as `_log_account_risk_event` — with a rollback — so a logging failure can never decide whether a
-> trade happens. The `logger.warning` is outside the try, so the event is still visible even when
-> the row cannot be written.
->
-> The test the item asked for exists: `api/tests/test_risk_event_logging.py` trips all three gates
-> **through `validate_pre_trade`** (not the private checks), asserts a failed write still returns a
-> clean `rejected`, and asserts a SELL is approved on every one of the four gates. All passing.
->
-> Uncommitted as of 2026-09-07: `api/engine/risk_manager.py` is modified in the working tree and
-> `api/tests/test_risk_event_logging.py` is still untracked.
-
-`RiskEvent` has no `message` column (`models.py`) — it carries `details` JSON. `_log_risk_event`
-passes `message=message` to the constructor anyway, and unlike its sibling
-`_log_account_risk_event` it has **no try/except**. Reproduced:
-
-```
-TypeError: 'message' is an invalid keyword argument for RiskEvent
-```
-
-The docstring on `_log_account_risk_event` already names this ("the legacy `_log_risk_event`,
-which references a `message` column that doesn't exist on the model") — the newer writer was
-written correctly and the old one was left in place.
-
-**Three gates route through it:** the per-strategy daily loss limit, max drawdown, and the
-position cap. So a *clean rejection* becomes an *exception*, and then:
-
-```
-cap trips -> TypeError -> caught at strategy_executor.py:229 -> state.error_count += 1
-          -> repeats on every entry attempt
-          -> at 20 consecutive errors: strategy.is_active = False   (:238)
-```
-
-**Hitting a daily loss cap does not pause the strategy for the day — it turns the strategy OFF,
-and it stays off tomorrow.** 2026-09-02 produced 321 entry signals in a day; 20 consecutive
-errors is a couple of minutes.
-
-**Reachable on the next session.** The per-strategy default is 5% of account = **$60.71**, about
-two typical losing trades ($46/$39/$34 observed).
-
-Knock-on: the D4 alerts never fire on these paths — `_note_entry_block` is called *after*
-`_log_risk_event`, so the exception pre-empts it. A strategy that deactivates itself this way
-sends nothing.
-
-Not caused by the D3/D4 work; it predates it. Contained in one respect: exits are unaffected,
-because a strategy holding a position runs the exit-only tick, which never calls
-`validate_pre_trade`.
-
-**Fix:** make `_log_risk_event` match `_log_account_risk_event` — write `details={"reason": ...}`
-instead of `message=`, and wrap it in the same try/except so a logging failure can never decide
-whether a trade happens. Needs a test that trips each of the three gates through
-`validate_pre_trade` (the existing tests call the private checks directly and miss this).
 
 ### D6. Position sizing does not scale with the account — acknowledge before the next band *(planning, 2026-09-07)*
 
@@ -362,208 +368,9 @@ currently checks the total.
 
 ---
 
-### F2. A trading-mode switch needs a process restart — and a UI banner will not survive the move to a server *(2026-09-07)*
-
-`TradierAccountStreamManager` resolves its account **once**, when the socket connects, and holds
-it for the life of the process. Order routing follows the paper/live toggle within ~30s (the
-worker re-reads the user row each loop), so after a mid-session switch:
-
-```
-orders  -> new account, within ~30s
-stream  -> OLD account, until the process restarts
-```
-
-Degraded, not dangerous: fills confirm over the 30s REST poll, which is the documented fallback
-and how everything ran before F1. But it is exactly the protection F1 restored, silently absent
-again.
-
-**Stopgap shipped 2026-09-07:** the environment controls show a dismissible warning after a mode
-switch telling the user to restart the engine.
-
-**Why that stopgap expires.** It assumes the person clicking the toggle can restart the process —
-true only while the engine runs on the same laptop as the browser. Once prod (and likely dev) move
-to a server, EC2/ECS or otherwise, the UI has no idea the engine exists and no way to restart it.
-The banner then instructs someone to do something they cannot do, which is worse than no banner.
-
-**Real fix, needed before the server move:** the stream must re-resolve its account when the mode
-changes, rather than relying on a human. Options, roughly in order of preference:
-
-- **(a) Reconnect on change.** The worker already re-reads the user row every loop and calls
-  `db.refresh(user)`. When `selected_trading_mode` differs from the account the stream connected
-  with, tear the socket down and reconnect through the provider. The manager already records
-  `_env_label` / `_account_label`, so the comparison is cheap and needs no new state.
-- **(b) Reject the switch while positions are open**, restarting the stream on the next flat tick.
-  Safer, more annoying, and it does not remove the human step — it moves it.
-- **(c) Refuse mode switches from the UI entirely** once the engine is remote, making the mode a
-  launch flag like `--env`. Most honest for a server deployment: the process gets pinned to an
-  account the way it is already pinned to a database.
-
-This interacts with the single-instance rule: the engine cannot scale horizontally (cash ledger,
-settled-cash cache, throttles and unconfirmed-order map are all in-memory class state), so a
-server deployment is one pinned process anyway. That argues for **(c)**, with **(a)** as the
-fallback if the UI toggle must keep working.
-
----
-
-### F1. ~~The account event stream watches the SANDBOX account during live trading~~ *(FIXED 2026-09-07)*
-
-> **Fixed and verified in the live process the same evening.** Connect line now reads
-> `wss://ws.tradier.com/v1/accounts/events (env=live account=6YB***56)` — the account the orders
-> actually go to.
->
-> Three changes: `TradierAccountStreamManager` takes a client provider, injected by `app.py` from
-> the same per-user routing the order path uses; `reconcile_user_history` uses
-> `TradingClientManager.get_client(user)`; and six market-data callers moved to a new
-> `get_market_client()` that forces the live endpoint, so paper mode reads real prices and a live
-> process never reads market data over a sandbox host.
->
-> Two things that let it hide are now closed: the connect log prints `env=` and a masked account,
-> and a missing provider logs a WARNING rather than falling back silently. `get_tradier_client()`
-> carries a docstring saying it is only safe for non-account calls.
->
-> Tests: `api/tests/test_account_stream_account_routing.py` — live provider gets the live socket,
-> paper still gets sandbox (not force-live), no provider falls back, a throwing provider cannot
-> take the stream down.
-
-`tradier_account_stream._create_session_sync` calls `get_tradier_client()` — a module-level
-singleton built from `settings.TRADIER_ENV` in `.env`, currently `sandbox`. Orders route
-per-user through `TradingClientManager.get_client(user)` on `user.selected_trading_mode`,
-currently `live`. The two disagree, and nothing reconciles them:
-
-```
-orders            -> LIVE account 6YB70356
-account WS stream -> wss://sandbox-ws.tradier.com  (sandbox account)
-```
-
-Confirmed in the 09-02 and 09-06 engine logs: `Account event stream connected:
-wss://sandbox-ws.tradier.com/v1/accounts/events` while the session traded real money.
-
-**Effect:** live fills are never pushed. Confirmation falls back to the 30s REST poll — the
-exact path this stream was built to backstop after 2026-07-13, when two orders filled while
-the poll expired and left the engine holding 6 unrecorded contracts. All 09-02 fills
-reconciled correctly via REST, so this is latent rather than broken, and the code comment at
-`tradier_account_stream.py:130` asserts the opposite of what happens.
-
-**Second site, same bug:** `services/tradier_reconcile.reconcile_user_history` (line 118) also
-calls `get_tradier_client()`. It pulls account history and writes commission/fees onto local
-`Trade` rows — so run against a live account it reads SANDBOX history and reconciles fees from
-the wrong account. Only reachable from the manual `POST /account/reconcile-fees` endpoint, not
-the engine loop, so it misfires only when someone calls it.
-
-**The fix already exists in the router.** `tradier_integration/router.py:29` added `_client(user)`
-for exactly this reason — its docstring says the singleton "always hit sandbox regardless of the
-user's live/paper selection". Both remaining sites need the same treatment.
-
-**Market data is NOT affected — verified 2026-09-07.** Sandbox and live return byte-identical
-quotes, greeks and open interest (`SPY 769.42/769.55`, `SPY260908C00768000 bid 3.00 ask 3.03
-oi 1193 delta 0.6736` from both). Tradier's sandbox serves real market data and only fabricates
-fills, so the six singleton callers that read quotes, chains, the clock and greeks are correct.
-Only the two account-touching sites above are wrong.
-
-**Fix:** the stream needs the same per-user client the order path uses, not the env singleton.
-That means giving `TradierAccountStreamManager` a user (or a client factory) rather than
-letting it resolve its own — worth care, since it is a singleton shared across strategies and
-the market stream is deliberately always-live.
-
----
-
 ## E. Exit rule structure *(from the 2026-09-02 live session)*
 
 Full write-up: `docs/live-test-results-2026-09-02.md`.
-
-### E1. ~~The trailing stop is unreachable by construction~~ *(FIXED 2026-09-03 — exercised live 2026-09-04)*
-
-> **Fixed in `signal_generator.check_exit_signal`.** Order is now stop loss -> trailing stop ->
-> take profit, and critically the **take profit is SUPPRESSED while the trail is armed**.
-> Reordering alone would not have worked: at the tick where price touches +TP the trail is not yet
-> hit, so it falls through to the target regardless — the target has to stand down for the trail to
-> govern. Unchecking `trailing_stop` restores the old behaviour exactly.
->
-> **Exercised live 2026-09-04 — the branch fires, and it pays.** Two `Trailing stop hit:` exits,
-> both on strategy 4 (puts, `SPY260904P00774000`):
->
-> | entry | trail level | exit fill | realised | |
-> |---|---|---|---|---|
-> | $2.97 (10:29:30 ET) | $4.44 (peak ~$4.93) | $4.50 | **+$153** | the flat +30% target would have sold at $3.86 = +$89 |
-> | $2.88 (10:16:39 ET) | $3.02 (peak ~$3.35) | $3.02 | **+$14** | armed just past +15%, then reversed |
->
-> The $153 trade is the proof this item was waiting for. `take_profit_percentage=30` was correctly
-> suppressed while the trail was armed, so the position ran to a ~$4.93 peak instead of being sold
-> at $3.86 — **+$153 against +$89**; the flat target would have surrendered 42% of the move.
->
-> The $14 trade is the other side of the trade-off, exactly as predicted below: armed at ~+16%,
-> reversed, exited at +4.5% rather than running to the target. A small win instead of a probable
-> stop-loss — the cost of letting winners run.
->
-> Source: `logs/livetest-2026-09-03/engine-20260903-061605.log` lines 28859 and 29072 (the 09-03
-> log file spans into the 09-04 session).
-
-The original finding, kept for the reasoning:
-
-> **2026-09-02 — FIXED, and option (a) as written below does NOT work.** Reordering the branches
-> changes nothing: the flat target fires on the way UP, at the tick price first crosses +25%, when
-> no pullback yet exists for the trail to be hit by. At that tick the trail falls through and the
-> target sells regardless of which is checked first. For both to be true on one tick the peak must
-> reach 1.25/0.90 = +38.9%, which the target already prevented the position from reaching.
->
-> What shipped instead — `signal_generator.check_exit_signal`, order now SL → trail → TP:
-> 1. **Arming latches on the peak.** It re-tested the live `pnl_pct` every tick, so the trail
->    switched itself off during the pullback it exists to catch; nothing could fire below a peak of
->    1.15/0.90 = **+27.8%**, not the +15% configured. Now armed off `position.peak_price` /
->    `trough_price` (with a 1e-9 tolerance — `(2.30-2.00)/2.00` is 14.999999999999998).
-> 2. **The flat take-profit stands down while the trail is armed.** The two rules are mutually
->    exclusive above the activation threshold; the target has to yield or the trail cannot govern.
->    Consequence on strategy 3 (`activation 15`, `take_profit 25`): the target is now dead — every
->    position that arms the trail exits via the trail.
->
-> Stop loss is untouched and still outranks the trail. Below activation, and with `trailing_stop`
-> unchecked, behaviour is identical to before — **unchecking the box in the strategy form is the
-> revert**, live within ~30s via `db.refresh(strategy)`, no deploy. Tests:
-> `api/tests/test_trailing_stop_arming.py` (18 cases: arm/disarm boundaries, the 09-02 runner
-> replay, SL precedence, shorts, trail-off regression).
-
-> 📜 **Everything from here to the end of E1 is the original 2026-09-02 analysis, preserved for the
-> reasoning that justified the fix. It describes the PRE-FIX engine and is no longer true — the
-> trail is reachable, has fired live, and neither fix option below is what shipped.** Current state
-> is at the top of this item.
-
-Prod strategy 3 is configured `trailing_stop=true, activation=15%, distance=10%,
-take_profit=25%`. `signal_generator.check_exit_signal` evaluates in a fixed order, each branch
-returning immediately:
-
-```
-1. take profit    (25%)   -> return
-2. stop loss      (15%)   -> return
-3. trailing stop  (arms at 15%)   <- never reached
-4. max hold time
-```
-
-The trail arms at +15% but take profit fires at +25% and returns first, so **any position that
-would arm the trail is sold before the trail can act.** It has never executed and cannot at these
-numbers. A configured feature that is dead code — not a tuning preference.
-
-**Fix options.** (b) is preferred as the first move: it is a data change, reversible from the
-portal, needs no code, and is therefore testable without touching the exit path.
-
-- **(a) Reorder** — evaluate trailing before the flat target. Once up 15% the trail governs and the
-  flat 25% only fires on a gap through it. Changes behaviour most aggressively.
-- **(b) Raise `take_profit_pct`** above the trail's useful range (e.g. 60%), leaving the trail as
-  the normal exit and the target as a ceiling.
-
-**What it affects — this is a real trade-off, not a free win.** Winners run further and exit below
-their peak; hold time rises; round-trip count falls. But a position that reaches +15% and then
-reverses now exits near +5% instead of at +25%, converting some current winners into smaller ones.
-Every exit the engine makes is affected, so it wants tests, not a quick edit.
-
-**Evidence (2026-09-02).** `SPY260902C00760000` ran 3.27 -> session high 6.40. The engine took
-+25.7%, immediately re-entered the same contract, and took +24.8% again:
-
-| | settled cash used | P&L | return on cash |
-|---|---|---|---|
-| actual: two 25% round trips | $750 | +$189 | 25% |
-| one position with a working 10% trail (exit ~5.76) | $327 | ~+$249 | 76% |
-
-The P&L difference is modest (~+$60). **The cost that matters is the cash** — see E2.
 
 ### E2. Settled cash is the binding constraint, and the flat target doubles its consumption
 
@@ -595,11 +402,13 @@ flat target spends two of them on one move.
 
 **Two separate items follow:**
 
-- **E2a. Stop previewing when out of buying power.** The engine should recognise it has no settled
-  cash and stop issuing previews rather than being refused 214 times. *Affects log readability,
-  broker request volume, rate-limit headroom — **no change to trading behaviour**, those orders
-  were already refused.* Low risk, purely additive. Adjacent to A1, whose probe still has never
-  run: today's protection came from Tradier's check, not ours.
+- **~~E2a. Stop previewing when out of buying power.~~ DONE 2026-09-05 — confirmed 2026-09-09.**
+  The pre-preview settled-cash check (note at the top of this item) works, and the event counts say
+  so cleanly: `ORDER_PREVIEW_FAILED` ran **450** on 09-02 and **478** on 09-04, then **0 on 09-08
+  and 0 on 09-09**, replaced by a single `ENTRY_SKIPPED_NO_CASH` transition row per day. Roughly
+  930 wasted broker round trips per two sessions, gone. Trading behaviour is unchanged, as intended
+  — those orders were already being refused. **A1's probe still has never run**, so today's hard
+  protection is still Tradier's check rather than ours.
 - **E2b. Funding is a precondition for strategy measurement.** Three samples/day cannot support any
   read on win rate. Not a code change — a decision about whether the next test measures the
   strategy or measures the cash constraint again.
@@ -610,59 +419,91 @@ Trade 3 stopped at 2.50 (−15.5%); the contract recovered to 2.98 (high 3.13) b
 to **2.50 by 13:00**. It reads as a shakeout at twelve minutes and as a correct exit at the hour.
 One ambiguous trade. Listed explicitly so it is not quietly retuned.
 
-### E5. ~~Capture MFE/MAE per trade — the data is being destroyed~~ *(DONE 2026-09-05)*
+### E13. ~~Every template ships a negative-expectancy stop/target pair~~ *(FIXED 2026-09-14)*
 
-> **Shipped.** `trades.mfe_price` / `mae_price` added (migration `a1b2c3d4e5f6`, applied to **DEV
-> and PROD**), and `order_manager` snapshots `position.peak_price` / `trough_price` onto the SELL
-> leg at close — before any re-entry can reset them. Covered by
-> `api/tests/test_mfe_mae_capture.py`, whose load-bearing assertion is that a reopen wipes the
-> position's peak while the already-closed leg keeps its own.
+> **Fixed the same day it was found.** All eight templates now run a 1:2 stop/target, so every one
+> breaks even at **33.3%**. The stop was set to each template's own `trailing_stop_activation` and
+> the target to twice that, which keeps the wider stops on the more volatile names — the relative
+> ordering the file already encoded, rescaled the way `min_volume_multiplier` was on 2026-09-10:
 >
-> Note the reset only fires on the **reopen** path (a row already at `qty=0`). With `qty>0`
-> `_update_position_entry` averages into the open position and legitimately keeps the peak.
+> ```
+>   spy / qqq / aapl / meta / amzn   50/25 -> 15/30
+>   amd                              45/30 -> 18/36
+>   tsla                             40/30 -> 20/40
+>   nvda                             40/35 -> 20/40
+> ```
 >
-> **Migration gotcha for next time:** the first PROD attempt stalled 4.5 min and had to be
-> cancelled. The running engine holds connections `idle in transaction`, which keeps an
-> `AccessShareLock` on `trades`; the `ALTER` queued for `AccessExclusiveLock`, and a queued
-> exclusive request makes every later reader queue behind it too. **Stop the app before DDL on
-> `trades` / `positions`.** Nothing was half-applied — the transaction rolled back clean.
+> SPY lands on exactly the 15/30 prod strategies 3 and 4 run, so the reference template and the live
+> rows now agree. Both key spellings (`params_json.*_pct` and the `*_percentage` columns) were
+> written together, all 32 values verified equal. `test_strategy_risk_field_sync` and
+> `test_trailing_stop_arming` both pass; neither reads the templates, so this is coverage-neutral —
+> **no test asserts on template defaults, and one probably should.**
 >
-> Data starts accumulating from the next live session. Historical trades stay NULL.
+> **Deliberately NOT changed: `delta_min` stays at 0.60 on all eight.** Raising it toward 0.85 is the
+> other half of the cost-budget recommendation and it changes the capital profile (~$7.57 vs ~$3.89
+> per contract, roughly halving trades/day against F3's cash ceiling). That is option 2 below and it
+> still waits on E11. What follows is the original finding.
 
-The original finding, kept for the reasoning:
+**The prod rows were fixed on 2026-07-13. The templates they were created from never were.** So the
+default path still creates strategies carrying the exact defect `docs/negative-expectancy.md` was
+written about, and that doc's rule — *"never deploy a strategy without computing SL/(SL+TP) first"* —
+is violated by every template in `api/strategy_templates.py`:
 
-`Position.peak_price` / `trough_price` are Maximum Favorable / Adverse Excursion in all but name,
-and they are the single most useful diagnostic for exit-rule quality. **They are currently
-unrecoverable after the fact.**
+```
+  template                SL    TP    break-even win rate
+  spy_0dte_scalping       50    25          66.7%
+  qqq_0dte_scalping       50    25          66.7%
+  aapl_0dte_scalping      50    25          66.7%
+  meta_0dte_scalping      50    25          66.7%
+  amzn_0dte_scalping      50    25          66.7%
+  amd_0dte_scalping       45    30          60.0%
+  tsla_0dte_scalping      40    30          57.1%
+  nvda_0dte_scalping      40    35          53.3%
+                                            ------
+  prod strategies 3 and 4 (patched)  15/30  33.3%
+```
 
-Two problems:
+**All eight have the stop wider than the target.** Not one is at the 33.3% the live strategies run.
+`scripts/fix_strategy_expectancy.py` wrote the four keys and both columns on the *existing rows*; it
+was never a template change, and nothing since has closed the gap.
 
-1. `Trade` has **no** `peak_price` / `trough_price` columns — MFE is never written to the
-   immutable record.
-2. `order_manager.py:1348` resets `position.peak_price = price` on every reopen, and position rows
-   are reused for re-entries. So MFE survives only for a row's **most recent cycle**.
+**The dual-key trap is NOT present here** — worth recording, because it is the thing to check. Each
+template writes `params_json.stop_loss_pct` and the `stop_loss_percentage` column to the *same*
+value (verified 2026-09-14, all eight), so a template-born strategy does not reproduce the
+2026-07-13 failure where the UI showed 15% and the engine enforced 50%. The values agree. They are
+simply the wrong values. `trading_safeguards.py:54` rejects `stop_loss_pct` below 10, so every one of
+these passes validation.
 
-On 2026-09-02 that already cost us: trade 1's peak was overwritten by trade 2's re-entry into the
-same contract, hours after the fact. Only pos2's peak survived long enough to be read — and it is
-the evidence that the day's only loser was +22% before it reversed
-(`docs/live-test-results-2026-09-02.md` §F7b). **Every future session loses this silently.**
+#### Why this is not a one-line fix to 15/30
 
-**Fix:** add `mfe_price` / `mae_price` to `Trade`, and copy `position.peak_price` /
-`trough_price` onto the sell-leg Trade row in `_update_position_exit` before the reopen path can
-reset them.
+`BRAINSTORM.md` 2026-09-14 computes what a percentage stop on premium actually costs: at
+`delta_min: 0.60` — which all eight templates also set — a **15% stop sits 10.4 bp from spot, or
+0.39 sigma of SPY's 30-minute move, and a driftless random walk touches it essentially 100% of the
+time.** Copying 15/30 into the templates swaps a stop that needs an unreachable win rate for a stop
+that fires on noise. Both lose; they lose for different reasons.
 
-**Sequencing — this is not a UI change.** Model change -> Alembic migration on **DEV *and* PROD**
-before the model edit lands (`reload=True` means a models.py save hits the live shared DB
-instantly) -> `order_manager` write (engine code, so it needs the usual care and a test) -> then
-the metric is computable and the UI can show it.
+Three options, and the choice needs to be made once rather than per-template:
 
-**Do this before E1.** E1's whole case rests on MFE, and right now the argument can only be made
-from one surviving row. A week of captured MFE turns "it cost a winner on 09-02" into a
-distribution.
+1. **Match prod (15/30).** Consistent, honest about what is actually being traded, and the defect
+   above is then documented rather than hidden. Cheapest, and it at least stops shipping 66.7%.
+2. **Derive the pair from the cost budget** — raise `delta_min` toward 0.85 and widen the stop so it
+   sits past ~1 sigma. `scripts/cost_budget.py` produces the numbers per hour and per delta. More
+   correct, and it changes the capital profile (~$7.57 vs ~$3.89 per contract), which collides with
+   E2/D6 and F3's roughly-three-trades-a-day cash ceiling.
+3. **Ship no default at all** — require SL/TP at creation and refuse to save without them, so the
+   arithmetic is forced on whoever creates the strategy. Most defensible, worst onboarding, and it
+   makes the templates much less useful as templates.
 
-**Metric it unlocks:** *MFE capture ratio* = realized P&L / MFE. 09-02 was `100%, 100%, -70%`. A
-persistently low ratio means the exit rule is systematically leaving the move behind; a negative
-one means a position that was well in profit closed at a loss.
+**Recommendation: 1 now, 2 after E11 has sample size.** *(1 was taken 2026-09-14, with the stop scaled per template rather than flat 15/30 — see the note at the top.)* Option 1 is a value change to eight dicts
+with no behavioural surface beyond creation; option 2 needs the live data E11 is blocked on, and
+picking a stop distance off four up-drifting sessions is exactly the retune E3 says not to do.
+
+#### Do not do this quietly
+
+Changing a template changes what *new* strategies get, not what the running ones use — the strategies
+router merges `params_json` on update (`routers/strategies.py:290-296`) and nothing rewrites existing
+rows. So this edit cannot disturb prod strategies 3 and 4, which is what makes it safe. It is still a
+trading-parameter change and wants explicit sign-off before the edit, per CLAUDE.md.
 
 ### E6. Performance metrics we do not compute
 
@@ -983,171 +824,429 @@ leave an untested branch in the exit path.
 
 ---
 
-# FUTURE CONSIDERATIONS
+## F. Broker routing & environment
 
-- **THERE ARE NO BROKER-SIDE STOPS. If the engine dies holding a position, nothing protects it.** Every exit — stop loss, take profit, trailing stop, time exit — is *simulated in-engine* and issued as a market sell when our own logic decides to fire (`order_manager.py:425`, market orders hardcoded). **Nothing rests at Tradier.** If the process crashes, the host reboots, the WebSocket wedges, or the eval loop stalls while a 0DTE position is open, that position simply sits there unmanaged until someone notices. The `stop_loss_pct` you configure is a number the engine checks — not an order the broker holds.
-    - **This is the single largest live-trading risk in the system** and it is independent of every other item here. It survived the 2026-07-13 session only because nothing crashed.
-    - **Tradier supports the fix.** It has OTO / OCO / OTOCO order classes, so an entry can carry an attached stop and target that live at the broker. `docs/tradier/trading/` documents them; **no code path calls them** — `place_option_order` hardcodes `class: "option"` (single-leg) and only ever sends market orders.
-    - **The tension to resolve first:** broker-side brackets and engine-side trailing stops fight each other. A resting stop can't trail, and the engine can't trail a position the broker might close underneath it. Options: (a) resting *disaster* stop at the broker (wide — e.g. −50%), engine keeps managing the tight/trailing exits inside it; (b) full broker-side bracket, drop engine trailing entirely; (c) engine cancels/replaces the resting stop as it trails (most correct, most API traffic, most ways to desync). **(a) is the cheapest real safety win** — it bounds the catastrophic case without touching the strategy logic.
-    - **Do this before any meaningful live capital.** Everything else on this list is money-losing-slowly; this one is money-gone-in-one-event.
+F1 (the account stream watching the wrong account) is fixed and has moved to **RESOLVED**.
 
-- **Configurable server port + first-class multi-instance (per-environment) runs.** `api/app.py` hardcodes `uvicorn.run(..., port=8000)`, so a dev (`APP_ENV=dev`) and a live (`APP_ENV=prod`) instance can't run at the same time — they collide on port 8000. Make the port env-driven (`PORT`, default 8000) so both can run side by side (e.g. dev on 8000, live on 8001), each with its own engine worker / Tradier stream / email scheduler and each pinned to its launch `APP_ENV`. This is the safe model — trading is pinned to the process env, not the UI toggle (the toggle only reroutes *reads*; see JOURNAL.md 2026-07-10/11 and `docs/monday-runbook.md`). Follow-ups: the Angular `apiUrl` is fixed per build, so driving two backends means pointing the UI at the target instance's port (or running two UIs / adding an instance picker); optionally add a `scripts/` launcher ("start-dev", "start-live"). Low risk — two lines in `app.py`.
+### F2. A trading-mode switch needs a process restart — and a UI banner will not survive the move to a server *(2026-09-07)*
 
-- **Daily-profit cutoff (positive-P&L halt for the day).** Mirror of the existing account-wide daily *loss* cap, but on the upside: once the day's P&L reaches +X%, pause **new entries** for the rest of the session so a green day can't be given back. Today the engine is one-directional — `RiskManager._check_user_daily_loss_limit` (`api/engine/risk_manager.py:221`) and the per-strategy `_check_daily_loss_limit` (`:305`) only gate `today_pnl < -limit`; the session-status helper even floors gains to zero (`loss_consumed = max(0.0, -today_pnl)`), so a positive day triggers nothing. `take_profit_pct` in `trading_safeguards.py` is a **per-position** option-price exit, not an account/day-level halt — unrelated.
-    - **Exits stay sacred.** This gate blocks `side='buy'` only. Open positions keep running SL/TP/trailing — a profit halt must never force-close, or it converts paper gains into realized ones and kills the trailing stops (per the engine rules in CLAUDE.md).
-    - **Sketch:** add `_check_user_daily_profit_target` alongside `_check_user_daily_loss_limit`, computing the same realized + unrealized `today_pnl`, rejecting buys when `today_pnl > +limit`. Wire into `check_entry` right after the loss gates (most-restrictive-bound composes cleanly — it's an additional entry block, never a widening). Add a `_log_account_risk_event(... "user_daily_profit_target" ...)` and optionally a `PROFIT_HALTED` status in the session-status block (~risk_manager.py:453–482) so the overview tile can surface it.
-    - **Config surface:** parallel `daily_loss_limit_pct` — new `User.daily_profit_limit_pct` column (`models.py:28`) + Alembic migration + `schemas.py` fields (`:76`, `:103`), and/or a `strategy.params_json['daily_profit_limit_pct']` key. Account-level, per-strategy, or both — TBD.
-    - **Open design question (decide before building):** measure the threshold against **account equity** (e.g. +3% of account) or against the **day's risked/deployed capital** (e.g. +50% of what was put at risk today)? They behave very differently on a small-position day. Also decide: does hitting the target also imply we're "done for the day" (ties into idea **D**, the standalone "finish trading today" button)?
+`TradierAccountStreamManager` resolves its account **once**, when the socket connects, and holds
+it for the life of the process. Order routing follows the paper/live toggle within ~30s (the
+worker re-reads the user row each loop), so after a mid-session switch:
 
-- **Broker-state reconciliation on engine startup (the right fix for restart + multi-process).** Relates to A2 but takes a different angle: instead of moving the in-process ledger to Redis / DB / sticky routing, **rebuild the ledger from Tradier itself** at `StreamDrivenWorker.start()` before allowing any new signals through. Premise: Tradier's `/orders` (open + pending) + `cash.cash_available` are the real source of truth — the in-process dict is just a milliseconds-window bridging hack between `place_order()` returning and Tradier registering the order in `cash_available`. Reconciling against broker state survives every restart scenario (process, host, future Redis) without introducing new infra.
-    - **Sketch:** on startup, for each user with active strategies, call `trading_client.get_open_orders(user)`, filter to `side='buy'` with non-terminal status, and call `OrderManager._acquire_buy_reservation(user.id, expected_cost)` for each. Key the reservation by `broker_order_id` (not just UUID) so the existing fill-handler can release by the order_id Tradier returns. TTL stays as the safety belt.
-    - **Why not just rely on Tradier's `cash_available`?** It does reflect registered orders, but there's a sub-second post-`place_order` window where it's stale — that's the entire reason the in-process ledger exists. Reconciliation moves that bridging logic from "in-process memory of orders we placed" to "explicit query for orders the broker knows about", which is restart-safe.
-    - **Promote when EITHER becomes true:** (1) deployment moves to multi-process (gunicorn `--workers >1`, multi-replica), so A2's cross-process gap becomes real; or (2) order frequency rises enough that the sub-second post-place window starts statistically coinciding with crashes. Today: single-process + ~19 trade cycles/day = effectively zero risk, the 5-second `_auto_restart` delay already covers the registration window in practice.
-    - **Effort:** ~30–50 lines + a startup test. Smaller than the Redis/DB-row alternatives in A2 because it doesn't add a new state store.
+```
+orders  -> new account, within ~30s
+stream  -> OLD account, until the process restarts
+```
 
-- **🚨 TRADIER SANDBOX FILLS ARE FABRICATED — no strategy metric measured in sandbox means anything.** Discovered 2026-07-14. The engine **must** read LIVE market data (sandbox has no market-data WebSocket, so quotes always come from the live endpoint), but orders **fill in sandbox**. Those are two different price universes and the engine straddles both.
-    - **Proof (the simplest possible invariant): an option cannot trade below its intrinsic value** — that would be free arbitrage. SPY's real tape at 10:34 ET on 2026-07-14 was **752.02**, and the engine's streamed price agreed (751.98). A **749 call** therefore has **$3.00 of intrinsic value**. Tradier sandbox priced and filled it at **$1.84–$2.14**. Impossible.
-    - **Consequence:** entry is recorded at a sandbox fill; the exit is then evaluated against a LIVE quote. `pnl_pct = (3.49 − 1.84) / 1.84 = +89.67%` → *"Take profit hit!"* → the exit fills in sandbox at 1.81 → **actually −1.6%**. A *"Stop loss hit: −15.58%"* realised **+5.1%**. **Exits are effectively random.**
-    - **Measured:** 2026-07-13 — **120 of 121** TSLA exits fired at a price we did not get (mean gap $0.92). 2026-07-14 — **20 of 22** SPY exits, same story. **The engine's logic is correct; the data is fake.**
-    - **This retroactively invalidates** the 31% win rate, the −1.08% mean per-trade return, the −0.146 Sharpe, the "−9.15% expectancy", the 69/31 exit-reason split, and the conclusion that the signal "fires on noise". All were computed from fabricated fills. **We do not know whether these strategies are profitable.** See the corrected `docs/negative-expectancy.md`.
-    - **What sandbox CAN test:** order placement, fill confirmation, reconciliation, the streams, contract selection/reselection, risk gates, not crashing. All verified working 2026-07-14.
-    - **To actually evaluate a strategy** you need real fills and real quotes in ONE price universe: either the **backtester (C1)** against historical option data, or **live with minimal size** — and the latter must not happen before broker-side stops exist (item #1 above).
+Degraded, not dangerous: fills confirm over the 30s REST poll, which is the documented fallback
+and how everything ran before F1. But it is exactly the protection F1 restored, silently absent
+again.
 
-- **The stop-wider-than-target flaw was real, and fixing it was right — but the specific 15/30 ratio was tuned to a fake win rate.** `SL / (SL + TP)` is the win rate you need just to break even; it is arithmetic and does not depend on any data. TSLA ran **SL 20 / TP 15** (needs **57.1%**) and SPY ran **SL 50 / TP 25** (needs **66.7%**) — both indefensible regardless of what the fills say. Both are now **SL 15 / TP 30** (needs 33.3%).
-    - **Revisit the exact ratio** once real fill data exists. The *direction* (target wider than stop) is unambiguous; the magnitude was chosen to sit below an observed "31% win rate" that turned out to be an artifact.
-    - **Churn is real and is NOT a pricing artifact** — timing data doesn't depend on fill prices. Median gap between consecutive TSLA entries on 2026-07-13 was **38 seconds**; 106 of 119 entries came within 90s of the previous one. `MIN_ORDER_INTERVAL_SECONDS = 5.0` blocked **108 of ~233 attempted orders (46%)**. That rate limiter is a governor pinned to the floor, not a safety margin. A re-entry cooldown is still worth adding.
+**Stopgap shipped 2026-09-07:** the environment controls show a dismissible warning after a mode
+switch telling the user to restart the engine.
 
-- **Cold-start latency blows the first orders' fill-confirmation window.** Both `ORDER_UNCONFIRMED` events on 2026-07-13 fired at 13:45:48 and 13:46:20 — within the first 80 seconds of the session's first order (13:45:01), and ~4.5 hours before anything was touched by hand. Both orders **filled anyway**. `_await_terminal_order` (`api/engine/order_manager.py`) polls `get_order` every 1.5s for 30s; the first Tradier round-trips of a session appear slow enough to exhaust it.
-    - **Now survivable, not fixed:** the account event stream (added 2026-07-13, `api/engine/tradier_account_stream.py`) pushes fills so the poll usually wakes in milliseconds, and unconfirmed orders now block further entries + get backfilled on the reconcile tick. But if the stream is down, the same 30s window applies.
-    - **Cheap follow-ups:** warm the Tradier connection at worker startup (one throwaway `get_clock`/`get_profile` before the first signal can fire), and/or give the FIRST order of a session a longer `timeout_s`. Confirm the cold-start theory first by logging poll-loop duration per order — it may just be sandbox latency.
+**Why that stopgap expires.** It assumes the person clicking the toggle can restart the process —
+true only while the engine runs on the same laptop as the browser. Once prod (and likely dev) move
+to a server, EC2/ECS or otherwise, the UI has no idea the engine exists and no way to restart it.
+The banner then instructs someone to do something they cannot do, which is worse than no banner.
 
-- **The unconfirmed-order ledger is in-process (same blind spot as A2's cash ledger).** `OrderManager._unconfirmed_orders` is a class-level dict. It gates new entries while an order's fill is unknown and drives the reconcile-tick backfill — but a restart empties it, so a process bounce mid-timeout silently drops both the entry block and the Trade-row backfill. The broker stays the source of truth (`_reconcile_position` still adopts the position), so this cannot produce a *wrong* position — only a missing trade record and a briefly unguarded entry path.
-    - **Fix alongside A2 / the startup-reconciliation item**, not separately: the same "rebuild in-process state from broker orders at startup" pass that repairs the cash ledger can repopulate this one from Tradier's open/pending orders. Doing it twice would be waste.
+**Real fix, needed before the server move:** the stream must re-resolve its account when the mode
+changes, rather than relying on a human. Options, roughly in order of preference:
 
-- **`TODO.md`'s DONE entry "Fee tracker on the performance page" (2026-05-09, Part 2) is now partly stale.** It concluded "No additional work needed" — but the tile it describes was reading Tradier's `/gainloss`, whose cost basis is corrupt (see the Sharpe/P&L note below). The commission/fee *attribution* logic it describes is probably still fine; the P&L basis underneath it was not. As of 2026-07-13 the page reads `/performance/closed-trades` (engine fill records) instead. Re-verify the fee tile against the new source before trusting it.
+- **(a) Reconnect on change.** The worker already re-reads the user row every loop and calls
+  `db.refresh(user)`. When `selected_trading_mode` differs from the account the stream connected
+  with, tear the socket down and reconnect through the provider. The manager already records
+  `_env_label` / `_account_label`, so the comparison is cheap and needs no new state.
+- **(b) Reject the switch while positions are open**, restarting the stream on the next flat tick.
+  Safer, more annoying, and it does not remove the human step — it moves it.
+- **(c) Refuse mode switches from the UI entirely** once the engine is remote, making the mode a
+  launch flag like `--env`. Most honest for a server deployment: the process gets pinned to an
+  account the way it is already pinned to a database.
 
-- **Tradier's `/gainloss` is not a safe P&L source — treat it as untrusted, in live as well as sandbox.** Its FIFO lot matcher does not retire closed buy lots when the same contract is round-tripped repeatedly in one session: it keeps pairing new sells against early, already-closed, more expensive lots. On 2026-07-13 a single 0DTE contract (`TSLA260713C00405000`, bought and sold 50 times as it decayed 6.10 → 0.39) reported cost 34,908 against a real 14,244 — same 150 contracts, same proceeds, cost inflated 2.45×. The report showed **−21,057** for a day that actually lost **−1,851** (confirmed against `close_pl`, order-fill cash flow, and account equity, which all agree).
-    - **Consequence beyond the dashboard:** if Tradier's LIVE gainloss shares this lot bug, live P&L/tax reporting is equally suspect. The money is always right (fills are fills) — the *report* is not. Compute P&L from fills, never from `gainloss`.
-    - **Still exposed:** `GET /account/gainloss` (`api/tradier_integration/router.py`) and `TradierClient.get_gainloss` remain, and the client hardcodes `page=1, limit=25` with no pagination loop. Either delete the route or paginate it and label it clearly as broker-reported-and-unreliable, so nobody wires a metric to it again.
-
-- **Unify the delta / open-interest defaults across the three places that read them.** The same param keys are defaulted to three different values, so a strategy created *without* `delta_min` / `delta_max` gets silently different criteria depending on which code path is asking. Contract selection defaults to `0.40 / 0.90` (`stream_driven_worker.py:738-740`), the drift re-check to the same `0.40 / 0.90` (`:905-907`), the SignalGenerator entry gate to `0.0 / 1.0` (`signal_generator.py:211-212` — i.e. accepts everything), and the confidence calc to `0.60 / 0.85` (`:568-569`). `min_open_interest` at least agrees on `0` everywhere.
-    - **Not a live bug today:** both current strategies (id=2 TSLA, id=3 SPY) define `delta_min`, `delta_max` and `min_open_interest` explicitly in `params_json`, so all four call sites read identical numbers and the defaults never fire. This is latent — it bites the first strategy created (or seeded from a template) that omits those keys, and it will fail *open*, not closed: the entry gate's `0.0 / 1.0` default accepts any delta.
-    - **Fix shape:** hoist the defaults to one module-level constant dict (or onto the Strategy model as column defaults) and have all four sites read from it. Prefer failing *closed* — a missing delta band should reject, not wave through.
-    - **While you're there:** the entry-gate and confidence blocks in `signal_generator.py` are now genuinely live (they were inert until 2026-07-13, see below), so a wrong default there actually changes trading behavior for the first time.
-
-- **Subscribe reconcile-adopted contracts to the market stream.** `_reconcile_position` adopts a contract straight off the broker when a position is opened outside the engine — manual fill in the Tradier UI, or an app restart mid-trade — by setting `state.option_symbol = occ` (`stream_driven_worker.py:614`; `_startup_sync` does the same at `:524`/`:528`). Neither path calls `stream_mgr.subscribe()`, so no option quotes flow in for that position: `state.option_bid` / `option_ask` stay `0.0` and exit pricing silently falls back to the per-tick REST fetch (`strategy_executor._fetch_option_price`).
-    - **⚠️ CORRECTED 2026-08-25 — it DID hurt, badly. This is the mechanism behind the $223,119 phantom.** The original analysis was right that `_check_exit_signals` falls back to REST, but it only checked the *exit-signal* path. The **mark-to-market** path had no such fallback: `strategy_executor.execute_exit_tick` kept `current_price` as the **UNDERLYING** whenever `ask == 0.0` (exactly the state an unsubscribed adopted contract is in) and wrote it straight to `position.current_price` / `unrealized_pnl`. `_reconcile_position` then used that field as a closing fill price, booking SPY's 747.03 as an option premium. Fixed at both ends 2026-08-25 (marks now come from the held contract's resolved price; the reconcile fallback sanity-checks every candidate against the underlying) — **but the underlying subscription gap this item describes is still open**, so adopted contracts still run on the slower REST path.
-    - **Also true, and still true:** the position's bid/ask never appear in the 30s heartbeat log, which makes a recovered position look half-dead when it isn't.
-    - **Fix shape:** route both adoption sites through the same `_arm_contract` helper the normal path now uses (`:868`), so subscribe + router-add + `streamed_symbols` bookkeeping happen together. The bookkeeping is the part that matters — `_disarm_contract` (`:876`) deliberately refuses to unsubscribe a symbol it never subscribed, precisely because these two paths can hand it one.
-    - **Care required:** this touches the restart-recovery path, which is the one path that can't be safely tested during market hours. Do it deliberately, with a paper restart-mid-position rehearsal, not as a drive-by.
-
-- **Watch for band-edge churn on drift-driven contract reselection** *(added 2026-07-13 alongside the reselection change — observation item, not yet a known bug)*. While a contract is armed but not yet bought, `_check_contract_drift` (`stream_driven_worker.py:886`) re-prices it every `_DRIFT_CHECK_INTERVAL` (30s, `:36`) and disarms it if delta has left the strategy's band, so the next tick selects a fresh strike. The drift check reads greeks from Tradier's **quotes** endpoint; contract *selection* reads them from Tradier's **chains** endpoint. Same vendor and same underlying greeks source, so they should agree — but if they disagree by a hair on a contract sitting exactly on the band edge, the engine can disarm and immediately re-arm the *same* strike, every 30 seconds, indefinitely.
-    - **Bounded, not dangerous:** worst case is one chain pull + one re-subscribe per 30s per strategy. It cannot cause a bad trade — a contract only ever gets bought if it passes the band at entry time. It's a noise/efficiency concern, and a signal that the band is mis-sized.
-    - **Where it would show up first:** TSLA (strategy id=2) has a **0.15-wide** band (0.50–0.65) and SPY (id=3) a 0.25-wide one (0.60–0.85). Those are narrow for 0DTE, where gamma walks delta quickly — expect reselection to fire *legitimately* and often, especially on TSLA.
-    - **The tell:** grep the logs for `drifted out of criteria` (`:935`). Strike actually changing = working as designed. Same symbol repeating every 30s = churn.
-    - **If it churns:** widen the band rather than lengthen the interval (a longer interval just means buying a staler contract). A hysteresis margin — only disarm once delta is outside the band by some epsilon — is the fallback if widening isn't acceptable. Note that selection already scores by *closest to band midpoint*, which is what makes a fresh pick start far from both edges, so churn should be self-limiting unless the band is genuinely too tight.
-    - **Open-interest half is effectively a no-op:** OI barely moves intraday, so the drift check's OI comparison will essentially never trip. Delta is the part doing real work.
-
-- **Verify drift-driven reselection actually fires — it ran in production on 2026-07-13 and we never checked.** Row 3 (`_check_contract_drift`, added that morning) is supposed to disarm a contract whose delta leaves the strategy's band and pick a fresh strike. It ran live all day and **its behaviour was never confirmed**. The suspicious signal: TSLA round-tripped ONE contract (`TSLA260713C00405000`) **50 times** while it decayed from 6.10 to 0.39 — which is what you would see if reselection was NOT swapping strikes.
-    - **How to check:** grep the engine log for `drifted out of criteria`. Strike actually changing = working. Silence across a day where a contract decayed 94% = the drift check never fired, and we should find out why (delta band too wide to ever trip? quote endpoint returning no greeks? the `elif` never reached because the contract stays armed only while flat?).
-    - **Until confirmed, treat Row 3 as unverified in production.** It is tested in isolation but has never been observed doing its job on real market data.
-
-- **⚠️ All `ORDER_PREVIEW_DRIFT` events logged before 2026-07-14 are garbage — DISCARD them before any B2 analysis.** The emit site passed `signal.price` as the "signal price", but on an entry `Signal.price` is the **UNDERLYING** (SPY ~751), not the option premium. So every event compared a stock price against an option premium and logged a "drift" of ~**−99.4%** — which is just `4.83 / 751.22`. **Fixed 2026-07-14** (`order_manager.py` now passes `estimated_price`, the option mid it actually sized from), but the ~149 historical rows (127 on 07-13, 22 on 07-14) are unusable.
-    - **This is the dataset B2 has been waiting on**, so B2's clock effectively restarts from 2026-07-14. Filter on `event_data.signal_price` being option-scale (< ~50) to separate good rows from bad.
-    - Silver lining: this bug is what cracked the sandbox-fills case — it was the only place the underlying price and the option price sat side by side in one record.
-
-- **174 post-cutoff churn trades remain in the history and drag every strategy metric.** Between 2026-07-15 and 08-21 the engine placed 174 entries *after* the 15:45 forced-exit time (12 of them at or after 16:00 ET, when the market was shut — `is_market_open()` let them through on a 60s-stale Tradier clock). Each was sold within seconds by the forced exit; net **−$1,064.46** in pure spread. The entry gate was fixed 2026-08-25 (`forced_exit_time_et()` is now the entry cutoff), but the trades are real records at real prices and were deliberately **left in place**.
-    - **They are separable:** all sit in the 15:45–16:00 ET band. Filter them out before measuring expectancy, win rate or Sharpe, or the numbers understate the strategy by ~$1,064 across ~87 fake round trips.
-    - **Decide:** either tag them (`notes.excluded_from_metrics = true`) so the performance endpoints can filter automatically, or accept the drag and remember to filter by hand. Tagging is the better answer if strategy evaluation is ever automated.
-
-- **`routers/performance.py:174` labels trades with the wrong contract.** It reads `position.option_symbol` to name a closed trade — but `_update_position_entry` **reuses a `qty=0` position row for the next entry**, overwriting that field. Trade 2408 closed `SPY260731C00745000`; its position row now reads `SPY260825C00764000`, a month-later strike. Every historical row on the performance page can therefore be labelled with whatever contract was bought most recently.
-    - `notifications/reports.py` was fixed 2026-08-25 to read `notes.option_symbol` first and fall back to the position row only for older rows. **Apply the same precedence here.**
-    - `close_position` now records `option_symbol` in its notes, so rows written from 2026-08-25 onward are self-describing; the ~1,225 older closes are not and can only ever be labelled approximately.
-
-- **A re-entry cooldown after a stop-out.** Not a data question — a design one. Re-entering 30 seconds after being stopped out is a bet that the thing which just went against you will now go for you. Combined with the 38-second median cadence and a rate limiter that is already rejecting 46% of attempts, the engine is trading as fast as it is permitted to rather than as fast as it has edge for.
-
-- **`TradierClient` has no 429 / rate-limit handling.** `_RETRY_STATUSES = {502, 503, 504}` only (`client.py:24`); the `Retry-After` and `X-Ratelimit-*` headers Tradier sends are ignored entirely. POST is deliberately never retried (correct — avoids double-submits), but a 429 on a GET currently just raises. Not urgent at ~19 trade cycles/day; becomes real the moment order frequency or strategy count rises.
-    - **Three modules bypass the client with raw `requests` and inline API keys**, so they'd miss any retry/limit logic added there: `strategy_executor._fetch_option_price` (`:555-591`, plus dead `live_url` at `:563`) and `utils/market_hours.py:138`. Route them through `TradierClient` when touching either.
-
-- **`api/engine/trading_safeguards.py` is dead code — decide whether to wire it up or delete it.** `PaperTradingSafeguards.validate_strategy_params` is never called by anything (the similarly-named `RiskManager.check_live_trading_safeguards` at `risk_manager.py:487` is a different function). It checks position sizing, that a stop loss exists and is ≥ 10%, that take-profit is < 100%, and warns when there is no time-based exit — all things we *want* enforced, and none of which are.
-    - **If wiring it up:** it rejects any strategy whose `stop_loss_pct` is absent or < 10. Both current strategies now set it (15), so they pass — but confirm before enabling, or strategy creation starts failing.
-    - **It would have caught the 2026-07-13 config.** Not the inverted risk/reward (it doesn't compare SL to TP — worth adding: reject `stop_loss >= take_profit`, the exact flaw that guaranteed the loss), but it *is* the natural home for that check. See `docs/negative-expectancy.md`.
-
-- **`scripts/update_account_size.py` is broken and untracked.** It writes `User.account_size` — **that column does not exist** on the model. Either add the column or delete the script; right now it will `AttributeError` on the first run. Same review needed for `scripts/test_user_update.py` (untracked, unread).
-
-- **Economic-event awareness — record first, gate later.** Log every scheduled macro release (CPI, PPI, NFP, FOMC, ISM) with its **exact ET release timestamp**, plus a 09:00 ET morning summary of what is scheduled today. Report-only: no signal consumption, no auto-disable, engine untouched. Same data-first pattern as B2 (entry-drift) and A1 (GFV reservations). **Design is settled — see BRAINSTORM.md, "Economic-event awareness".** Promote to the numbered list once the release-tier question below is answered.
-    - **A calendar, not a news feed.** SPY dilutes single-name news to nothing; macro hits every position in the same second. The upstream source (Fed FOMC dates, BLS release schedule) publishes a year ahead and is free, so v1 seeds ~20 entries in a repo YAML rather than taking a vendor key and a network dependency. Narrative-news vendors (Benzinga / Polygon / Finnhub / Marketaux) are **deferred, not rejected** — their real value is *unscheduled* events, a category that is essentially empty for an index ETF, and becomes real the day the book holds single names.
-    - **Windows, not days — and the ranking is backwards from intuition.** Danger to *this* book is **FOMC 14:00 > 10:00 releases (ISM/sentiment/JOLTS) >> CPI 08:30**. We enter after `entry_after_open_minutes` and are flat by 15:45, so an 08:30 print resolves *before* we ever have a position — we buy after the IV crush, not into it. The Fed is the one we hold long premium straight through.
-    - **Store timestamps, not dates.** A row saying "today had CPI" can never test a window size. With exact release times we can go back through fills and ask whether entries within 15 / 30 / 60 min of a release did worse, and let the data pick the window — and since MFE/MAE is captured per trade, measure *how hard* they went against us, not just whether they lost.
-    - **Verdict is per-DAY, not per-strategy.** A CPI print is true for every strategy at once. Any future per-strategy column reads the day's row rather than computing its own. New table ⇒ **migrate dev *and* prod before editing `models.py`** (`reload=True` hits the shared DB instantly).
-    - **Scheduler:** copy the two-stage anchor in `services/email_report_scheduler.py` — 03:00 ET cron reads Tradier `markets/calendar`, then a one-shot at `open.start − 30min`. Holidays fall out for free; a flat `CronTrigger(hour=9)` fires on them.
-    - **~~Strategy-direction mapping~~ — already solved.** `engine/signal_generator.py:60` `resolve_direction()` is the single resolver and `schemas.py:211` validates it on write. No `bias` column needed. (Moot for a per-day verdict; unblocks the story-news half if ever built.)
-    - **Deferred gate — `avoid_economic_news` is a lie today.** All eight templates set it (`strategy_templates.py:99,148,198,247,297,346,395,444`) and nothing reads it; the engine advertises the behavior and does not have it. Wiring it up is a **blackout window**, which inherits the engine rules: compose most-restrictive-wins with `signal_generator.py:289` (`entry_after_open_minutes` ∧ `user.trading_window_start` ∧ forced-exit time), never widen them, and let `side='sell'` through so a blackout cannot trap an open position.
-    - **Open:** which release tiers to seed (Fed-only, the big four, or the full ~20 including 10:00 second-tier prints); whether to cross-check the annual seed against a free vendor or trust the published schedules. **Note the evidence limit:** CP-1 makes trades ≤ 2905 untrustworthy and the 174 churn trades drag everything until filtered, so clean history starts 2026-08-25 — roughly one CPI and one FOMC. This cannot be answered retroactively; the value of v1 is starting the clock.
+This interacts with the single-instance rule: the engine cannot scale horizontally (cash ledger,
+settled-cash cache, throttles and unconfirmed-order map are all in-memory class state), so a
+server deployment is one pinned process anyway. That argues for **(c)**, with **(a)** as the
+fallback if the UI toggle must keep working.
 
 ---
 
----
+## G. Entry selection *(from the 2026-09-09 prod review — 14 live round trips)*
 
-# DONE
+Full write-up and the reasoning behind both items: **BRAINSTORM.md, "Entry is a state, not an event
+— and the strike roll is where it costs"**. Nothing here is built. Both items are recorded so the
+decision is made on evidence rather than on a market morning, and both are **blocked on sample
+size** — see the caution at the end of G2.
 
-- [x] **Phantom P&L eliminated — the $223,119 "close" on a Saturday, and three siblings.** `_reconcile_position` books a closing Trade when the broker shows flat but the DB holds qty; when `_broker_close_fill()` found nothing (Tradier `/orders` covers only the **current session**, so any previous-day close is invisible) it fell back to `position.current_price` — which held **SPY's underlying price**, because `strategy_executor.execute_exit_tick` wrote the raw tick price to the position whenever the option quote hadn't arrived. `(747.03 − 3.30) × 3 × 100 = 223,119`. **This silently disabled the daily-loss cap**: `Position.unrealized_pnl` feeds `risk_manager.py:248`/`:448` and the phantom `Trade.pnl` feeds `realized` at `:241`. Fixed at both ends — positions are now marked off the **held contract's** resolved price (never the underlying tick), and `_fallback_exit_price()` walks broker fill → REST quote → own mark, sanity-checking every candidate against the underlying and booking **at cost with an ERROR log** rather than inventing a figure. Four historical rows corrected to expiry settlement (`max(0, SPY close − strike)`, closes from `/v1/markets/history`); all-time P&L **+$220,942 → −$3,035.37**. Originals in `scripts/backups/`, correction in `scripts/fix_phantom_expiry_pnl.sql`, each row stamped `notes.corrected_at`. Prod was empty. Also fixed a missing `×100` in the partial-close `unrealized_pnl` and a `multiplier` scoped inside a sibling branch (a latent `NameError`). _(2026-08-25, Part 2)_
+Everything below is prod only (2026-09-02 → 09-09, live money). Dev is sandbox and its fills are
+fabricated; the 2026-09-08 retraction of a dev-based re-entry finding stands.
 
-- [x] **Forced-exit time is now the ENTRY cutoff — 174 pointless round trips per the last six weeks, stopped.** `check_entry_signal`'s time gate had an upper bound **only when `user.trading_window_enabled`**, which was off. So the 15:45 forced exit sold, and the engine bought again at 15:46 — every day, 174 entries after the cutoff for **−$1,064.46** in spread, 12 of them placed at/after 16:00 ET on a 60s-stale market clock. One straddled the bell (2026-07-31 16:00:41), never exited, expired, and became the phantom above. The gate now reuses `forced_exit_time_et()` as its upper bound so entries stop exactly when exits start and the two can never drift apart. **Note: the EOD exit itself was never broken** — it is the single most common exit reason in the history (71 of the last 60 days' closes). What was missing was its entry-side counterpart. _(2026-08-25, Part 2)_
+### G1. The entry condition is a state, not an event — cash is doing the trade selection
 
-- [x] **`exit_before_close_minutes` floor of 15, enforced in three layers.** Previously opt-in and falsy at `0`, with the strategy form defaulting to `0` and a hint that read *"0 = disabled"*. Now: the engine clamps anything below 15 (`FORCED_EOD_EXIT_FLOOR_MINUTES`, unconditional, composes most-restrictive-wins so a strategy asking 30 still gets 30); the API rejects 0–14 with a 422 (`schemas.py`, deliberately on `StrategyCreate`/`StrategyUpdate` and **not** `StrategyBase` — `StrategyResponse` inherits Base, and a legacy row must stay *readable* even when no longer *writable*); the form defaults to 15 with `Validators.min(15)` and loads a legacy `0` as `15` via `Math.max` (`??` does not fire on `0`, so it would otherwise be permanently unsaveable). The rule is **minimum 15, not "not zero"** — the value counts backwards from the bell, so 5 would be later than the floor and equally broken. _(2026-08-25, Part 2)_
+`price_above_9ema_and_vwap` / `price_below_9ema_and_vwap` describe a condition that can hold for
+hours, not a moment that occurs. So the instant a position closes the condition is still true and
+the engine buys again — not because something new happened, but because nothing changed.
 
-- [x] **Notifications report dollars, not premium.** `notifications/reports.py` computed `multiplier = 100 if is_option_symbol(trade.symbol)` — but **`Trade.symbol` is the underlying** (`"SPY"`), never the OCC symbol, so that was **always False** and email Cost/Proceeds were **100× too small** ($2.23 where $223 was committed). Now joins `Position` and prefers `notes.option_symbol`, adds Capital-deployed / Proceeds / Return-on-capital totals computed over **all** trades rather than the 50 that fit the table, and is restyled to the flat-terminal language (hero P&L, stat tiles, zebra rows, tabular numerals, zero `box-shadow`). Discord embeds moved from a 3-across field grid to an aligned monospace table with `premium → dollars` on one line, Cost / Proceeds / Return %, and readable contract names via new `parse_occ_symbol()` / `format_contract()` (`SPY260825C00745000` → `SPY $745 CALL 8/25`). `close_position` now records `option_symbol` in its notes so a close can be attributed to a contract at all — the position row cannot answer that, since closed rows are reused. Both channels test-sent and verified. _(2026-08-25, Part 2)_
+How long the engine kept **attempting** entries after its last executed trade of the day:
 
-- [x] **Data-accuracy checkpoint system.** `scripts/verify_data_checkpoint.sql` asserts seven invariants the 2026-08-25 fixes guarantee, scoped to post-checkpoint rows so historical damage can't mask a regression. It is self-validating — run it with `cp_trade_id=0` and checks 2/3/5 **fail** against history (186 / 4 / 1225 rows), which is how a PASS is known to mean something. Registry at the top of `JOURNAL.md` (grep `DATA ACCURACY CHECKPOINT`) with instructions for adding CP-2. **CP-1 (`trades.id > 2905`) is PENDING** — it opens at the first engine start after these fixes deploy, not on the date they were written. _(2026-08-25, Part 2)_
+| Day | Last fill (ET) | Still attempting until (ET) | Executed | Blocked attempts |
+|---|---|---|---|---|
+| 09-02 | 11:15 | **15:43** | 3 | 450 preview-rejects + 141 throttles |
+| 09-04 | 11:07 | **15:44** | 3 | 478 + 175 |
+| 09-08 | 10:25 | **15:41** | 3 | 98 throttles |
+| 09-09 | 11:01 | **13:39** | 3 | 53 throttles |
 
-- [x] **Tradier is now the only broker — Alpaca and Schwab fully removed (91 files).** Deleted `api/alpaca/` (a vendored copy of the alpaca-py SDK, committed to the repo — which is why `import alpaca` resolved even though `alpaca-py` was never in the venv), `api/schwab_integration/`, the whole `api/services/market_data/` tree (`chain_fetcher`, `enhanced_service`, `realtime_aggregator`, `service` — all Alpaca-backed), `api/utils/multi_stream.py`, `api/services/strategy_worker.py` (the dead legacy polling worker), the Schwab auth/token scripts, `api/debug/check_chain_data.py`, nine Alpaca test scripts, and `ui/src/app/services/schwab.service.ts`. Unmounted the Schwab router from `app.py`, dropped all eight `ALPACA_*`/`SCHWAB_*` keys from `config.py`, deleted `TradingClientManager._get_schwab_client()` (never called — `get_client` routed both modes to Tradier anyway), and stripped the dead Alpaca/Schwab branches from `order_manager`'s three `_extract_*` parsers. **The UI was naming the wrong broker in the real-money confirmation dialog** ("Live trading uses REAL MONEY via Schwab API!", "Paper trading with Alpaca") — corrected to Tradier Sandbox / Tradier Live, as was the live-switch logging in `system.py`. Verified: app boots, 89 routes, **zero** Alpaca/Schwab modules loaded, Tradier contract selection intact, UI typechecks. Architecture diagram updated. _(2026-07-13)_
-- [x] **Alpaca removed from the live engine greeks path.** `_refresh_greeks` was calling Alpaca's option-snapshot endpoint every 5 minutes per strategy — a *blocking* HTTP call on the shared event loop — and Alpaca's free tier returns **no greeks**, so it wrote `None` over `None` forever. Because both gates in `SignalGenerator` are guarded on `is not None`, the **delta band and `min_open_interest` filters were silently skipped on every entry, permanently, since the day they were written**. Greeks now come from the Tradier chain at contract selection (zero extra API calls — selection already reads them). _(2026-07-13)_
-- [x] **Drift-driven contract reselection.** A contract was armed once and then held — sometimes for hours — while 0DTE gamma walked its delta out of the strategy's band, and it was bought anyway. `_check_contract_drift` now re-prices the armed contract every 30s via `get_quotes(greeks=True)` and disarms it if it has left the band, so the next tick selects a fresh strike. Disarming (rather than just rejecting the entry) is what avoids a deadlock: selection only runs when `option_symbol is None`. Also fixed a **subscription-accounting bug found in the re-audit** — teardown used a stale startup snapshot, so a strategy that swapped contracts would unsubscribe a symbol another live strategy was holding, killing its market data. Each strategy now tracks its own `streamed_symbols`. _(2026-07-13)_
-- [x] **Unconfirmed-order safety + fill backfill.** On 2026-07-13 two orders filled at the broker while `_await_terminal_order` timed out at 30s; the engine wrote no Position row and believed it was flat while holding 6 TSLA contracts — no stop, no take-profit, free to stack another entry. Now: an unconfirmed order **blocks further BUYS** for that strategy (never sells — an exit must always run), and the reconcile tick re-polls it and backfills the Trade row at the broker's real `avg_fill_price`. `_reconcile_position` also writes a Trade row when a position is closed **outside** the engine (a hand-close in the Tradier portal previously zeroed the position but dropped its −$104 from P&L history entirely). _(2026-07-13)_
-- [x] **Tradier account/order event stream.** `api/engine/tradier_account_stream.py` subscribes to order lifecycle events so fills are **pushed** instead of polled — `_await_terminal_order` now sleeps on the stream and wakes in milliseconds. It is an *accelerator, not a replacement*: REST polling remains the fallback, so if the stream drops the engine behaves exactly as before. Confirmed a market stream and an account stream **run concurrently** (Tradier's "one session at a time" is per stream-type; separate session endpoints and sockets) — verified live against sandbox. Note the account event carries **no symbol and no side**, and names its quantity `executed_quantity` (not REST's `exec_quantity`), so it is only ever a notification keyed on order id. _(2026-07-13)_
-- [x] **Performance page P&L no longer comes from Tradier's `/gainloss`.** That report's FIFO lot matcher does not retire closed buy lots when a contract is round-tripped repeatedly, so it reported **−$21,057** for a day that actually lost **−$1,851** (one 0DTE contract bought and sold 50 times as it decayed 6.10 → 0.39: real cost 14,244, reported cost 34,908). It is also paginated, so a busy day was truncated on top of being wrong. New `GET /performance/closed-trades` computes from the engine's own `Trade` rows, which pair each exit with the entry that opened it at fill time — correct by construction, no lot matching. Added the missing **1D** period filter. Also fixed `calculate_performance_metrics`, which read `t.entry_price` and `t.asset_class` — **neither column exists on `Trade`** — and had been returning HTTP 500 for any strategy with trades. _(2026-07-13)_
-- [x] **Negative-expectancy fix + 2026-07-13 P&L reconciled to the cent.** Both strategies ran a stop loss WIDER than their take profit (TSLA 20/15 → needed a 57% win rate; SPY 50/25 → needed 66.7%) — and SPY's `params_json` carried **both** key spellings with different values, with `signal_generator.py:355` reading `_pct` first, so **the UI showed a 15% stop while the engine enforced 50%**. Both now 1:2 (SL 15 / TP 30, break-even 33.3%), with all four keys and both columns written together so nothing can silently disagree again. `scripts/reconcile_2026_07_13.py` backfilled the three fills the engine dropped and repriced one adopted-position exit, bringing the DB to **−1,851.00**, matching the broker exactly. **⚠️ Corrected 2026-07-14:** the original claim that "the strategy is still negative-EV at its measured 31% win rate (−1.08%/trade, Sharpe −0.146)" was **wrong** — those numbers came from Tradier sandbox fills, which are fabricated (sandbox filled a 749 call at 1.84 while SPY was at 752, i.e. **below intrinsic value**). The *structural* fix (stop wider than target) was right; the *performance* claims were built on fiction. See the corrected `docs/negative-expectancy.md`. _(2026-07-13, corrected 2026-07-14)_
-- [x] A view in performance that shows a calendar with each day being green or red with the gain/loss inside the data block. _(2026-05-03)_
-- [x] Dark mode + colorblind mode (blue/orange palette) toggleable from the user menu. CSS custom properties (`--color-profit`, `--color-loss`, `--surface`, `--text`, `--border`, etc.) drive theming; future UI work should use these tokens instead of hardcoded colors. _(2026-05-03)_
-- [x] Account-level trading window. Toggleable per-user start/end time (ET, "HH:MM") in the user menu; layers on top of per-strategy `entry_after_open_minutes` / `exit_before_close_minutes` with most-restrictive-bound-wins semantics so users can never widen past strategy defaults. _(2026-05-05)_
-- [x] Time-exit visibility & editability — open positions appearing to auto-close at fixed intervals were strategy-defined (`params_json.max_hold_time_minutes`), not engine-defined. Added a 30s INFO heartbeat per active strategy in `stream_driven_worker.py` so the loop is never silent. Surfaced `max_hold_time_minutes`, `entry_after_open_minutes`, `exit_before_close_minutes`, and trailing-stop fields in the strategy edit form so the value can be tuned without DB pokes. Strategy 3's value remains 30 — user judgment call whether to set 0 / 90 / 120. _(2026-05-06)_
-- [x] Per-user Discord notifications for trade opens and closes. Replaced the "SMS notifications" idea after weighing Twilio cost / A2P 10DLC overhead against existing Discord patterns — Discord is free, instant, and formats embeds nicely. Per-user webhook URL stored in `User.notification_preferences.discord` (JSON column), opt-in toggles for open/close, "Send test message" button in the dialog. SSRF-guarded: schema validator + dispatcher both reject anything that isn't an official Discord webhook host. Fire-and-forget daemon thread so a slow webhook never blocks the post-fill path. _(2026-05-06, Part 2)_
-- [x] Discord close-notification audit: confirmed exactly one fire per real fully-closed position across all three call sites (`close_position` post-terminal-filled, `_update_position_exit` post-fully-closed, runtime `_reconcile_position` for broker-UI manual closes). Every bailout (throttle/preview-fail/broker-reject/unconfirmed/non-filled-terminal) returns before notify. Reconcile early-returns on local qty<=0 so it can't double-fire after a strategy-driven close. `apply_trade` referenced in the original TODO doesn't exist in the code; startup-sync manual-close path stays silent by design. _(2026-05-09)_
-- [x] End-of-period email reports (daily/weekly/monthly/quarterly/yearly) via Resend. Two-stage scheduler: 03:00 ET cron pulls `markets/calendar` for today's actual close (handles early-close days), schedules a one-shot DateTrigger at close+30min. Dispatcher iterates opted-in users and per-user fires daily always, weekly/monthly/quarterly/yearly only on the period's last trading day (next-open lookup against the live calendar). Daily/weekly skip empty periods; monthly+ always send. Aggregation reads `Trade` rows (closing legs only, anchored on `exit_timestamp` in ET-localized windows). Self-contained inline-styled HTML email + plain-text fallback. Per-user prefs in `User.notification_preferences['email_reports']`; opt-in dialog in the user menu with per-period checkboxes, "Send test report" button (real-shaped daily report), and an "off" banner when disabled. _(2026-05-09)_
-- [x] User profile editing — name, email and password change in a "Profile" entry on the user menu. Email-uniqueness check on PATCH so a collision returns a clean 400 instead of a DB unique-violation 500. Password change requires `current_password` + `new_password ≥ 8 chars`. JWT subject migrated from email → user id (`str(user.id)`) so an email change mid-session no longer invalidates the access token; existing tokens require one re-login after deploy. Email change automatically re-targets email reports because the dispatcher reads `User.email` at send time. _(2026-05-09)_
-- [x] Fee tracker on the performance page. Confirmed already in place: `Trade.fees` + `Trade.commission` are populated from Tradier `account/history` (regulatory fees joined per close day, commission joined per open/close day with symbol+date matching). Performance page surfaces a dedicated "Costs (Commission + Fees)" tile with the breakdown sub-line, plus a "Net P&L" tile that subtracts costs from realized P&L (`performance.component.ts:186-189, 226-239`). Per-position attribution writes `commission`/`fees`/`net_pnl` onto every closed-position row (`performance.component.ts:455-462`) so the trade table can show them. No additional work needed. _(2026-05-09, Part 2)_
-- [x] Account-wide daily loss cap + dashboard visibility. New `User.daily_loss_limit_pct` (default 5%, bounded 0.5–20). `RiskManager._check_user_daily_loss_limit` sums realized+unrealized PnL across all of a user's strategies for the day and halts new entries account-wide once breached; sells stay open so existing positions remain closeable. Wired before per-strategy checks in `validate_pre_trade` (most-restrictive-bound semantics). New `GET /risk-events/account-status` powers an overview-page session-status tile (PnL with realized/unrealized split, % cap consumed, $ remaining before halt, status badge OK / WARNING / HALTED at 0/80/100, progress bar that switches color via SCSS class). Refreshes every 30s so unrealized ticks don't go stale. Profile dialog gained a Risk-limits section. New `--color-warning*` tokens added to `styles.scss`. See journal 2026-05-09 (Part 3). _(2026-05-09, Part 3)_
-- [x] Role-based access (RBAC). Five roles defined in `auth.py`: `user`, `admin`, `viewer`, `auditor`, `strategy_author` (Pydantic-validated). Layered enforcement: router deps `require_can_write_own` (blocks viewer/auditor), `require_can_place_orders` (blocks viewer/auditor/strategy_author), `get_current_active_admin_or_auditor` (read-cross-user), `get_current_active_admin` (admin-only writes). Engine-level gate at the top of `order_manager.execute_signal` blocks `side='buy'` for non-trading roles so a strategy worker that survived a role demotion can't bypass the router gate; sells go through. New `routers/admin.py` with read-only `/admin/users` list/detail/dashboard/strategies/positions/trades and admin-only `PATCH /admin/users/{id}/role` (with self-demotion guard). New Angular admin Users page (table + slide-in detail panel + role dropdown for admin / read-only pill for auditor), `adminGuard`, role badge in user menu, role-aware sidenav. Admin scope is observe-only by deliberate decision — no act-as-user path. See journal 2026-05-09 (Part 3). _(2026-05-09, Part 3)_
-- [x] UI auth-header fix on new services. `risk.service.ts` (broke the overview's session-status tile with a 401) and `admin.service.ts` (would have 401'd every admin page request) were calling the backend without `Authorization: Bearer <token>`. Both now build their own `getHeaders()` returning the token from `localStorage('access_token')`, matching the convention used by every other service in the codebase. The Angular UI does NOT use an `HTTP_INTERCEPTORS` provider — `app.config.ts` calls `provideHttpClient()` without `withInterceptors([...])`, so each service is responsible for attaching the token manually. Future refactor opportunity: switch to `withInterceptors([authInterceptor])` so this class of bug can't recur (~8 files to touch). _(2026-05-09, Part 4)_
-- [x] Reservation-ledger code audit + sandbox concurrency probe + entry-drift logging (A1 forward-progress). Audited `_preview_or_abort` and the reservation helpers — release-path try/finally is sound, no `await` between cash check and reservation acquire (same-loop concurrent signals atomically serialized), `cost` field correctly used per Tradier docs, sells correctly skip the gate. Wrote `api/debug/probe_buy_reservations.py` — fires N concurrent `_preview_or_abort` calls via `asyncio.gather` and asserts only `floor(effective_cash / required_per_order)` succeed. Default mode is preview-only (no real orders placed). Wired `ORDER_PREVIEW_DRIFT` event on every option buy (signal_price vs preview_per_contract) — observation only, no cancel logic. A1 still pending the actual sandbox probe run. B2 cancel-on-drift decision pending data + A1. See journal 2026-05-09 (Part 4). _(2026-05-09, Part 4)_
-- [x] Per-strategy equity curve charts on the strategies page. New `GET /performance/equity-curves` returns `[{strategy_id, name, points: [{t, cum_pnl, trade_pnl}]}]` — running sum of `Trade.pnl` over closing trades (`exit_timestamp` + `pnl` not-null), ordered ascending, realized only (open-position unrealized intentionally excluded so the curve is stable). New "Equity" column on the strategies table renders an inline Chart.js sparkline (no axes, no tooltip) plus the lifetime-cumulative dollar amount, color-keyed via `themeService.chartColors()` so it follows theme/CB toggles live. Click → `EquityCurveDialogComponent` with full Chart.js line, hover tooltip (trade #, full timestamp, this-trade PnL, cumulative), and four stat tiles (total realized, best trade, worst trade, win rate). Strategies with zero closed trades show "—" — the canvas only renders for non-empty curves. Route ordering matters: `/equity-curves` is registered before `/{metrics_id}` so the path-param doesn't capture the literal. _(2026-05-09, Part 5)_
-- [x] Broker routing fix — live trading mode now uses Tradier Live instead of Schwab (E1). Modified `TradierClient.__init__()` to accept optional `env` parameter (defaults to `settings.TRADIER_ENV` for backward compatibility). Updated `TradingClientManager` to route both `paper` and `live` modes to Tradier (sandbox vs live respectively), removing Schwab from the normal client selector path. All trading methods (`place_order`, `preview_order`, `get_account`, `get_history`, `get_positions`) now use Tradier for both modes. Schwab integration remains mounted but is no longer reachable through standard trading flows. Fully backward compatible — existing code continues to work. _(2026-07-08)_
+On 09-02 that is **5h21m** of continuous demand producing 3 trades. **Settled cash and the 5-second
+throttle chose which 3 — the strategy did not.**
+
+**Consequence that changes the order of work:** funding the account (E2b) does not fix this, it
+*exposes* it. The T+1 cash ceiling is currently the only thing bounding trade count, so more capital
+means more of exactly the entries this item is about. Whatever selectivity rule lands should land
+before, or with, the funding decision.
+
+Related: E12 (`check_market_regime` is declared and read by nothing) is the natural home for a
+"should we be trading at all right now" filter; this item is the narrower "is *this* entry a fresh
+setup" question. They compose but are not the same gate.
+
+### G2. Re-entry on a rolled strike is 0 for 3 — and a blanket cooldown is the wrong lever
+
+14 round trips, net **+$319**, 8W/6L (2 take-profit, 6 stop-loss, 6 trailing-stop exits). The
+obvious cut says nothing: first-trade-of-day +$157 over 5, re-entries +$162 over 9. The cut that
+separates is **whether the engine had to select a different contract**:
+
+| Bucket | n | Record | P&L |
+|---|---|---|---|
+| First trade of the day | 5 | 4W-1L | **+$157** |
+| Re-entry into the **same contract** | 6 | 4W-2L | **+$309** |
+| Re-entry on a **newly selected strike** | 3 | **0W-3L** | **−$147** |
+
+All three losers, three different days, both sides of the chain:
+
+| Day | Rolled | After | Entry | Result |
+|---|---|---|---|---|
+| 09-02 | C760 → **C763** | SPY rallied, C760 ran 3.27 → 5.28 | 2.96 | −$46 |
+| 09-08 | P773 → **P769** | SPY fell, P773 ran 5.72 → 6.27 | 2.72 | −$39 |
+| 09-09 | P769 → **P766** | SPY fell, P769 ran 5.36 → 5.79 | 2.64 | −$62 |
+
+**The mechanism is the delta band, and it is late by construction.** After a winning move the held
+contract goes deep in the money, delta climbs past the 0.85 ceiling, and `_select_option_contract`
+reaches for a strike back inside 0.60–0.85 — always further along the direction price *just
+travelled*, at roughly half the premium. The engine ends up buying the continuation of a move that
+already happened, at its point of maximum extension.
+
+MFE confirms it. Both roll entries with excursion data peaked at +10–11%, never reached the +15% that
+arms the trail, and reversed into the stop — while the *same contract* re-entered minutes later ran
+to +22.8% and +59.4%:
+
+| Trade | Best point (MFE) | Armed trail? | Outcome |
+|---|---|---|---|
+| 09-08 P769 (roll) | +11.4% | no | −14.3% |
+| 09-09 P766 (roll) | +10.2% | no | −16.7% |
+| 09-08 P769 (same contract) | +22.8% | yes | +13.4% |
+| 09-09 P766 (same contract) | +59.4% | yes | +43.8% |
+
+**This corrects the standing "re-entry cooldown after a stop-out" item** (FUTURE CONSIDERATIONS). A
+blanket cooldown blocks the +$309 bucket along with the −$147: five of the six same-contract
+re-entries came back within 90 seconds, including the +$153 and the +$126. **Pause on contract
+*change*, not on elapsed time.**
+
+**Cheapest testable shape, when the time comes:** after a strike roll, require price to re-establish
+the setup before arming — minimum version, a touch back to the 9 EMA. It is an entry gate in
+`stream_driven_worker`, so it composes most-restrictive-wins, only ever removes trades, and must
+leave `side='sell'` untouched. Same-contract re-entries pass through unchanged.
+
+**Do NOT build this yet — the sample cannot carry it.** The losing bucket is **n=3**; the winning
+bucket's +$309 rests on two trades (+$153, +$126). The mechanism is legible and matches theory,
+which is why it is worth building *around*, but E11's thresholds still govern: ~62 round trips for a
+first read, ~126 for a confident one. Tuning an entry rule on n=3 is how the retracted 31%-win-rate
+analysis happened. Also note the roll entries and the E7 open-interest starvation are the same
+selector reacting to price history — measure whether a roll gate duplicates an effect E7 already
+produces by accident before adding a second one.
+
+**What to compute when the sample arrives** (all from existing columns — no schema change):
+
+- Re-entry outcome split by *contract changed / unchanged*, with a confidence interval.
+- MFE distribution for roll entries vs. all others. If roll entries systematically top out below the
+  +15% activation, that is the number that justifies the gate.
+- Time-since-prior-exit as a control, to confirm the separating variable is the contract change and
+  not the gap. In this sample the two are confounded — fast re-entries were mostly same-contract.
+- How often a roll entry would have been *avoided* rather than merely delayed by a 9-EMA touch
+  requirement, i.e. what the rule actually costs in missed trades.
+
+### G3. ~~`ema_period: 9` is nine SECONDS — and raising it past 100 deletes the gate~~ *(FIXED 2026-09-10 — warm-up seeding still open, and UNCOMMITTED)*
+
+> **Fixed in the working tree 2026-09-10, not yet committed.** Both parts of the fix shape below
+> landed, and the live sessions on **2026-09-11 and 2026-09-14** ran on it (engine processes started
+> after the 21:28 PT save on 09-10). `api/tests/test_bar_aggregation.py` pins it and passes.
+>
+> - **Bars.** `_update_history` folds ticks into 1-minute bars; only completed minutes reach
+>   `price_history`, so `ema_period: 9` is nine minutes and `max_history_length = 100` is 100
+>   minutes. Bar volume is differenced from the exchange cumulative counter (`cum_volume`), not
+>   summed from sampled ticks. `volume_ratio` = last completed minute ÷ mean of the last 20.
+> - **Fed unconditionally.** The update moved out of `check_entry_signal` into
+>   `strategy_executor.execute_strategy_tick`, ahead of every gate, so indicators keep moving while
+>   a position is open and during the re-entry cooldown.
+> - **Missing indicator now blocks.** An EMA, VWAP or volume baseline that cannot be computed yet
+>   returns no signal instead of silently skipping the gate — `ema_period > 100` no longer deletes
+>   the filter. Entries only; exits untouched.
+> - VWAP is still fed every tick, on purpose (measured fine, see trap 2).
+>
+> **Still open — the warm-up cost named under "Before building".** Nothing seeds history from
+> Tradier historical bars. After any restart the strategy takes no entries for ~9 minutes (EMA) and
+> ~20 minutes (volume baseline needs 20 usable bars). That is the safe direction — blocked, not
+> ungated — but a mid-session restart now costs ~20 minutes of entries.
+>
+> **Does not change the verdict below.** The measurement further down already showed the repaired
+> stack has no directional edge on this tape; the fix makes measurement trustworthy, it does not add
+> an edge. G4 is no longer waiting on this item.
+>
+> Everything below is the original write-up, kept for the reasoning.
+
+**Not a tuning question. The indicator does not measure what its name says.**
+
+`stream_driven_worker._EVAL_INTERVAL` is **1 second**, and `signal_generator._update_history`
+appends exactly one price per `check_entry_signal` call. So `price_history` holds one sample per
+second and `ema_period: 9` is a **9-second EMA**. `max_history_length = 100` caps the whole buffer
+at 100 seconds — under two minutes of history for every indicator built on it.
+
+Measured against the recorded SPY tape (09-02, 09-08, 09-09; 6.5h each, 1s samples):
+
+| | crosses spot | median distance from spot |
+|---|---|---|
+| **9-second EMA** (what runs today) | **11.9–12.2 / min** (~4,700 a day) | 0.17–0.18 bp |
+| 9-minute EMA (what "9-period" implies) | 0.2 / min (~80 a day) | 1.46–1.47 bp |
+
+The gate flips sides about every five seconds and sits ~0.17 bp from price. It is not a weak trend
+filter — at 1 Hz evaluation it is satisfiable within essentially any minute, so it removes almost
+nothing.
+
+**This refines G1 rather than repeating it.** G1 reads the all-day demand as "the condition is a
+state that holds for hours." The measurement says something narrower and more fixable: the EMA
+*component* is near-random and near-always passable, so it contributes no selection at all. The
+persistence G1 documents is real; the EMA is not the part providing it.
+
+Directional test on the underlying — 1,010 distinct signal-minutes over 4 prod sessions (calls 502,
+puts 508), deduped to one observation per minute per direction. Measured on **SPY**, not the option,
+so it needs no option quotes and cannot be flattered by stop/target geometry:
+
+| Rule | right at +15m | right at +30m |
+|---|---|---|
+| Current (9EMA + VWAP + volume) | 45.6% | **43.0%** |
+| …calls only | 48.6% | 47.0% |
+| …puts only | 42.7% | **39.1%** |
+| *Baseline — long at any minute* | *51.0%* | *50.6%* |
+| Opening Range Breakout (09:30–10:00) | 58.1% | **59.0%** |
+
+Below a coin flip, and below simply being long. **Caveat: all four sessions drifted upward**, which
+flatters anything long and punishes puts — a meaningful share of the put result is direction of tape,
+not signal quality. Do not read 39.1% as "the put rule is broken" without a down-tape sample.
+
+**Two traps that make this worse than it looks:**
+
+1. **You cannot fix it by raising `ema_period`.** `_calculate_ema` returns `None` when
+   `len(prices) < period`, and `check_entry_signal` **skips the EMA gate entirely when it is
+   `None`**. With the buffer capped at 100, any `ema_period > 100` silently *removes* the filter
+   instead of lengthening it — no log, no event, strategy still reads Active. Anyone reaching for
+   `ema_period: 540` to get nine minutes gets no EMA check at all.
+2. **The same buffer feeds VWAP and the volume gate — but they are NOT equally damaged.**
+   `volume_ratio` = size of the last single trade ÷ mean of the last 20 sampled trade sizes, about
+   20 seconds of history. That is tick noise, not a volume spike, and `min_volume_multiplier: 2.0`
+   gates on it.
+
+   **VWAP, however, measures fine — corrected 2026-09-10.** An earlier note here claimed the
+   sampling made it "not VWAP". Measured against today's tape it does not:
+
+   | VWAP version | value | vs best estimate |
+   |---|---|---|
+   | Engine (1 sampled trade/sec) | 758.559 | **+0.117** |
+   | Every delivered stream event (~7/sec) | 758.545 | +0.102 |
+   | Cumulative-volume weighted (closest to true) | 758.442 | — |
+
+   **12 cents, about 1.5 bp**, and the `price < VWAP` gate returns the same answer as the
+   cvol-weighted version **98.6%** of the time (846 disagreements across 61,904 trade events).
+   Sampling is uncorrelated with price, so it is an unbiased estimator and the error averages out
+   over thousands of samples. Note the stream itself only delivers ~37% of traded volume as
+   individual prints, so *no* reconstruction from it is exact — the engine is already close to the
+   best that feed supports.
+
+   **This is the key distinction: the EMA problem is a TIMESCALE error, VWAP's is a sampling error.**
+   A 9-second EMA is a different object from a 9-minute EMA, not a noisy version of one. A sampled
+   VWAP *is* a noisy version of VWAP, and the noise is small. Do not spend effort "fixing" VWAP
+   expecting a behaviour change.
+3. **Both indicators FREEZE while a position is open.** `_check_entry_signals` returns early on the
+   `max_positions` check (`strategy_executor.py:277`) and on the 30s `_check_reentry_cooldown`
+   *before* calling `check_entry_signal` — and `_update_history` is the first line inside it. So for
+   the entire duration of every trade, no price enters the deque and no volume enters the VWAP
+   accumulator.
+
+   Two consequences that matter:
+   - The EMA's 9 samples can straddle the hole. Immediately after a 20-minute hold, the "9-second
+     EMA" is comparing now against prices from 20 minutes ago, then collapses back to 9 seconds
+     within nine ticks. **Effective lookback is a function of how long the last trade lasted.**
+   - **Re-entry decisions are made inside that window.** This is a mechanism G2 did not have: the
+     0-for-3 rolled-strike re-entries were each evaluated against an EMA polluted by the hold that
+     had just ended. Check this before attributing that result solely to the delta-band roll.
+
+   VWAP's gaps land on the periods active enough to have triggered an entry, which is not random —
+   but given the 1.5 bp sampling error measured above, treat this as a correctness wart rather than
+   a source of bad decisions until someone measures it costing something.
+
+   It also **gets worse as the account grows** — cash starvation kept the strategies flat most of
+   each session, so the holes were small. More funding means more time in a position means larger
+   holes. Same shape as G1's warning about E2b.
+
+**Measured 2026-09-10: the fix does NOT improve the signal.** Both stacks were rebuilt from the
+recorded SPY tape and asked the same question — when you fire, does SPY then move your way? The
+broken reconstruction lands at 44.0% hit at +15m against the live engine's 45.6%, which says the
+reconstruction is faithful. The repaired stack (1-minute bars, VWAP from *every* trade, volume
+compared minute-to-minute):
+
+| `min_volume_multiplier` | signals / 4 sessions | per day | hit @ +15m | avg bps @ +15m |
+|---|---|---|---|---|
+| 1.0x | 498 | 124 | 45.9% | +0.02 (CI −0.72 to +0.75) |
+| 1.2x | 224 | 56 | 46.0% | +0.49 (CI −0.67 to +1.64) |
+| 1.5x | 76 | 19 | 46.4% | +0.37 (CI −1.49 to +2.22) |
+| 2.0x (today's value) | **15** | **4** | 50.0% | +0.42 (CI −4.35 to +5.19) |
+| *broken stack, for reference* | *1,869* | *467* | *44.0%* | *−0.27* |
+| *baseline — long at any minute* | *1,725* | *431* | *51.0%* | *+0.32* |
+
+At the thresholds with real sample size (498 and 224 signals) this is **tightly measured as no
+edge**, not merely unproven — the CIs are narrow and centred on zero, and every row still sits below
+simply being long. Repairing the timeframe produces *fewer signals of the same quality*, not better
+ones. **The defect is in the implementation; the problem is in the premise.** Price-above-EMA-and-
+VWAP does not predict SPY direction on this tape at either timeframe.
+
+Caveat: 4 sessions, all up-drifting. A down-tape sample could read differently, and the concept is
+not disproven in general — only measured as flat here.
+
+**So fix it, but not for performance.** The reasons that survive: an indicator that does not mean
+what its name says is a permanent trap for anyone tuning it; `ema_period > 100` silently deleting the
+gate is a live footgun; and no future entry work (ORB, regime, trendlines) can be evaluated on a
+buffer that samples once a second and stops during trades. It is foundation work, not an edge.
+
+**Recalibrate `min_volume_multiplier` in the same change.** Today it compares ONE TRADE against 20
+recent trades — individual trade sizes are heavily skewed, so 2.0x clears constantly (467 signal-
+minutes a day). Barred, it compares ONE MINUTE against 20 recent minutes, and minute volumes barely
+vary — 2.0x then clears **4 times a day**. Porting the number across unchanged silences the strategy
+without anyone touching a setting. ~1.0–1.2x is the range that reproduces a comparable signal count.
+
+**Fix shape:** two parts, and the second is not optional.
+1. Bar `_update_history` into 1-minute candles (OHLC + summed volume per minute) and hold the deque
+   in *bars*, so `ema_period: 9` means nine minutes, VWAP sums real per-minute volume, and
+   `volume_ratio` compares a minute against recent minutes.
+2. **Feed the history unconditionally**, from the tick path rather than from inside the entry gate,
+   so it keeps updating while a position is open and during the re-entry cooldown. Barring alone
+   still leaves holes the length of every trade.
+
+Contained to `signal_generator` plus the call site that feeds it; changes no exit path and no order
+path.
+
+**Before building, three things to settle — this is a live entry-path change:**
+
+- **Warm-up becomes a real cost.** A 9-minute EMA needs 9 minutes of bars. `entry_after_open_minutes:
+  30` covers a clean start, but a **mid-session restart currently needs 9 seconds and would then need
+  9 minutes** with nothing tradable in between. Seeding from Tradier historical bars
+  (`docs/tradier/market/`) is the obvious answer and should land with the change, not after it.
+- **The replay cannot validate this.** `scripts/replay_session.py` prices the contracts the engine
+  actually armed; a different entry rule arms different contracts, and no quotes exist for those.
+  This needs a paper session to generate its own logs, then a replay of *those*. Same constraint
+  applies to ORB.
+- **Both live strategies change behaviour at once.** Expect the signal count to fall sharply — the
+  gate currently removes almost nothing. Fewer signals is the intent, but it interacts with G1/G2 and
+  with E2b's sample-size problem: this makes samples *scarcer* while E11 is waiting on n.
+
+**Sequencing.** Same note as G1: this belongs before, or with, the funding decision (E2b). Funding
+does not fix a signal that tests below a coin flip; it buys more of it. But given the measurement
+above, **do not let this item hold up entry-rule work** — repairing the buffer is a prerequisite for
+*evaluating* a new entry rule, not a substitute for finding one. If effort is scarce, the ordering is:
+fix the buffer (so measurement is trustworthy) → build a candidate rule with actual directional
+information → measure it. Not: fix the buffer and expect the numbers to move.
+
+**Do not treat the ORB row as a recommendation.** n=105 breakouts over 4 sessions, and its **+3.69 bp**
+average edge at 30 minutes sits well inside the noise the stop is set against. Measured this session:
+a 15% stop on a 10:00 ET contract (avg premium $3.47, delta ~0.70) needs SPY to travel **9.7 bp**
+against you, while SPY moves **2.1 bp/min** at that hour — so the edge is smaller than one typical
+minute of drift. ORB is the only rule measured so far whose directional information has a CI that
+separates from zero, which makes it the first candidate worth *building to measure* — not a setting
+to switch on.
+
+**Related measurement worth recording** (same session, recorded tape): contract premium falls ~4x
+through the day ($3.47 at 10:00 → $0.89 at 15:30) while SPY's movement only halves (2.1 → 1.2
+bp/min). A **fixed** 15% stop therefore sits progressively deeper inside the noise as the session
+runs — ~4.6 minutes of typical drift away at 10:00, ~2.1 minutes by 15:30. Relevant to E3 (do not
+retune the stop on thin data) and to any future time-of-day entry gate: the stop distance is not
+constant in the terms that matter, even though the number never changes.
+
+Tooling for all of the above: `scripts/replay_session.py` (`--sweep window|close|stop|trail|target|
+cooldown|losscooldown|maxday`, and `--verify` to check the replay against the fills that actually
+happened). Baseline across 4 prod sessions, modelling the engine's own 30s re-entry cooldown:
+**98 replayed round trips, 43.9% win rate, −1.40% expectancy per trade (−$110 per contract), 95% CI
+−5.57% to +2.78%.** Eight sweeps have been run over that set; every one lands between −1% and −3%.
+**No exit-side or throttle-side knob moves the result** — which is what points upstream to this item.
+
+### G4. Candidate entry signals — measure on the tape first *(2026-09-11)*
+
+Full reasoning: **BRAINSTORM.md, "Candidate entry signals — measure on the tape before building"**.
+Nothing built. Sequenced behind G3 only because G3 makes the measurement trustworthy, not because
+G3 is expected to improve anything (it was measured not to — see G3).
+
+**The standing rule this item exists to enforce: a candidate gets measured against the recorded SPY
+tape before any engine change.** A tape test costs ~20 minutes, needs no code and no money, and
+needs no option quotes — it runs on the underlying, so it is not limited to contracts the engine
+happened to arm, and the stop/target geometry cannot flatter it. Building first is how the current
+three gates ended up testing below a coin flip (43.0% right at +30m against a 50.6% always-long
+baseline).
+
+Ordered by confidence, highest first.
+
+**G4a. Relative volume by time of day.** *This one is a measured defect, not a hypothesis — the
+highest-value item here.* SPY volume is a deep U (median/min: 97,052 at 09:30, **33,950 at 12:30**,
+**122,316 at 15:30**). `min_volume_multiplier` divides by a rolling 20-bar baseline that lags the
+steep parts of that curve: into the close it trails the ramp, so a typical 15:45 minute scores
+**~2.2× with no spike at all** and clears a 1.5× gate on nearly every minute of the last half hour;
+at the open the reverse suppresses ratios. **The gate is loosest late and tightest early**, which is
+backwards — late is when contracts are cheapest and the fixed percentage stop sits deepest in noise
+(see G3's premium-vs-volatility note). Fix: a per-clock-minute profile built from prior sessions
+instead of a trailing window. Needs no new data; 8 sessions are on disk.
+
+**G4b. Distance from VWAP rather than side of it.** The gate is binary, so a penny above and 2% above
+pass identically. 2026-09-10 spent 97.6% of the post-10:20 session blocked on it with price **$0.58**
+above VWAP. Measurable straight from the replay — record distance in standard deviations at entry,
+bucket outcomes — before deciding whether a band threshold earns its place.
+
+**G4c. Prior levels** — yesterday's close, overnight high/low, pre-market range. ORB is already one
+member of this family and the only one measured (**105 breakouts, 59.0% right at +30m, CI excludes
+zero** — the only candidate that does). The data is already captured: stream logs start before the
+open, so overnight and pre-market are in the files.
+
+**G4d. Higher-timeframe agreement.** `docs/REGIME_FILTER.md` specifies it and E12 records that
+`check_market_regime` ships on every strategy and is read by nothing. Would have silenced the put
+side for most of the measured week. **Most likely of the four to be fooled by this sample** — all
+four measured sessions drifted upward, which is exactly the tape where a trend filter flatters
+itself. Needs a down-tape stretch first.
+
+**Also: `$TICK` is half-built.** The gate is fully implemented at `signal_generator.py:489`
+(`use_tick_indicator`, `tick_threshold`, `tick_direction`), but
+`StrategyMarketState.to_market_data()` never supplies `tick_value`, so the branch is unreachable
+even when enabled, and nothing says so. The missing half is a data feed — Tradier's stream does not
+carry breadth — so this is not a few lines. Either wire a source or mark the params dead, but do not
+leave a gate that silently cannot fire.
+
+**Not on this list on purpose: implied volatility.** It matters more than any of the four, because
+this book only ever buys options — a fall in expected movement costs money even when the direction
+call is right, and can never help us the way it helps a seller. Excluded because measuring it needs
+option-chain snapshots through the session, which is a collection project rather than a tape test.
+Revisit once the four above are settled.
+
+**Evidence limit.** Every number here comes from 4–8 prod sessions, all of them up-drifting.
+E11's thresholds govern as they govern everything else, and the tape tests share the underlying
+sample — they are not independent confirmations of each other.
 
 ---
 
 ## H. Recovery-path hardening (from the 2026-08-26 put-support guard passes)
 
-### H1. ~~`held[0]` + `_flatten_other_contracts` orphans a second contract~~ *(fixed 2026-08-26)*
-
-`_flatten_other_contracts` now takes `broker_holds` and zeroes only rows the broker does **not**
-report, and both recovery paths pass the adoptable set in. `_startup_sync` additionally sorts `held`
-so a contract this strategy already has an open row for is adopted ahead of one it does not — the
-choice no longer depends on Tradier's response ordering.
-
-Was deferred as out-of-scope on 2026-08-26, then fixed the same day because the F3 change (adoption
-no longer defers to a *dead* strategy's claim) moved the trigger from "hand-buy a second strike in
-the portal" to "any strategy auto-stops while holding", which the 20-consecutive-error auto-stop
-makes routine.
-
-**Residual:** a strategy can now legitimately hold two open rows when the broker holds two
-contracts. That is fine — `_check_exit_signals` (`strategy_executor.py:368`) iterates **every** open
-row for `(user, strategy, symbol)`, and the forced-EOD block sits inside that same loop, so both
-rows get stop-loss, take-profit and EOD handling. Only the *armed/streamed* contract is one at a
-time; the second is REST-priced. Single-contract operation (`max_positions: 1`) is unaffected.
-
-(An earlier version of this note claimed the second row was "not actively managed for SL/TP". That
-was wrong — do not "fix" the code on the strength of it.)
+H1 (the orphaned second contract) is fixed and has moved to **RESOLVED**.
 
 ### H2. Adoption serialisation is in-process only
 
@@ -1164,6 +1263,8 @@ names a different one. Exit pricing is safe (`_check_exit_signals` compares the 
 `position.option_symbol` and falls back to REST on mismatch), but that REST fallback then runs on
 every 1s eval tick — ~60 quote calls/minute for a position that could have been streamed. The
 declined branch could arm the strategy's own open contract instead.
+
+---
 
 ---
 
@@ -1355,3 +1456,541 @@ all before changing anything — per `feedback_engine_filter_consumer`, find the
 touching the producer. Fee rows may post T+1, in which case the fix is a next-day sweep, not a
 change on the fill path.
 
+---
+
+# FUTURE CONSIDERATIONS
+
+- **THERE ARE NO BROKER-SIDE STOPS. If the engine dies holding a position, nothing protects it.** Every exit — stop loss, take profit, trailing stop, time exit — is *simulated in-engine* and issued as a market sell when our own logic decides to fire (`order_manager.py:425`, market orders hardcoded). **Nothing rests at Tradier.** If the process crashes, the host reboots, the WebSocket wedges, or the eval loop stalls while a 0DTE position is open, that position simply sits there unmanaged until someone notices. The `stop_loss_pct` you configure is a number the engine checks — not an order the broker holds.
+    - **This is the single largest live-trading risk in the system** and it is independent of every other item here. It survived the 2026-07-13 session only because nothing crashed.
+    - **Tradier supports the fix.** It has OTO / OCO / OTOCO order classes, so an entry can carry an attached stop and target that live at the broker. `docs/tradier/trading/` documents them; **no code path calls them** — `place_option_order` hardcodes `class: "option"` (single-leg) and only ever sends market orders.
+    - **The tension to resolve first:** broker-side brackets and engine-side trailing stops fight each other. A resting stop can't trail, and the engine can't trail a position the broker might close underneath it. Options: (a) resting *disaster* stop at the broker (wide — e.g. −50%), engine keeps managing the tight/trailing exits inside it; (b) full broker-side bracket, drop engine trailing entirely; (c) engine cancels/replaces the resting stop as it trails (most correct, most API traffic, most ways to desync). **(a) is the cheapest real safety win** — it bounds the catastrophic case without touching the strategy logic.
+    - **Do this before any meaningful live capital.** Everything else on this list is money-losing-slowly; this one is money-gone-in-one-event.
+
+- **Configurable server port + first-class multi-instance (per-environment) runs.** `api/app.py` hardcodes `uvicorn.run(..., port=8000)`, so a dev (`APP_ENV=dev`) and a live (`APP_ENV=prod`) instance can't run at the same time — they collide on port 8000. Make the port env-driven (`PORT`, default 8000) so both can run side by side (e.g. dev on 8000, live on 8001), each with its own engine worker / Tradier stream / email scheduler and each pinned to its launch `APP_ENV`. This is the safe model — trading is pinned to the process env, not the UI toggle (the toggle only reroutes *reads*; see JOURNAL.md 2026-07-10/11 and `docs/monday-runbook.md`). Follow-ups: the Angular `apiUrl` is fixed per build, so driving two backends means pointing the UI at the target instance's port (or running two UIs / adding an instance picker); optionally add a `scripts/` launcher ("start-dev", "start-live"). Low risk — two lines in `app.py`.
+
+- **~~Daily-profit cutoff (positive-P&L halt for the day).~~ PROMOTED — this is now D2.** The sketch that lived here (mirror `_check_user_daily_loss_limit` on the upside, block `side='buy'` only, `_check_user_daily_profit_target`, a `User.daily_profit_limit_pct` column + migration, a `PROFIT_HALTED` session status, and the open equity-vs-risked-capital threshold question) is carried in full by **D2**, which now also has live data to size it against and a stated reason for sitting behind G2. Kept as a pointer so the cross-reference from older notes still lands somewhere.
+
+- **Broker-state reconciliation on engine startup (the right fix for restart + multi-process).** Relates to A2 but takes a different angle: instead of moving the in-process ledger to Redis / DB / sticky routing, **rebuild the ledger from Tradier itself** at `StreamDrivenWorker.start()` before allowing any new signals through. Premise: Tradier's `/orders` (open + pending) + `cash.cash_available` are the real source of truth — the in-process dict is just a milliseconds-window bridging hack between `place_order()` returning and Tradier registering the order in `cash_available`. Reconciling against broker state survives every restart scenario (process, host, future Redis) without introducing new infra.
+    - **Sketch:** on startup, for each user with active strategies, call `trading_client.get_open_orders(user)`, filter to `side='buy'` with non-terminal status, and call `OrderManager._acquire_buy_reservation(user.id, expected_cost)` for each. Key the reservation by `broker_order_id` (not just UUID) so the existing fill-handler can release by the order_id Tradier returns. TTL stays as the safety belt.
+    - **Why not just rely on Tradier's `cash_available`?** It does reflect registered orders, but there's a sub-second post-`place_order` window where it's stale — that's the entire reason the in-process ledger exists. Reconciliation moves that bridging logic from "in-process memory of orders we placed" to "explicit query for orders the broker knows about", which is restart-safe.
+    - **Promote when EITHER becomes true:** (1) deployment moves to multi-process (gunicorn `--workers >1`, multi-replica), so A2's cross-process gap becomes real; or (2) order frequency rises enough that the sub-second post-place window starts statistically coinciding with crashes. Today: single-process + ~19 trade cycles/day = effectively zero risk, the 5-second `_auto_restart` delay already covers the registration window in practice.
+    - **Effort:** ~30–50 lines + a startup test. Smaller than the Redis/DB-row alternatives in A2 because it doesn't add a new state store.
+
+- **🚨 TRADIER SANDBOX FILLS ARE FABRICATED — no strategy metric measured in sandbox means anything.** Discovered 2026-07-14. The engine **must** read LIVE market data (sandbox has no market-data WebSocket, so quotes always come from the live endpoint), but orders **fill in sandbox**. Those are two different price universes and the engine straddles both.
+    - **Proof (the simplest possible invariant): an option cannot trade below its intrinsic value** — that would be free arbitrage. SPY's real tape at 10:34 ET on 2026-07-14 was **752.02**, and the engine's streamed price agreed (751.98). A **749 call** therefore has **$3.00 of intrinsic value**. Tradier sandbox priced and filled it at **$1.84–$2.14**. Impossible.
+    - **Consequence:** entry is recorded at a sandbox fill; the exit is then evaluated against a LIVE quote. `pnl_pct = (3.49 − 1.84) / 1.84 = +89.67%` → *"Take profit hit!"* → the exit fills in sandbox at 1.81 → **actually −1.6%**. A *"Stop loss hit: −15.58%"* realised **+5.1%**. **Exits are effectively random.**
+    - **Measured:** 2026-07-13 — **120 of 121** TSLA exits fired at a price we did not get (mean gap $0.92). 2026-07-14 — **20 of 22** SPY exits, same story. **The engine's logic is correct; the data is fake.**
+    - **This retroactively invalidates** the 31% win rate, the −1.08% mean per-trade return, the −0.146 Sharpe, the "−9.15% expectancy", the 69/31 exit-reason split, and the conclusion that the signal "fires on noise". All were computed from fabricated fills. **We do not know whether these strategies are profitable.** See the corrected `docs/negative-expectancy.md`.
+    - **What sandbox CAN test:** order placement, fill confirmation, reconciliation, the streams, contract selection/reselection, risk gates, not crashing. All verified working 2026-07-14.
+    - **To actually evaluate a strategy** you need real fills and real quotes in ONE price universe: either the **backtester (C1)** against historical option data, or **live with minimal size** — and the latter must not happen before broker-side stops exist (item #1 above).
+
+- **The stop-wider-than-target flaw was real, and fixing it was right — but the specific 15/30 ratio was tuned to a fake win rate.** `SL / (SL + TP)` is the win rate you need just to break even; it is arithmetic and does not depend on any data. TSLA ran **SL 20 / TP 15** (needs **57.1%**) and SPY ran **SL 50 / TP 25** (needs **66.7%**) — both indefensible regardless of what the fills say. Both are now **SL 15 / TP 30** (needs 33.3%).
+    - **Revisit the exact ratio** once real fill data exists. The *direction* (target wider than stop) is unambiguous; the magnitude was chosen to sit below an observed "31% win rate" that turned out to be an artifact.
+    - **Churn is real and is NOT a pricing artifact** — timing data doesn't depend on fill prices. Median gap between consecutive TSLA entries on 2026-07-13 was **38 seconds**; 106 of 119 entries came within 90s of the previous one. `MIN_ORDER_INTERVAL_SECONDS = 5.0` blocked **108 of ~233 attempted orders (46%)**. That rate limiter is a governor pinned to the floor, not a safety margin. A re-entry cooldown is still worth adding.
+
+- **Cold-start latency blows the first orders' fill-confirmation window.** Both `ORDER_UNCONFIRMED` events on 2026-07-13 fired at 13:45:48 and 13:46:20 — within the first 80 seconds of the session's first order (13:45:01), and ~4.5 hours before anything was touched by hand. Both orders **filled anyway**. `_await_terminal_order` (`api/engine/order_manager.py`) polls `get_order` every 1.5s for 30s; the first Tradier round-trips of a session appear slow enough to exhaust it.
+    - **Now survivable, not fixed:** the account event stream (added 2026-07-13, `api/engine/tradier_account_stream.py`) pushes fills so the poll usually wakes in milliseconds, and unconfirmed orders now block further entries + get backfilled on the reconcile tick. But if the stream is down, the same 30s window applies.
+    - **Cheap follow-ups:** warm the Tradier connection at worker startup (one throwaway `get_clock`/`get_profile` before the first signal can fire), and/or give the FIRST order of a session a longer `timeout_s`. Confirm the cold-start theory first by logging poll-loop duration per order — it may just be sandbox latency.
+
+- **The unconfirmed-order ledger is in-process (same blind spot as A2's cash ledger).** `OrderManager._unconfirmed_orders` is a class-level dict. It gates new entries while an order's fill is unknown and drives the reconcile-tick backfill — but a restart empties it, so a process bounce mid-timeout silently drops both the entry block and the Trade-row backfill. The broker stays the source of truth (`_reconcile_position` still adopts the position), so this cannot produce a *wrong* position — only a missing trade record and a briefly unguarded entry path.
+    - **Fix alongside A2 / the startup-reconciliation item**, not separately: the same "rebuild in-process state from broker orders at startup" pass that repairs the cash ledger can repopulate this one from Tradier's open/pending orders. Doing it twice would be waste.
+
+- **`TODO.md`'s DONE entry "Fee tracker on the performance page" (2026-05-09, Part 2) is now partly stale.** It concluded "No additional work needed" — but the tile it describes was reading Tradier's `/gainloss`, whose cost basis is corrupt (see the Sharpe/P&L note below). The commission/fee *attribution* logic it describes is probably still fine; the P&L basis underneath it was not. As of 2026-07-13 the page reads `/performance/closed-trades` (engine fill records) instead. Re-verify the fee tile against the new source before trusting it.
+
+- **Tradier's `/gainloss` is not a safe P&L source — treat it as untrusted, in live as well as sandbox.** Its FIFO lot matcher does not retire closed buy lots when the same contract is round-tripped repeatedly in one session: it keeps pairing new sells against early, already-closed, more expensive lots. On 2026-07-13 a single 0DTE contract (`TSLA260713C00405000`, bought and sold 50 times as it decayed 6.10 → 0.39) reported cost 34,908 against a real 14,244 — same 150 contracts, same proceeds, cost inflated 2.45×. The report showed **−21,057** for a day that actually lost **−1,851** (confirmed against `close_pl`, order-fill cash flow, and account equity, which all agree).
+    - **Consequence beyond the dashboard:** if Tradier's LIVE gainloss shares this lot bug, live P&L/tax reporting is equally suspect. The money is always right (fills are fills) — the *report* is not. Compute P&L from fills, never from `gainloss`.
+    - **Still exposed:** `GET /account/gainloss` (`api/tradier_integration/router.py`) and `TradierClient.get_gainloss` remain, and the client hardcodes `page=1, limit=25` with no pagination loop. Either delete the route or paginate it and label it clearly as broker-reported-and-unreliable, so nobody wires a metric to it again.
+
+- **Unify the delta / open-interest defaults across the three places that read them.** The same param keys are defaulted to three different values, so a strategy created *without* `delta_min` / `delta_max` gets silently different criteria depending on which code path is asking. Contract selection defaults to `0.40 / 0.90` (`stream_driven_worker.py:738-740`), the drift re-check to the same `0.40 / 0.90` (`:905-907`), the SignalGenerator entry gate to `0.0 / 1.0` (`signal_generator.py:211-212` — i.e. accepts everything), and the confidence calc to `0.60 / 0.85` (`:568-569`). `min_open_interest` at least agrees on `0` everywhere.
+    - **Not a live bug today:** both current strategies (id=2 TSLA, id=3 SPY) define `delta_min`, `delta_max` and `min_open_interest` explicitly in `params_json`, so all four call sites read identical numbers and the defaults never fire. This is latent — it bites the first strategy created (or seeded from a template) that omits those keys, and it will fail *open*, not closed: the entry gate's `0.0 / 1.0` default accepts any delta.
+    - **Fix shape:** hoist the defaults to one module-level constant dict (or onto the Strategy model as column defaults) and have all four sites read from it. Prefer failing *closed* — a missing delta band should reject, not wave through.
+    - **While you're there:** the entry-gate and confidence blocks in `signal_generator.py` are now genuinely live (they were inert until 2026-07-13, see below), so a wrong default there actually changes trading behavior for the first time.
+
+- **Subscribe reconcile-adopted contracts to the market stream.** `_reconcile_position` adopts a contract straight off the broker when a position is opened outside the engine — manual fill in the Tradier UI, or an app restart mid-trade — by setting `state.option_symbol = occ` (`stream_driven_worker.py:614`; `_startup_sync` does the same at `:524`/`:528`). Neither path calls `stream_mgr.subscribe()`, so no option quotes flow in for that position: `state.option_bid` / `option_ask` stay `0.0` and exit pricing silently falls back to the per-tick REST fetch (`strategy_executor._fetch_option_price`).
+    - **⚠️ CORRECTED 2026-08-25 — it DID hurt, badly. This is the mechanism behind the $223,119 phantom.** The original analysis was right that `_check_exit_signals` falls back to REST, but it only checked the *exit-signal* path. The **mark-to-market** path had no such fallback: `strategy_executor.execute_exit_tick` kept `current_price` as the **UNDERLYING** whenever `ask == 0.0` (exactly the state an unsubscribed adopted contract is in) and wrote it straight to `position.current_price` / `unrealized_pnl`. `_reconcile_position` then used that field as a closing fill price, booking SPY's 747.03 as an option premium. Fixed at both ends 2026-08-25 (marks now come from the held contract's resolved price; the reconcile fallback sanity-checks every candidate against the underlying) — **but the underlying subscription gap this item describes is still open**, so adopted contracts still run on the slower REST path.
+    - **Also true, and still true:** the position's bid/ask never appear in the 30s heartbeat log, which makes a recovered position look half-dead when it isn't.
+    - **Fix shape:** route both adoption sites through the same `_arm_contract` helper the normal path now uses (`:868`), so subscribe + router-add + `streamed_symbols` bookkeeping happen together. The bookkeeping is the part that matters — `_disarm_contract` (`:876`) deliberately refuses to unsubscribe a symbol it never subscribed, precisely because these two paths can hand it one.
+    - **Care required:** this touches the restart-recovery path, which is the one path that can't be safely tested during market hours. Do it deliberately, with a paper restart-mid-position rehearsal, not as a drive-by.
+
+- **Watch for band-edge churn on drift-driven contract reselection** *(added 2026-07-13 alongside the reselection change — observation item, not yet a known bug)*. While a contract is armed but not yet bought, `_check_contract_drift` (`stream_driven_worker.py:886`) re-prices it every `_DRIFT_CHECK_INTERVAL` (30s, `:36`) and disarms it if delta has left the strategy's band, so the next tick selects a fresh strike. The drift check reads greeks from Tradier's **quotes** endpoint; contract *selection* reads them from Tradier's **chains** endpoint. Same vendor and same underlying greeks source, so they should agree — but if they disagree by a hair on a contract sitting exactly on the band edge, the engine can disarm and immediately re-arm the *same* strike, every 30 seconds, indefinitely.
+    - **Bounded, not dangerous:** worst case is one chain pull + one re-subscribe per 30s per strategy. It cannot cause a bad trade — a contract only ever gets bought if it passes the band at entry time. It's a noise/efficiency concern, and a signal that the band is mis-sized.
+    - **Where it would show up first:** TSLA (strategy id=2) has a **0.15-wide** band (0.50–0.65) and SPY (id=3) a 0.25-wide one (0.60–0.85). Those are narrow for 0DTE, where gamma walks delta quickly — expect reselection to fire *legitimately* and often, especially on TSLA.
+    - **The tell:** grep the logs for `drifted out of criteria` (`:935`). Strike actually changing = working as designed. Same symbol repeating every 30s = churn.
+    - **If it churns:** widen the band rather than lengthen the interval (a longer interval just means buying a staler contract). A hysteresis margin — only disarm once delta is outside the band by some epsilon — is the fallback if widening isn't acceptable. Note that selection already scores by *closest to band midpoint*, which is what makes a fresh pick start far from both edges, so churn should be self-limiting unless the band is genuinely too tight.
+    - **Open-interest half is effectively a no-op:** OI barely moves intraday, so the drift check's OI comparison will essentially never trip. Delta is the part doing real work.
+
+- **Verify drift-driven reselection actually fires — it ran in production on 2026-07-13 and we never checked.** Row 3 (`_check_contract_drift`, added that morning) is supposed to disarm a contract whose delta leaves the strategy's band and pick a fresh strike. It ran live all day and **its behaviour was never confirmed**. The suspicious signal: TSLA round-tripped ONE contract (`TSLA260713C00405000`) **50 times** while it decayed from 6.10 to 0.39 — which is what you would see if reselection was NOT swapping strikes.
+    - **How to check:** grep the engine log for `drifted out of criteria`. Strike actually changing = working. Silence across a day where a contract decayed 94% = the drift check never fired, and we should find out why (delta band too wide to ever trip? quote endpoint returning no greeks? the `elif` never reached because the contract stays armed only while flat?).
+    - **Until confirmed, treat Row 3 as unverified in production.** It is tested in isolation but has never been observed doing its job on real market data.
+
+- **⚠️ All `ORDER_PREVIEW_DRIFT` events logged before 2026-07-14 are garbage — DISCARD them before any B2 analysis.** The emit site passed `signal.price` as the "signal price", but on an entry `Signal.price` is the **UNDERLYING** (SPY ~751), not the option premium. So every event compared a stock price against an option premium and logged a "drift" of ~**−99.4%** — which is just `4.83 / 751.22`. **Fixed 2026-07-14** (`order_manager.py` now passes `estimated_price`, the option mid it actually sized from), but the ~149 historical rows (127 on 07-13, 22 on 07-14) are unusable.
+    - **This is the dataset B2 has been waiting on**, so B2's clock effectively restarts from 2026-07-14. Filter on `event_data.signal_price` being option-scale (< ~50) to separate good rows from bad.
+    - Silver lining: this bug is what cracked the sandbox-fills case — it was the only place the underlying price and the option price sat side by side in one record.
+
+- **174 post-cutoff churn trades remain in the history and drag every strategy metric.** Between 2026-07-15 and 08-21 the engine placed 174 entries *after* the 15:45 forced-exit time (12 of them at or after 16:00 ET, when the market was shut — `is_market_open()` let them through on a 60s-stale Tradier clock). Each was sold within seconds by the forced exit; net **−$1,064.46** in pure spread. The entry gate was fixed 2026-08-25 (`forced_exit_time_et()` is now the entry cutoff), but the trades are real records at real prices and were deliberately **left in place**.
+    - **They are separable:** all sit in the 15:45–16:00 ET band. Filter them out before measuring expectancy, win rate or Sharpe, or the numbers understate the strategy by ~$1,064 across ~87 fake round trips.
+    - **Decide:** either tag them (`notes.excluded_from_metrics = true`) so the performance endpoints can filter automatically, or accept the drag and remember to filter by hand. Tagging is the better answer if strategy evaluation is ever automated.
+
+- **`routers/performance.py:174` labels trades with the wrong contract.** It reads `position.option_symbol` to name a closed trade — but `_update_position_entry` **reuses a `qty=0` position row for the next entry**, overwriting that field. Trade 2408 closed `SPY260731C00745000`; its position row now reads `SPY260825C00764000`, a month-later strike. Every historical row on the performance page can therefore be labelled with whatever contract was bought most recently.
+    - `notifications/reports.py` was fixed 2026-08-25 to read `notes.option_symbol` first and fall back to the position row only for older rows. **Apply the same precedence here.**
+    - `close_position` now records `option_symbol` in its notes, so rows written from 2026-08-25 onward are self-describing; the ~1,225 older closes are not and can only ever be labelled approximately.
+
+- **~~A re-entry cooldown after a stop-out.~~ SUPERSEDED 2026-09-09 by G2 — a blanket cooldown is the wrong lever.** The original reasoning below still reads well and is still wrong on this data: five of the six same-contract re-entries came back within **90 seconds** and that bucket made **+$309**, including the +$153 and the +$126. An elapsed-time cooldown blocks those along with the three losers. What separates the buckets is not the gap, it is whether the engine had to **select a different strike** — see G2. Kept for the reasoning:
+    - *Not a data question — a design one. Re-entering 30 seconds after being stopped out is a bet that the thing which just went against you will now go for you. Combined with the 38-second median cadence and a rate limiter that is already rejecting 46% of attempts, the engine is trading as fast as it is permitted to rather than as fast as it has edge for.*
+    - The **cadence half of that is confirmed** and G1 restates it in live terms: on 09-02 the engine wanted to be in a position continuously from 10:22 to 15:43 ET and took 3 trades. It is still trading as fast as it is permitted to — permission is just now denominated in settled cash rather than in seconds.
+
+- **`TradierClient` has no 429 / rate-limit handling.** `_RETRY_STATUSES = {502, 503, 504}` only (`client.py:24`); the `Retry-After` and `X-Ratelimit-*` headers Tradier sends are ignored entirely. POST is deliberately never retried (correct — avoids double-submits), but a 429 on a GET currently just raises. Not urgent at ~19 trade cycles/day; becomes real the moment order frequency or strategy count rises.
+    - **Three modules bypass the client with raw `requests` and inline API keys**, so they'd miss any retry/limit logic added there: `strategy_executor._fetch_option_price` (`:555-591`, plus dead `live_url` at `:563`) and `utils/market_hours.py:138`. Route them through `TradierClient` when touching either.
+
+- **`api/engine/trading_safeguards.py` is dead code — decide whether to wire it up or delete it.** `PaperTradingSafeguards.validate_strategy_params` is never called by anything (the similarly-named `RiskManager.check_live_trading_safeguards` at `risk_manager.py:487` is a different function). It checks position sizing, that a stop loss exists and is ≥ 10%, that take-profit is < 100%, and warns when there is no time-based exit — all things we *want* enforced, and none of which are.
+    - **If wiring it up:** it rejects any strategy whose `stop_loss_pct` is absent or < 10. Both current strategies now set it (15), so they pass — but confirm before enabling, or strategy creation starts failing.
+    - **It would have caught the 2026-07-13 config.** Not the inverted risk/reward (it doesn't compare SL to TP — worth adding: reject `stop_loss >= take_profit`, the exact flaw that guaranteed the loss), but it *is* the natural home for that check. See `docs/negative-expectancy.md`.
+
+- **~~`scripts/update_account_size.py` is broken and untracked.~~ RESOLVED — verified 2026-09-09.** It now writes `user.account_size_usd`, which is the real column (`models.py:18`), and the file is tracked. `scripts/test_user_update.py` is tracked too. The original report — that it wrote a non-existent `User.account_size` and would `AttributeError` on first run — was accurate when written; the script has since been corrected.
+
+- **Economic-event awareness — record first, gate later.** Log every scheduled macro release (CPI, PPI, NFP, FOMC, ISM) with its **exact ET release timestamp**, plus a 09:00 ET morning summary of what is scheduled today. Report-only: no signal consumption, no auto-disable, engine untouched. Same data-first pattern as B2 (entry-drift) and A1 (GFV reservations). **Design is settled — see BRAINSTORM.md, "Economic-event awareness".** Promote to the numbered list once the release-tier question below is answered.
+    - **A calendar, not a news feed.** SPY dilutes single-name news to nothing; macro hits every position in the same second. The upstream source (Fed FOMC dates, BLS release schedule) publishes a year ahead and is free, so v1 seeds ~20 entries in a repo YAML rather than taking a vendor key and a network dependency. Narrative-news vendors (Benzinga / Polygon / Finnhub / Marketaux) are **deferred, not rejected** — their real value is *unscheduled* events, a category that is essentially empty for an index ETF, and becomes real the day the book holds single names.
+    - **Windows, not days — and the ranking is backwards from intuition.** Danger to *this* book is **FOMC 14:00 > 10:00 releases (ISM/sentiment/JOLTS) >> CPI 08:30**. We enter after `entry_after_open_minutes` and are flat by 15:45, so an 08:30 print resolves *before* we ever have a position — we buy after the IV crush, not into it. The Fed is the one we hold long premium straight through.
+    - **Store timestamps, not dates.** A row saying "today had CPI" can never test a window size. With exact release times we can go back through fills and ask whether entries within 15 / 30 / 60 min of a release did worse, and let the data pick the window — and since MFE/MAE is captured per trade, measure *how hard* they went against us, not just whether they lost.
+    - **Verdict is per-DAY, not per-strategy.** A CPI print is true for every strategy at once. Any future per-strategy column reads the day's row rather than computing its own. New table ⇒ **migrate dev *and* prod before editing `models.py`** (`reload=True` hits the shared DB instantly).
+    - **Scheduler:** copy the two-stage anchor in `services/email_report_scheduler.py` — 03:00 ET cron reads Tradier `markets/calendar`, then a one-shot at `open.start − 30min`. Holidays fall out for free; a flat `CronTrigger(hour=9)` fires on them.
+    - **~~Strategy-direction mapping~~ — already solved.** `engine/signal_generator.py:60` `resolve_direction()` is the single resolver and `schemas.py:211` validates it on write. No `bias` column needed. (Moot for a per-day verdict; unblocks the story-news half if ever built.)
+    - **Deferred gate — `avoid_economic_news` is a lie today.** All eight templates set it (`strategy_templates.py:99,148,198,247,297,346,395,444`) and nothing reads it; the engine advertises the behavior and does not have it. Wiring it up is a **blackout window**, which inherits the engine rules: compose most-restrictive-wins with `signal_generator.py:289` (`entry_after_open_minutes` ∧ `user.trading_window_start` ∧ forced-exit time), never widen them, and let `side='sell'` through so a blackout cannot trap an open position.
+    - **Open:** which release tiers to seed (Fed-only, the big four, or the full ~20 including 10:00 second-tier prints); whether to cross-check the annual seed against a free vendor or trust the published schedules. **Note the evidence limit:** CP-1 makes trades ≤ 2905 untrustworthy and the 174 churn trades drag everything until filtered, so clean history starts 2026-08-25 — roughly one CPI and one FOMC. This cannot be answered retroactively; the value of v1 is starting the clock.
+
+---
+
+# RESOLVED — kept for the reasoning
+
+Items that were live to-dos, are now fixed, and whose write-up is worth keeping: the reasoning that
+justified each change, and in several cases an explicit *do not "fix" this back* note. Moved here
+from the numbered streams on 2026-09-09 so those streams contain only open work. Nothing was
+deleted — every word below stood in A–I before the move, and the item numbers are unchanged so
+existing cross-references still resolve.
+
+One-line summaries of older completed work live in **DONE** below; this section is for items that
+carry an argument.
+
+### D3. ~~The drawdown gate was a latch, not a limit~~ *(FIXED 2026-09-05)*
+
+> `RiskManager._check_max_drawdown` compared the **worst drawdown ever recorded** against the
+> limit. A running maximum only rises, nothing reset it, and the query had no date filter — so one
+> bad stretch retired the strategy permanently. It kept reading as **Active**, kept evaluating,
+> kept generating signals, and silently refused every entry, with no alert and nothing on screen
+> to explain it. The only way to clear it was to edit the database.
+>
+> **Caught at $2.43 of margin.** Measured on prod 2026-09-05:
+>
+> | | worst-ever dd | current dd | limit (10% of $1,214.25) | headroom |
+> |---|---|---|---|---|
+> | strategy 3 (calls) | $119.00 | $119.00 | $121.43 | **$2.43** |
+> | strategy 4 (puts) | $71.00 | $71.00 | $121.43 | $50.43 |
+>
+> **What changed.** The gate now measures the **current** distance below the strategy's own
+> high-water mark, so winning the drawdown back lifts the block. Trades are also now read
+> `ORDER BY timestamp` — a cumulative running total was previously computed over whatever order
+> the database happened to return, which made `peak` (and therefore the drawdown) arbitrary.
+>
+> This is deliberately **more permissive** than before: current drawdown can never exceed
+> worst-ever. That is the point — the old bound was not a risk control, it was a latch.
+>
+> **It does not remove the near-miss.** Strategy 3 is currently sitting *at* its trough, so
+> current dd == worst-ever dd == $119.00 and the $2.43 headroom is unchanged. The next losing
+> trade still pauses it. The difference is that it now **un-pauses on recovery** instead of
+> retiring. Open question: 10% of a $1,214 account is ~2 losing trades — decide whether
+> `max_drawdown_pct` is tuned for an account this size.
+>
+> **The recovery path is narrower than it first looked.** Current drawdown only shrinks when a
+> trade CLOSES, a trade can only close if it was OPENED, and opening is exactly what the block
+> prevents. A blocked strategy holding nothing therefore *cannot* trade its way out — the only
+> escapes are a position that was already open when the block tripped, or `account_size_usd`
+> growing until 10% of it clears the drawdown (from $1,168 that needs $1,650, +41%, and it would
+> have to come from another strategy). So the fix converted "blocked forever because you EVER had
+> a bad stretch" into "blocked forever because you are CURRENTLY in one" — strictly better, and
+> still a latch while enforcement is on.
+>
+> **Hence two settings, not one:**
+>
+> | key | meaning |
+> |---|---|
+> | `max_drawdown_pct` | threshold as % of account. **`<= 0` disables everything** — no alert, no block, and no DB query. |
+> | `max_drawdown_block` | `True` (default) crossing it stops entries; `False` it only raises an alert and the strategy keeps trading. |
+>
+> Alert-only is the useful mode on a small account: the strategy keeps trading, so it can climb
+> out on its own and the alert is genuinely self-clearing. `max_drawdown_block` defaults to `True`
+> so nothing that has not explicitly opted out changes behaviour.
+>
+> Reading the settings now happens BEFORE the trade query, so a disabled gate costs nothing. That
+> query loads the strategy's entire history and runs on every entry attempt — 321 times on
+> 2026-09-02.
+>
+> Bleed alerts (`notify_strategy_bleeding` / `notify_strategy_recovered`) fire once on the
+> transition over the threshold, and clear with **hysteresis at 80%** so a strategy sitting on the
+> line does not alternate messages.
+>
+> **Still deferred:** the lookback window and a manual clear. Both only matter with
+> `max_drawdown_block=True`, which nothing currently uses.
+>
+> Tests: `api/tests/test_max_drawdown_recovery.py` (28 cases: recovery to a new high, recovery to
+> flat, still-in-the-hole, insertion-order independence, badge/gate agreement, account-size
+> scaling, notification safety, the off switch, absent-means-default, alert-only mode, re-alert
+> suppression across 50 evaluations, and the hysteresis band).
+
+---
+
+### D4. ~~A blocked strategy looked identical to a healthy one~~ *(FIXED 2026-09-05)*
+
+> Every silent entry block had the same symptom: an account that quietly stops trading, which is
+> indistinguishable from a market with no setups. Now surfaced two ways.
+>
+> **Discord** — `notify_strategy_blocked` / `notify_strategy_unblocked`, gated on a new
+> `notification_preferences.discord.notify_risk` (defaults True). Fired **once**, on the
+> transition into the blocked state, and once again on recovery with the count of entries skipped
+> in between. Throttling is not optional here: 2026-09-02 produced **321 entry signals in one
+> day**, and this gate is evaluated on every one of them. Mirrors the
+> `OrderManager._cash_block_state` idiom — announce the transition, count the repeats quietly.
+>
+> **UI** — the strategies table shows a `Blocked` chip beside `Active`, with the reason on hover.
+> Backed by `RiskManager.get_entry_block_status`, a read-only evaluation that runs the same
+> private checks in the same order as `validate_pre_trade`, so the badge cannot disagree with the
+> engine. It writes nothing and commits nothing; a failure is swallowed and the page renders
+> without a badge rather than 500ing.
+>
+> Covered codes — the blocks with no other symptom: `mode_mismatch`, `account_daily_loss`,
+> `strategy_daily_loss`, `max_drawdown`. Deliberately **excluded** as self-evident: an inactive
+> strategy, the manual "done for the day" halt, and the position cap (normal operation, fires
+> constantly). Out-of-cash entries already have their own `ENTRY_SKIPPED_NO_CASH` event.
+
+---
+
+### D5. ~~`_log_risk_event` raises TypeError — a tripped cap DEACTIVATES the strategy~~ *(FIXED 2026-09-07)*
+
+> **Fixed exactly as prescribed below, verified 2026-09-07.** `_log_risk_event` now writes
+> `details={"reason": message}` instead of `message=`, and wraps the write in the same try/except
+> as `_log_account_risk_event` — with a rollback — so a logging failure can never decide whether a
+> trade happens. The `logger.warning` is outside the try, so the event is still visible even when
+> the row cannot be written.
+>
+> The test the item asked for exists: `api/tests/test_risk_event_logging.py` trips all three gates
+> **through `validate_pre_trade`** (not the private checks), asserts a failed write still returns a
+> clean `rejected`, and asserts a SELL is approved on every one of the four gates. All passing.
+>
+> ~~Uncommitted as of 2026-09-07~~ — **committed since**; `api/tests/test_risk_event_logging.py` is
+> tracked. Verified 2026-09-09.
+
+`RiskEvent` has no `message` column (`models.py`) — it carries `details` JSON. `_log_risk_event`
+passes `message=message` to the constructor anyway, and unlike its sibling
+`_log_account_risk_event` it has **no try/except**. Reproduced:
+
+```
+TypeError: 'message' is an invalid keyword argument for RiskEvent
+```
+
+The docstring on `_log_account_risk_event` already names this ("the legacy `_log_risk_event`,
+which references a `message` column that doesn't exist on the model") — the newer writer was
+written correctly and the old one was left in place.
+
+**Three gates route through it:** the per-strategy daily loss limit, max drawdown, and the
+position cap. So a *clean rejection* becomes an *exception*, and then:
+
+```
+cap trips -> TypeError -> caught at strategy_executor.py:229 -> state.error_count += 1
+          -> repeats on every entry attempt
+          -> at 20 consecutive errors: strategy.is_active = False   (:238)
+```
+
+**Hitting a daily loss cap does not pause the strategy for the day — it turns the strategy OFF,
+and it stays off tomorrow.** 2026-09-02 produced 321 entry signals in a day; 20 consecutive
+errors is a couple of minutes.
+
+**Reachable on the next session.** The per-strategy default is 5% of account = **$60.71**, about
+two typical losing trades ($46/$39/$34 observed).
+
+Knock-on: the D4 alerts never fire on these paths — `_note_entry_block` is called *after*
+`_log_risk_event`, so the exception pre-empts it. A strategy that deactivates itself this way
+sends nothing.
+
+Not caused by the D3/D4 work; it predates it. Contained in one respect: exits are unaffected,
+because a strategy holding a position runs the exit-only tick, which never calls
+`validate_pre_trade`.
+
+**Fix:** make `_log_risk_event` match `_log_account_risk_event` — write `details={"reason": ...}`
+instead of `message=`, and wrap it in the same try/except so a logging failure can never decide
+whether a trade happens. Needs a test that trips each of the three gates through
+`validate_pre_trade` (the existing tests call the private checks directly and miss this).
+
+---
+
+### E1. ~~The trailing stop is unreachable by construction~~ *(FIXED 2026-09-03 — exercised live 2026-09-04)*
+
+> **Fixed in `signal_generator.check_exit_signal`.** Order is now stop loss -> trailing stop ->
+> take profit, and critically the **take profit is SUPPRESSED while the trail is armed**.
+> Reordering alone would not have worked: at the tick where price touches +TP the trail is not yet
+> hit, so it falls through to the target regardless — the target has to stand down for the trail to
+> govern. Unchecking `trailing_stop` restores the old behaviour exactly.
+>
+> **Exercised live 2026-09-04 — the branch fires, and it pays.** Two `Trailing stop hit:` exits,
+> both on strategy 4 (puts, `SPY260904P00774000`):
+>
+> | entry | trail level | exit fill | realised | |
+> |---|---|---|---|---|
+> | $2.97 (10:29:30 ET) | $4.44 (peak ~$4.93) | $4.50 | **+$153** | the flat +30% target would have sold at $3.86 = +$89 |
+> | $2.88 (10:16:39 ET) | $3.02 (peak ~$3.35) | $3.02 | **+$14** | armed just past +15%, then reversed |
+>
+> The $153 trade is the proof this item was waiting for. `take_profit_percentage=30` was correctly
+> suppressed while the trail was armed, so the position ran to a ~$4.93 peak instead of being sold
+> at $3.86 — **+$153 against +$89**; the flat target would have surrendered 42% of the move.
+>
+> The $14 trade is the other side of the trade-off, exactly as predicted below: armed at ~+16%,
+> reversed, exited at +4.5% rather than running to the target. A small win instead of a probable
+> stop-loss — the cost of letting winners run.
+>
+> Source: `logs/livetest-2026-09-03/engine-20260903-061605.log` lines 28859 and 29072 (the 09-03
+> log file spans into the 09-04 session).
+
+The original finding, kept for the reasoning:
+
+> **2026-09-02 — FIXED, and option (a) as written below does NOT work.** Reordering the branches
+> changes nothing: the flat target fires on the way UP, at the tick price first crosses +25%, when
+> no pullback yet exists for the trail to be hit by. At that tick the trail falls through and the
+> target sells regardless of which is checked first. For both to be true on one tick the peak must
+> reach 1.25/0.90 = +38.9%, which the target already prevented the position from reaching.
+>
+> What shipped instead — `signal_generator.check_exit_signal`, order now SL → trail → TP:
+> 1. **Arming latches on the peak.** It re-tested the live `pnl_pct` every tick, so the trail
+>    switched itself off during the pullback it exists to catch; nothing could fire below a peak of
+>    1.15/0.90 = **+27.8%**, not the +15% configured. Now armed off `position.peak_price` /
+>    `trough_price` (with a 1e-9 tolerance — `(2.30-2.00)/2.00` is 14.999999999999998).
+> 2. **The flat take-profit stands down while the trail is armed.** The two rules are mutually
+>    exclusive above the activation threshold; the target has to yield or the trail cannot govern.
+>    Consequence on strategy 3 (`activation 15`, `take_profit 25`): the target is now dead — every
+>    position that arms the trail exits via the trail.
+>
+> Stop loss is untouched and still outranks the trail. Below activation, and with `trailing_stop`
+> unchecked, behaviour is identical to before — **unchecking the box in the strategy form is the
+> revert**, live within ~30s via `db.refresh(strategy)`, no deploy. Tests:
+> `api/tests/test_trailing_stop_arming.py` (18 cases: arm/disarm boundaries, the 09-02 runner
+> replay, SL precedence, shorts, trail-off regression).
+
+> 📜 **Everything from here to the end of E1 is the original 2026-09-02 analysis, preserved for the
+> reasoning that justified the fix. It describes the PRE-FIX engine and is no longer true — the
+> trail is reachable, has fired live, and neither fix option below is what shipped.** Current state
+> is at the top of this item.
+
+Prod strategy 3 is configured `trailing_stop=true, activation=15%, distance=10%,
+take_profit=25%`. `signal_generator.check_exit_signal` evaluates in a fixed order, each branch
+returning immediately:
+
+```
+1. take profit    (25%)   -> return
+2. stop loss      (15%)   -> return
+3. trailing stop  (arms at 15%)   <- never reached
+4. max hold time
+```
+
+The trail arms at +15% but take profit fires at +25% and returns first, so **any position that
+would arm the trail is sold before the trail can act.** It has never executed and cannot at these
+numbers. A configured feature that is dead code — not a tuning preference.
+
+**Fix options.** (b) is preferred as the first move: it is a data change, reversible from the
+portal, needs no code, and is therefore testable without touching the exit path.
+
+- **(a) Reorder** — evaluate trailing before the flat target. Once up 15% the trail governs and the
+  flat 25% only fires on a gap through it. Changes behaviour most aggressively.
+- **(b) Raise `take_profit_pct`** above the trail's useful range (e.g. 60%), leaving the trail as
+  the normal exit and the target as a ceiling.
+
+**What it affects — this is a real trade-off, not a free win.** Winners run further and exit below
+their peak; hold time rises; round-trip count falls. But a position that reaches +15% and then
+reverses now exits near +5% instead of at +25%, converting some current winners into smaller ones.
+Every exit the engine makes is affected, so it wants tests, not a quick edit.
+
+**Evidence (2026-09-02).** `SPY260902C00760000` ran 3.27 -> session high 6.40. The engine took
++25.7%, immediately re-entered the same contract, and took +24.8% again:
+
+| | settled cash used | P&L | return on cash |
+|---|---|---|---|
+| actual: two 25% round trips | $750 | +$189 | 25% |
+| one position with a working 10% trail (exit ~5.76) | $327 | ~+$249 | 76% |
+
+The P&L difference is modest (~+$60). **The cost that matters is the cash** — see E2.
+
+---
+
+### E5. ~~Capture MFE/MAE per trade — the data is being destroyed~~ *(DONE 2026-09-05)*
+
+> **Shipped.** `trades.mfe_price` / `mae_price` added (migration `a1b2c3d4e5f6`, applied to **DEV
+> and PROD**), and `order_manager` snapshots `position.peak_price` / `trough_price` onto the SELL
+> leg at close — before any re-entry can reset them. Covered by
+> `api/tests/test_mfe_mae_capture.py`, whose load-bearing assertion is that a reopen wipes the
+> position's peak while the already-closed leg keeps its own.
+>
+> Note the reset only fires on the **reopen** path (a row already at `qty=0`). With `qty>0`
+> `_update_position_entry` averages into the open position and legitimately keeps the peak.
+>
+> **Migration gotcha for next time:** the first PROD attempt stalled 4.5 min and had to be
+> cancelled. The running engine holds connections `idle in transaction`, which keeps an
+> `AccessShareLock` on `trades`; the `ALTER` queued for `AccessExclusiveLock`, and a queued
+> exclusive request makes every later reader queue behind it too. **Stop the app before DDL on
+> `trades` / `positions`.** Nothing was half-applied — the transaction rolled back clean.
+>
+> Data starts accumulating from the next live session. Historical trades stay NULL.
+
+The original finding, kept for the reasoning:
+
+`Position.peak_price` / `trough_price` are Maximum Favorable / Adverse Excursion in all but name,
+and they are the single most useful diagnostic for exit-rule quality. **They are currently
+unrecoverable after the fact.**
+
+Two problems:
+
+1. `Trade` has **no** `peak_price` / `trough_price` columns — MFE is never written to the
+   immutable record.
+2. `order_manager.py:1348` resets `position.peak_price = price` on every reopen, and position rows
+   are reused for re-entries. So MFE survives only for a row's **most recent cycle**.
+
+On 2026-09-02 that already cost us: trade 1's peak was overwritten by trade 2's re-entry into the
+same contract, hours after the fact. Only pos2's peak survived long enough to be read — and it is
+the evidence that the day's only loser was +22% before it reversed
+(`docs/live-test-results-2026-09-02.md` §F7b). **Every future session loses this silently.**
+
+**Fix:** add `mfe_price` / `mae_price` to `Trade`, and copy `position.peak_price` /
+`trough_price` onto the sell-leg Trade row in `_update_position_exit` before the reopen path can
+reset them.
+
+**Sequencing — this is not a UI change.** Model change -> Alembic migration on **DEV *and* PROD**
+before the model edit lands (`reload=True` means a models.py save hits the live shared DB
+instantly) -> `order_manager` write (engine code, so it needs the usual care and a test) -> then
+the metric is computable and the UI can show it.
+
+**Do this before E1.** E1's whole case rests on MFE, and right now the argument can only be made
+from one surviving row. A week of captured MFE turns "it cost a winner on 09-02" into a
+distribution.
+
+**Metric it unlocks:** *MFE capture ratio* = realized P&L / MFE. 09-02 was `100%, 100%, -70%`. A
+persistently low ratio means the exit rule is systematically leaving the move behind; a negative
+one means a position that was well in profit closed at a loss.
+
+---
+
+### F1. ~~The account event stream watches the SANDBOX account during live trading~~ *(FIXED 2026-09-07)*
+
+> **Fixed and verified in the live process the same evening.** Connect line now reads
+> `wss://ws.tradier.com/v1/accounts/events (env=live account=6YB***56)` — the account the orders
+> actually go to.
+>
+> Three changes: `TradierAccountStreamManager` takes a client provider, injected by `app.py` from
+> the same per-user routing the order path uses; `reconcile_user_history` uses
+> `TradingClientManager.get_client(user)`; and six market-data callers moved to a new
+> `get_market_client()` that forces the live endpoint, so paper mode reads real prices and a live
+> process never reads market data over a sandbox host.
+>
+> Two things that let it hide are now closed: the connect log prints `env=` and a masked account,
+> and a missing provider logs a WARNING rather than falling back silently. `get_tradier_client()`
+> carries a docstring saying it is only safe for non-account calls.
+>
+> Tests: `api/tests/test_account_stream_account_routing.py` — live provider gets the live socket,
+> paper still gets sandbox (not force-live), no provider falls back, a throwing provider cannot
+> take the stream down.
+
+`tradier_account_stream._create_session_sync` calls `get_tradier_client()` — a module-level
+singleton built from `settings.TRADIER_ENV` in `.env`, currently `sandbox`. Orders route
+per-user through `TradingClientManager.get_client(user)` on `user.selected_trading_mode`,
+currently `live`. The two disagree, and nothing reconciles them:
+
+```
+orders            -> LIVE account 6YB70356
+account WS stream -> wss://sandbox-ws.tradier.com  (sandbox account)
+```
+
+Confirmed in the 09-02 and 09-06 engine logs: `Account event stream connected:
+wss://sandbox-ws.tradier.com/v1/accounts/events` while the session traded real money.
+
+**Effect:** live fills are never pushed. Confirmation falls back to the 30s REST poll — the
+exact path this stream was built to backstop after 2026-07-13, when two orders filled while
+the poll expired and left the engine holding 6 unrecorded contracts. All 09-02 fills
+reconciled correctly via REST, so this is latent rather than broken, and the code comment at
+`tradier_account_stream.py:130` asserts the opposite of what happens.
+
+**Second site, same bug:** `services/tradier_reconcile.reconcile_user_history` (line 118) also
+calls `get_tradier_client()`. It pulls account history and writes commission/fees onto local
+`Trade` rows — so run against a live account it reads SANDBOX history and reconciles fees from
+the wrong account. Only reachable from the manual `POST /account/reconcile-fees` endpoint, not
+the engine loop, so it misfires only when someone calls it.
+
+**The fix already exists in the router.** `tradier_integration/router.py:29` added `_client(user)`
+for exactly this reason — its docstring says the singleton "always hit sandbox regardless of the
+user's live/paper selection". Both remaining sites need the same treatment.
+
+**Market data is NOT affected — verified 2026-09-07.** Sandbox and live return byte-identical
+quotes, greeks and open interest (`SPY 769.42/769.55`, `SPY260908C00768000 bid 3.00 ask 3.03
+oi 1193 delta 0.6736` from both). Tradier's sandbox serves real market data and only fabricates
+fills, so the six singleton callers that read quotes, chains, the clock and greeks are correct.
+Only the two account-touching sites above are wrong.
+
+**Fix:** the stream needs the same per-user client the order path uses, not the env singleton.
+That means giving `TradierAccountStreamManager` a user (or a client factory) rather than
+letting it resolve its own — worth care, since it is a singleton shared across strategies and
+the market stream is deliberately always-live.
+
+---
+
+### H1. ~~`held[0]` + `_flatten_other_contracts` orphans a second contract~~ *(fixed 2026-08-26)*
+
+`_flatten_other_contracts` now takes `broker_holds` and zeroes only rows the broker does **not**
+report, and both recovery paths pass the adoptable set in. `_startup_sync` additionally sorts `held`
+so a contract this strategy already has an open row for is adopted ahead of one it does not — the
+choice no longer depends on Tradier's response ordering.
+
+Was deferred as out-of-scope on 2026-08-26, then fixed the same day because the F3 change (adoption
+no longer defers to a *dead* strategy's claim) moved the trigger from "hand-buy a second strike in
+the portal" to "any strategy auto-stops while holding", which the 20-consecutive-error auto-stop
+makes routine.
+
+**Residual:** a strategy can now legitimately hold two open rows when the broker holds two
+contracts. That is fine — `_check_exit_signals` (`strategy_executor.py:368`) iterates **every** open
+row for `(user, strategy, symbol)`, and the forced-EOD block sits inside that same loop, so both
+rows get stop-loss, take-profit and EOD handling. Only the *armed/streamed* contract is one at a
+time; the second is REST-priced. Single-contract operation (`max_positions: 1`) is unaffected.
+
+(An earlier version of this note claimed the second row was "not actively managed for SL/TP". That
+was wrong — do not "fix" the code on the strength of it.)
+
+---
+
+# DONE
+
+- [x] **Phantom P&L eliminated — the $223,119 "close" on a Saturday, and three siblings.** `_reconcile_position` books a closing Trade when the broker shows flat but the DB holds qty; when `_broker_close_fill()` found nothing (Tradier `/orders` covers only the **current session**, so any previous-day close is invisible) it fell back to `position.current_price` — which held **SPY's underlying price**, because `strategy_executor.execute_exit_tick` wrote the raw tick price to the position whenever the option quote hadn't arrived. `(747.03 − 3.30) × 3 × 100 = 223,119`. **This silently disabled the daily-loss cap**: `Position.unrealized_pnl` feeds `risk_manager.py:248`/`:448` and the phantom `Trade.pnl` feeds `realized` at `:241`. Fixed at both ends — positions are now marked off the **held contract's** resolved price (never the underlying tick), and `_fallback_exit_price()` walks broker fill → REST quote → own mark, sanity-checking every candidate against the underlying and booking **at cost with an ERROR log** rather than inventing a figure. Four historical rows corrected to expiry settlement (`max(0, SPY close − strike)`, closes from `/v1/markets/history`); all-time P&L **+$220,942 → −$3,035.37**. Originals in `scripts/backups/`, correction in `scripts/fix_phantom_expiry_pnl.sql`, each row stamped `notes.corrected_at`. Prod was empty. Also fixed a missing `×100` in the partial-close `unrealized_pnl` and a `multiplier` scoped inside a sibling branch (a latent `NameError`). _(2026-08-25, Part 2)_
+
+- [x] **Forced-exit time is now the ENTRY cutoff — 174 pointless round trips per the last six weeks, stopped.** `check_entry_signal`'s time gate had an upper bound **only when `user.trading_window_enabled`**, which was off. So the 15:45 forced exit sold, and the engine bought again at 15:46 — every day, 174 entries after the cutoff for **−$1,064.46** in spread, 12 of them placed at/after 16:00 ET on a 60s-stale market clock. One straddled the bell (2026-07-31 16:00:41), never exited, expired, and became the phantom above. The gate now reuses `forced_exit_time_et()` as its upper bound so entries stop exactly when exits start and the two can never drift apart. **Note: the EOD exit itself was never broken** — it is the single most common exit reason in the history (71 of the last 60 days' closes). What was missing was its entry-side counterpart. _(2026-08-25, Part 2)_
+
+- [x] **`exit_before_close_minutes` floor of 15, enforced in three layers.** Previously opt-in and falsy at `0`, with the strategy form defaulting to `0` and a hint that read *"0 = disabled"*. Now: the engine clamps anything below 15 (`FORCED_EOD_EXIT_FLOOR_MINUTES`, unconditional, composes most-restrictive-wins so a strategy asking 30 still gets 30); the API rejects 0–14 with a 422 (`schemas.py`, deliberately on `StrategyCreate`/`StrategyUpdate` and **not** `StrategyBase` — `StrategyResponse` inherits Base, and a legacy row must stay *readable* even when no longer *writable*); the form defaults to 15 with `Validators.min(15)` and loads a legacy `0` as `15` via `Math.max` (`??` does not fire on `0`, so it would otherwise be permanently unsaveable). The rule is **minimum 15, not "not zero"** — the value counts backwards from the bell, so 5 would be later than the floor and equally broken. _(2026-08-25, Part 2)_
+
+- [x] **Notifications report dollars, not premium.** `notifications/reports.py` computed `multiplier = 100 if is_option_symbol(trade.symbol)` — but **`Trade.symbol` is the underlying** (`"SPY"`), never the OCC symbol, so that was **always False** and email Cost/Proceeds were **100× too small** ($2.23 where $223 was committed). Now joins `Position` and prefers `notes.option_symbol`, adds Capital-deployed / Proceeds / Return-on-capital totals computed over **all** trades rather than the 50 that fit the table, and is restyled to the flat-terminal language (hero P&L, stat tiles, zebra rows, tabular numerals, zero `box-shadow`). Discord embeds moved from a 3-across field grid to an aligned monospace table with `premium → dollars` on one line, Cost / Proceeds / Return %, and readable contract names via new `parse_occ_symbol()` / `format_contract()` (`SPY260825C00745000` → `SPY $745 CALL 8/25`). `close_position` now records `option_symbol` in its notes so a close can be attributed to a contract at all — the position row cannot answer that, since closed rows are reused. Both channels test-sent and verified. _(2026-08-25, Part 2)_
+
+- [x] **Data-accuracy checkpoint system.** `scripts/verify_data_checkpoint.sql` asserts seven invariants the 2026-08-25 fixes guarantee, scoped to post-checkpoint rows so historical damage can't mask a regression. It is self-validating — run it with `cp_trade_id=0` and checks 2/3/5 **fail** against history (186 / 4 / 1225 rows), which is how a PASS is known to mean something. Registry at the top of `JOURNAL.md` (grep `DATA ACCURACY CHECKPOINT`) with instructions for adding CP-2. **CP-1 (`trades.id > 2905`) is PENDING** — it opens at the first engine start after these fixes deploy, not on the date they were written. _(2026-08-25, Part 2)_
+
+- [x] **Tradier is now the only broker — Alpaca and Schwab fully removed (91 files).** Deleted `api/alpaca/` (a vendored copy of the alpaca-py SDK, committed to the repo — which is why `import alpaca` resolved even though `alpaca-py` was never in the venv), `api/schwab_integration/`, the whole `api/services/market_data/` tree (`chain_fetcher`, `enhanced_service`, `realtime_aggregator`, `service` — all Alpaca-backed), `api/utils/multi_stream.py`, `api/services/strategy_worker.py` (the dead legacy polling worker), the Schwab auth/token scripts, `api/debug/check_chain_data.py`, nine Alpaca test scripts, and `ui/src/app/services/schwab.service.ts`. Unmounted the Schwab router from `app.py`, dropped all eight `ALPACA_*`/`SCHWAB_*` keys from `config.py`, deleted `TradingClientManager._get_schwab_client()` (never called — `get_client` routed both modes to Tradier anyway), and stripped the dead Alpaca/Schwab branches from `order_manager`'s three `_extract_*` parsers. **The UI was naming the wrong broker in the real-money confirmation dialog** ("Live trading uses REAL MONEY via Schwab API!", "Paper trading with Alpaca") — corrected to Tradier Sandbox / Tradier Live, as was the live-switch logging in `system.py`. Verified: app boots, 89 routes, **zero** Alpaca/Schwab modules loaded, Tradier contract selection intact, UI typechecks. Architecture diagram updated. _(2026-07-13)_
+- [x] **Alpaca removed from the live engine greeks path.** `_refresh_greeks` was calling Alpaca's option-snapshot endpoint every 5 minutes per strategy — a *blocking* HTTP call on the shared event loop — and Alpaca's free tier returns **no greeks**, so it wrote `None` over `None` forever. Because both gates in `SignalGenerator` are guarded on `is not None`, the **delta band and `min_open_interest` filters were silently skipped on every entry, permanently, since the day they were written**. Greeks now come from the Tradier chain at contract selection (zero extra API calls — selection already reads them). _(2026-07-13)_
+- [x] **Drift-driven contract reselection.** A contract was armed once and then held — sometimes for hours — while 0DTE gamma walked its delta out of the strategy's band, and it was bought anyway. `_check_contract_drift` now re-prices the armed contract every 30s via `get_quotes(greeks=True)` and disarms it if it has left the band, so the next tick selects a fresh strike. Disarming (rather than just rejecting the entry) is what avoids a deadlock: selection only runs when `option_symbol is None`. Also fixed a **subscription-accounting bug found in the re-audit** — teardown used a stale startup snapshot, so a strategy that swapped contracts would unsubscribe a symbol another live strategy was holding, killing its market data. Each strategy now tracks its own `streamed_symbols`. _(2026-07-13)_
+- [x] **Unconfirmed-order safety + fill backfill.** On 2026-07-13 two orders filled at the broker while `_await_terminal_order` timed out at 30s; the engine wrote no Position row and believed it was flat while holding 6 TSLA contracts — no stop, no take-profit, free to stack another entry. Now: an unconfirmed order **blocks further BUYS** for that strategy (never sells — an exit must always run), and the reconcile tick re-polls it and backfills the Trade row at the broker's real `avg_fill_price`. `_reconcile_position` also writes a Trade row when a position is closed **outside** the engine (a hand-close in the Tradier portal previously zeroed the position but dropped its −$104 from P&L history entirely). _(2026-07-13)_
+- [x] **Tradier account/order event stream.** `api/engine/tradier_account_stream.py` subscribes to order lifecycle events so fills are **pushed** instead of polled — `_await_terminal_order` now sleeps on the stream and wakes in milliseconds. It is an *accelerator, not a replacement*: REST polling remains the fallback, so if the stream drops the engine behaves exactly as before. Confirmed a market stream and an account stream **run concurrently** (Tradier's "one session at a time" is per stream-type; separate session endpoints and sockets) — verified live against sandbox. Note the account event carries **no symbol and no side**, and names its quantity `executed_quantity` (not REST's `exec_quantity`), so it is only ever a notification keyed on order id. _(2026-07-13)_
+- [x] **Performance page P&L no longer comes from Tradier's `/gainloss`.** That report's FIFO lot matcher does not retire closed buy lots when a contract is round-tripped repeatedly, so it reported **−$21,057** for a day that actually lost **−$1,851** (one 0DTE contract bought and sold 50 times as it decayed 6.10 → 0.39: real cost 14,244, reported cost 34,908). It is also paginated, so a busy day was truncated on top of being wrong. New `GET /performance/closed-trades` computes from the engine's own `Trade` rows, which pair each exit with the entry that opened it at fill time — correct by construction, no lot matching. Added the missing **1D** period filter. Also fixed `calculate_performance_metrics`, which read `t.entry_price` and `t.asset_class` — **neither column exists on `Trade`** — and had been returning HTTP 500 for any strategy with trades. _(2026-07-13)_
+- [x] **Negative-expectancy fix + 2026-07-13 P&L reconciled to the cent.** Both strategies ran a stop loss WIDER than their take profit (TSLA 20/15 → needed a 57% win rate; SPY 50/25 → needed 66.7%) — and SPY's `params_json` carried **both** key spellings with different values, with `signal_generator.py:355` reading `_pct` first, so **the UI showed a 15% stop while the engine enforced 50%**. Both now 1:2 (SL 15 / TP 30, break-even 33.3%), with all four keys and both columns written together so nothing can silently disagree again. `scripts/reconcile_2026_07_13.py` backfilled the three fills the engine dropped and repriced one adopted-position exit, bringing the DB to **−1,851.00**, matching the broker exactly. **⚠️ Corrected 2026-07-14:** the original claim that "the strategy is still negative-EV at its measured 31% win rate (−1.08%/trade, Sharpe −0.146)" was **wrong** — those numbers came from Tradier sandbox fills, which are fabricated (sandbox filled a 749 call at 1.84 while SPY was at 752, i.e. **below intrinsic value**). The *structural* fix (stop wider than target) was right; the *performance* claims were built on fiction. See the corrected `docs/negative-expectancy.md`. _(2026-07-13, corrected 2026-07-14)_
+- [x] A view in performance that shows a calendar with each day being green or red with the gain/loss inside the data block. _(2026-05-03)_
+- [x] Dark mode + colorblind mode (blue/orange palette) toggleable from the user menu. CSS custom properties (`--color-profit`, `--color-loss`, `--surface`, `--text`, `--border`, etc.) drive theming; future UI work should use these tokens instead of hardcoded colors. _(2026-05-03)_
+- [x] Account-level trading window. Toggleable per-user start/end time (ET, "HH:MM") in the user menu; layers on top of per-strategy `entry_after_open_minutes` / `exit_before_close_minutes` with most-restrictive-bound-wins semantics so users can never widen past strategy defaults. _(2026-05-05)_
+- [x] Time-exit visibility & editability — open positions appearing to auto-close at fixed intervals were strategy-defined (`params_json.max_hold_time_minutes`), not engine-defined. Added a 30s INFO heartbeat per active strategy in `stream_driven_worker.py` so the loop is never silent. Surfaced `max_hold_time_minutes`, `entry_after_open_minutes`, `exit_before_close_minutes`, and trailing-stop fields in the strategy edit form so the value can be tuned without DB pokes. Strategy 3's value remains 30 — user judgment call whether to set 0 / 90 / 120. _(2026-05-06)_
+- [x] Per-user Discord notifications for trade opens and closes. Replaced the "SMS notifications" idea after weighing Twilio cost / A2P 10DLC overhead against existing Discord patterns — Discord is free, instant, and formats embeds nicely. Per-user webhook URL stored in `User.notification_preferences.discord` (JSON column), opt-in toggles for open/close, "Send test message" button in the dialog. SSRF-guarded: schema validator + dispatcher both reject anything that isn't an official Discord webhook host. Fire-and-forget daemon thread so a slow webhook never blocks the post-fill path. _(2026-05-06, Part 2)_
+- [x] Discord close-notification audit: confirmed exactly one fire per real fully-closed position across all three call sites (`close_position` post-terminal-filled, `_update_position_exit` post-fully-closed, runtime `_reconcile_position` for broker-UI manual closes). Every bailout (throttle/preview-fail/broker-reject/unconfirmed/non-filled-terminal) returns before notify. Reconcile early-returns on local qty<=0 so it can't double-fire after a strategy-driven close. `apply_trade` referenced in the original TODO doesn't exist in the code; startup-sync manual-close path stays silent by design. _(2026-05-09)_
+- [x] End-of-period email reports (daily/weekly/monthly/quarterly/yearly) via Resend. Two-stage scheduler: 03:00 ET cron pulls `markets/calendar` for today's actual close (handles early-close days), schedules a one-shot DateTrigger at close+30min. Dispatcher iterates opted-in users and per-user fires daily always, weekly/monthly/quarterly/yearly only on the period's last trading day (next-open lookup against the live calendar). Daily/weekly skip empty periods; monthly+ always send. Aggregation reads `Trade` rows (closing legs only, anchored on `exit_timestamp` in ET-localized windows). Self-contained inline-styled HTML email + plain-text fallback. Per-user prefs in `User.notification_preferences['email_reports']`; opt-in dialog in the user menu with per-period checkboxes, "Send test report" button (real-shaped daily report), and an "off" banner when disabled. _(2026-05-09)_
+- [x] User profile editing — name, email and password change in a "Profile" entry on the user menu. Email-uniqueness check on PATCH so a collision returns a clean 400 instead of a DB unique-violation 500. Password change requires `current_password` + `new_password ≥ 8 chars`. JWT subject migrated from email → user id (`str(user.id)`) so an email change mid-session no longer invalidates the access token; existing tokens require one re-login after deploy. Email change automatically re-targets email reports because the dispatcher reads `User.email` at send time. _(2026-05-09)_
+- [x] Fee tracker on the performance page. Confirmed already in place: `Trade.fees` + `Trade.commission` are populated from Tradier `account/history` (regulatory fees joined per close day, commission joined per open/close day with symbol+date matching). Performance page surfaces a dedicated "Costs (Commission + Fees)" tile with the breakdown sub-line, plus a "Net P&L" tile that subtracts costs from realized P&L (`performance.component.ts:186-189, 226-239`). Per-position attribution writes `commission`/`fees`/`net_pnl` onto every closed-position row (`performance.component.ts:455-462`) so the trade table can show them. No additional work needed. _(2026-05-09, Part 2)_
+- [x] Account-wide daily loss cap + dashboard visibility. New `User.daily_loss_limit_pct` (default 5%, bounded 0.5–20). `RiskManager._check_user_daily_loss_limit` sums realized+unrealized PnL across all of a user's strategies for the day and halts new entries account-wide once breached; sells stay open so existing positions remain closeable. Wired before per-strategy checks in `validate_pre_trade` (most-restrictive-bound semantics). New `GET /risk-events/account-status` powers an overview-page session-status tile (PnL with realized/unrealized split, % cap consumed, $ remaining before halt, status badge OK / WARNING / HALTED at 0/80/100, progress bar that switches color via SCSS class). Refreshes every 30s so unrealized ticks don't go stale. Profile dialog gained a Risk-limits section. New `--color-warning*` tokens added to `styles.scss`. See journal 2026-05-09 (Part 3). _(2026-05-09, Part 3)_
+- [x] Role-based access (RBAC). Five roles defined in `auth.py`: `user`, `admin`, `viewer`, `auditor`, `strategy_author` (Pydantic-validated). Layered enforcement: router deps `require_can_write_own` (blocks viewer/auditor), `require_can_place_orders` (blocks viewer/auditor/strategy_author), `get_current_active_admin_or_auditor` (read-cross-user), `get_current_active_admin` (admin-only writes). Engine-level gate at the top of `order_manager.execute_signal` blocks `side='buy'` for non-trading roles so a strategy worker that survived a role demotion can't bypass the router gate; sells go through. New `routers/admin.py` with read-only `/admin/users` list/detail/dashboard/strategies/positions/trades and admin-only `PATCH /admin/users/{id}/role` (with self-demotion guard). New Angular admin Users page (table + slide-in detail panel + role dropdown for admin / read-only pill for auditor), `adminGuard`, role badge in user menu, role-aware sidenav. Admin scope is observe-only by deliberate decision — no act-as-user path. See journal 2026-05-09 (Part 3). _(2026-05-09, Part 3)_
+- [x] UI auth-header fix on new services. `risk.service.ts` (broke the overview's session-status tile with a 401) and `admin.service.ts` (would have 401'd every admin page request) were calling the backend without `Authorization: Bearer <token>`. Both now build their own `getHeaders()` returning the token from `localStorage('access_token')`, matching the convention used by every other service in the codebase. The Angular UI does NOT use an `HTTP_INTERCEPTORS` provider — `app.config.ts` calls `provideHttpClient()` without `withInterceptors([...])`, so each service is responsible for attaching the token manually. Future refactor opportunity: switch to `withInterceptors([authInterceptor])` so this class of bug can't recur (~8 files to touch). _(2026-05-09, Part 4)_
+- [x] Reservation-ledger code audit + sandbox concurrency probe + entry-drift logging (A1 forward-progress). Audited `_preview_or_abort` and the reservation helpers — release-path try/finally is sound, no `await` between cash check and reservation acquire (same-loop concurrent signals atomically serialized), `cost` field correctly used per Tradier docs, sells correctly skip the gate. Wrote `api/debug/probe_buy_reservations.py` — fires N concurrent `_preview_or_abort` calls via `asyncio.gather` and asserts only `floor(effective_cash / required_per_order)` succeed. Default mode is preview-only (no real orders placed). Wired `ORDER_PREVIEW_DRIFT` event on every option buy (signal_price vs preview_per_contract) — observation only, no cancel logic. A1 still pending the actual sandbox probe run. B2 cancel-on-drift decision pending data + A1. See journal 2026-05-09 (Part 4). _(2026-05-09, Part 4)_
+- [x] Per-strategy equity curve charts on the strategies page. New `GET /performance/equity-curves` returns `[{strategy_id, name, points: [{t, cum_pnl, trade_pnl}]}]` — running sum of `Trade.pnl` over closing trades (`exit_timestamp` + `pnl` not-null), ordered ascending, realized only (open-position unrealized intentionally excluded so the curve is stable). New "Equity" column on the strategies table renders an inline Chart.js sparkline (no axes, no tooltip) plus the lifetime-cumulative dollar amount, color-keyed via `themeService.chartColors()` so it follows theme/CB toggles live. Click → `EquityCurveDialogComponent` with full Chart.js line, hover tooltip (trade #, full timestamp, this-trade PnL, cumulative), and four stat tiles (total realized, best trade, worst trade, win rate). Strategies with zero closed trades show "—" — the canvas only renders for non-empty curves. Route ordering matters: `/equity-curves` is registered before `/{metrics_id}` so the path-param doesn't capture the literal. _(2026-05-09, Part 5)_
+- [x] Broker routing fix — live trading mode now uses Tradier Live instead of Schwab (E1). Modified `TradierClient.__init__()` to accept optional `env` parameter (defaults to `settings.TRADIER_ENV` for backward compatibility). Updated `TradingClientManager` to route both `paper` and `live` modes to Tradier (sandbox vs live respectively), removing Schwab from the normal client selector path. All trading methods (`place_order`, `preview_order`, `get_account`, `get_history`, `get_positions`) now use Tradier for both modes. Schwab integration remains mounted but is no longer reachable through standard trading flows. Fully backward compatible — existing code continues to work. _(2026-07-08)_
+
+---

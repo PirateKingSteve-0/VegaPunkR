@@ -239,8 +239,18 @@ class SignalGenerator:
         # { symbol: { 'date': date, 'sum_pv': float, 'sum_v': int } }
         self._vwap_accumulators: Dict[str, dict] = {}
 
-        # Configuration
-        self.max_history_length = 100  # Keep last 100 bars
+        # The in-progress 1-minute bar, flushed into the deques above when the
+        # clock crosses a minute boundary. Before 2026-09-10 there was no bar:
+        # _update_history appended one entry per CALL, and the caller runs once
+        # a second (stream_driven_worker._EVAL_INTERVAL), so `ema_period: 9`
+        # was a 9-SECOND EMA. Measured against the tape it crossed spot ~12
+        # times a minute where a real 9-minute EMA crosses 0.2 — it tracked
+        # price instead of trend and gated nothing. See TODO.md G3.
+        # { symbol: {'minute', 'close', 'cv_open', 'cv_last'} }
+        self._current_bar: Dict[str, dict] = {}
+
+        # Configuration — these are BARS, and one bar is one minute.
+        self.max_history_length = 100  # 100 one-minute bars
 
     def check_entry_signal(
         self,
@@ -265,9 +275,12 @@ class SignalGenerator:
         Returns:
             Signal object if entry conditions met, None otherwise
         """
-        # Update price history
-        self._update_history(symbol, current_price, current_volume)
-
+        # History is NOT updated here. It is fed unconditionally from
+        # strategy_executor.execute_strategy_tick, because this function is
+        # skipped entirely while a position is open or during the re-entry
+        # cooldown — so folding the update in here froze every indicator for
+        # the whole duration of each trade, and re-entry decisions were then
+        # made against an EMA whose samples straddled the gap. See TODO.md G3.
         params = strategy.params_json
         indicators = {}
 
@@ -340,14 +353,32 @@ class SignalGenerator:
         ema_period = params.get('ema_period', 9)
         if ema_period:
             ema_value = self._calculate_ema(symbol, ema_period)
-            if ema_value is not None:
+            entry_signal = params.get('entry_signal', 'price_above_9ema_and_vwap')
+            ema_gates = _names_a_bound(entry_signal, 'ema')
+
+            # An EMA we cannot compute BLOCKS the entry when the strategy is
+            # configured to gate on it. It used to fall through and trade with
+            # no EMA check at all, silently: `_calculate_ema` returns None
+            # whenever history is shorter than `ema_period`, so setting a period
+            # above `max_history_length` DELETED the filter rather than
+            # lengthening it, and nothing logged that. Now that a bar is a
+            # minute rather than a second, warm-up is ~`ema_period` minutes
+            # instead of seconds, which would have turned that quiet hole into a
+            # real unguarded window after every restart. Most-restrictive-bound
+            # wins: no indicator, no entry. Exits are untouched.
+            if ema_value is None:
+                if ema_gates:
+                    logger.debug(
+                        f"{symbol}: EMA({ema_period}) not available yet "
+                        f"({len(self.price_history.get(symbol, ()))} bars) — entry blocked"
+                    )
+                    return None
+            else:
                 indicators['ema'] = ema_value
 
                 # `entry_signal` decides whether EMA gates the entry at all;
                 # `direction` decides which side of it we need.
-                entry_signal = params.get('entry_signal', 'price_above_9ema_and_vwap')
-
-                if _names_a_bound(entry_signal, 'ema'):
+                if ema_gates:
                     if wants_upside and current_price <= ema_value:
                         logger.debug(f"{symbol}: Price ${current_price:.2f} not above EMA ${ema_value:.2f}")
                         return None
@@ -359,14 +390,22 @@ class SignalGenerator:
         use_vwap = params.get('use_vwap', False)
         if use_vwap:
             vwap_value = self._calculate_vwap(symbol)
-            if vwap_value is not None:
+            # Default '' on purpose: with no entry_signal named, VWAP does
+            # not gate the entry even when use_vwap is on. Unchanged.
+            entry_signal = params.get('entry_signal', '')
+            vwap_gates = _names_a_bound(entry_signal, 'vwap')
+
+            # Same most-restrictive rule as the EMA above: if VWAP is supposed
+            # to gate and has no value yet (no volume accumulated this session),
+            # block rather than trade ungated.
+            if vwap_value is None:
+                if vwap_gates:
+                    logger.debug(f"{symbol}: VWAP not available yet — entry blocked")
+                    return None
+            else:
                 indicators['vwap'] = vwap_value
 
-                # Default '' on purpose: with no entry_signal named, VWAP does
-                # not gate the entry even when use_vwap is on. Unchanged.
-                entry_signal = params.get('entry_signal', '')
-
-                if _names_a_bound(entry_signal, 'vwap'):
+                if vwap_gates:
                     if wants_upside and current_price <= vwap_value:
                         logger.debug(f"{symbol}: Price ${current_price:.2f} not above VWAP ${vwap_value:.2f}")
                         return None
@@ -379,17 +418,37 @@ class SignalGenerator:
         if volume_spike_required:
             min_volume_multiplier = params.get('min_volume_multiplier', 2.0)
             avg_volume = self._calculate_avg_volume(symbol, period=20)
+            # The last COMPLETED minute, not this tick's trade size. Previously
+            # this divided ONE trade's size by the mean of 20 recent trade
+            # sizes — individual prints are wildly uneven, so 2.0x cleared
+            # constantly and the gate confirmed nothing. It now compares a
+            # minute against the last twenty minutes, which is what
+            # `min_volume_multiplier` has always claimed to mean.
+            #
+            # CALIBRATION WARNING: the same NUMBER is far stricter under this
+            # definition. Measured over 4 prod sessions, 2.0x fires ~4 times a
+            # day where the old reading fired ~467 times. Strategies were moved
+            # to 1.5x with this change; anything still carrying 2.0+ will be
+            # close to silent. See TODO.md G3.
+            bar_volume = self._last_bar_volume(symbol)
 
-            if avg_volume and avg_volume > 0:
-                volume_ratio = current_volume / avg_volume
-                indicators['volume_ratio'] = volume_ratio
+            if bar_volume is None or not avg_volume or avg_volume <= 0:
+                # No completed bar yet, or fewer than 20 usable ones. Same
+                # most-restrictive rule as the EMA and VWAP gates above.
+                logger.debug(
+                    f"{symbol}: volume baseline not available yet — entry blocked"
+                )
+                return None
 
-                if volume_ratio < min_volume_multiplier:
-                    logger.debug(
-                        f"{symbol}: Volume spike {volume_ratio:.2f}x insufficient "
-                        f"(need {min_volume_multiplier}x)"
-                    )
-                    return None
+            volume_ratio = bar_volume / avg_volume
+            indicators['volume_ratio'] = volume_ratio
+
+            if volume_ratio < min_volume_multiplier:
+                logger.debug(
+                    f"{symbol}: Volume spike {volume_ratio:.2f}x insufficient "
+                    f"(need {min_volume_multiplier}x)"
+                )
+                return None
 
         # 4. Check delta range for options
         if additional_data and additional_data.get('delta') is not None:
@@ -674,14 +733,79 @@ class SignalGenerator:
 
     # ========== Technical Indicator Calculations ==========
 
-    def _update_history(self, symbol: str, price: float, volume: int):
-        """Update price/volume history and intraday VWAP accumulator."""
+    @staticmethod
+    def _bar_volume(bar: dict) -> Optional[int]:
+        """Volume traded during one completed bar, or None if unknowable.
+
+        Derived from the exchange's CUMULATIVE volume counter rather than by
+        summing the per-tick sizes we happen to sample. The caller sees roughly
+        one trade a second out of the ~7 the stream delivers and the several
+        hundred that actually print, so a summed figure would be a small random
+        subsample — noisy enough that `min_volume_multiplier` would be gating on
+        sampling noise, which is the very failure this change exists to remove.
+
+        Returns None on a discontinuity: process start (no opening reading) or
+        the counter resetting at the session boundary (last < open). None means
+        "unknown", and the volume gate treats unknown as a block, never a pass.
+        """
+        cv_open, cv_last = bar.get("cv_open"), bar.get("cv_last")
+        if cv_open is None or cv_last is None or cv_last < cv_open:
+            return None
+        return cv_last - cv_open
+
+    def _update_history(
+        self,
+        symbol: str,
+        price: float,
+        volume: int,
+        cum_volume: Optional[int] = None,
+        ts: Optional[datetime] = None,
+    ):
+        """Fold one tick into the current 1-minute bar; flush completed bars.
+
+        Called once per evaluation tick (~1/s). Only a COMPLETED minute reaches
+        `price_history` / `volume_history`, so `ema_period: 9` is nine minutes
+        and `_calculate_avg_volume(period=20)` is twenty minutes.
+
+        `ts` is injectable so tests can drive bar boundaries without sleeping.
+
+        NOTE: the VWAP accumulator is deliberately still fed on EVERY tick, not
+        per bar. Measured 2026-09-10 against the tape, the tick-sampled VWAP sat
+        within $0.117 (~1.5 bp) of a cumulative-volume-weighted VWAP and the
+        `price < VWAP` gate agreed 98.6% of the time — sampling is uncorrelated
+        with price, so the error averages out over thousands of samples. VWAP
+        was never the broken one; only the EMA's timescale was.
+        """
+        now = ts or datetime.utcnow()
+        minute = now.replace(second=0, microsecond=0)
+
         if symbol not in self.price_history:
             self.price_history[symbol] = deque(maxlen=self.max_history_length)
             self.volume_history[symbol] = deque(maxlen=self.max_history_length)
 
-        self.price_history[symbol].append(price)
-        self.volume_history[symbol].append(volume)
+        bar = self._current_bar.get(symbol)
+        if bar is None:
+            self._current_bar[symbol] = {
+                "minute": minute, "close": price,
+                "cv_open": cum_volume, "cv_last": cum_volume,
+            }
+        elif minute != bar["minute"]:
+            # Minute rolled over — the previous bar is final. Push it, then open
+            # a new one seeded with this tick's cumulative reading so the next
+            # bar measures from here rather than from the old bar's close.
+            self.price_history[symbol].append(bar["close"])
+            self.volume_history[symbol].append(self._bar_volume(bar))
+            self._current_bar[symbol] = {
+                "minute": minute, "close": price,
+                "cv_open": bar.get("cv_last") if cum_volume is None else cum_volume,
+                "cv_last": cum_volume,
+            }
+        else:
+            bar["close"] = price
+            if cum_volume is not None:
+                if bar["cv_open"] is None:
+                    bar["cv_open"] = cum_volume
+                bar["cv_last"] = cum_volume
 
         # Intraday VWAP — cumulative from market open, resets each day
         today = date.today()
@@ -692,6 +816,18 @@ class SignalGenerator:
         if volume > 0:
             acc["sum_pv"] += price * volume
             acc["sum_v"] += volume
+
+    def _last_bar_volume(self, symbol: str) -> Optional[int]:
+        """Volume of the most recently COMPLETED minute, or None.
+
+        The volume gate compares this against the 20-bar average rather than
+        the in-progress bar, which would otherwise read near-zero early in a
+        minute and near-full at its end — biasing every entry toward :59.
+        """
+        vols = self.volume_history.get(symbol)
+        if not vols:
+            return None
+        return vols[-1]
 
     def _calculate_ema(self, symbol: str, period: int) -> Optional[float]:
         """Calculate Exponential Moving Average"""
@@ -719,15 +855,22 @@ class SignalGenerator:
         return acc["sum_pv"] / acc["sum_v"]
 
     def _calculate_avg_volume(self, symbol: str, period: int = 20) -> Optional[float]:
-        """Calculate average volume over period"""
+        """Average volume over the last `period` COMPLETED bars (minutes).
+
+        Walks backward skipping bars whose volume is unknown (see _bar_volume)
+        rather than refusing outright, so a single discontinuity — a restart, a
+        session-boundary counter reset — costs one bar instead of blacking out
+        the gate for the next twenty minutes. Returns None until `period` usable
+        bars exist; the caller treats None as a block.
+        """
         if symbol not in self.volume_history:
             return None
 
-        volumes = list(self.volume_history[symbol])
-        if len(volumes) < period:
+        usable = [v for v in reversed(self.volume_history[symbol]) if v is not None]
+        if len(usable) < period:
             return None
 
-        return sum(volumes[-period:]) / period
+        return sum(usable[:period]) / period
 
     def _calculate_rsi(self, symbol: str, period: int = 14) -> Optional[float]:
         """Calculate Relative Strength Index"""

@@ -205,6 +205,23 @@ class StrategyExecutor:
                 results['errors'].append("Invalid market data")
                 return results
 
+            # 2b. Feed the indicator history — UNCONDITIONALLY, before any gate.
+            #
+            # This used to live inside check_entry_signal, which is skipped
+            # whenever a position is open or the re-entry cooldown is running.
+            # The effect was that every indicator froze for the full duration of
+            # each trade: after a 20-minute hold the EMA's samples straddled the
+            # gap, so it compared the current price against prices from before
+            # the trade — and re-entry decisions are made in exactly that
+            # window. Feeding here keeps the series continuous whether we are
+            # flat, holding, or cooling down. See TODO.md G3.
+            self.signal_generator._update_history(
+                symbol,
+                current_price,
+                current_volume,
+                cum_volume=market_data.get('cum_volume'),
+            )
+
             # 3. Check for entry signals (if we have room for more positions)
             await self._check_entry_signals(
                 user, strategy, symbol, current_price, current_volume,

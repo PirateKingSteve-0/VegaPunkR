@@ -26,6 +26,27 @@ import { StrategyService } from '../../services/strategy.service';
  */
 const EOD_EXIT_FLOOR_MIN = 15;
 
+/**
+ * ENGINE-level constants. These are NOT per-strategy settings — they are
+ * compiled into the engine and apply to every strategy on the account. They are
+ * surfaced on the form read-only because they are what give the per-strategy
+ * numbers their UNIT, and that split is exactly what made the 2026-09-10 bug
+ * invisible: `ema_period: 9` looked correct on every screen while the engine
+ * averaged nine SECONDS, because the bar size lives here and not there.
+ *
+ * Keep in sync with:
+ *   barMinutes    api/engine/stream_driven_worker.py  _EVAL_INTERVAL + bar fold
+ *   historyBars   api/engine/signal_generator.py      max_history_length
+ *   volumeLookbackBars  api/engine/signal_generator.py  _calculate_avg_volume(period=)
+ *   reentryCooldownSeconds  api/engine/strategy_executor.py  REENTRY_COOLDOWN_SECONDS
+ */
+const ENGINE = {
+  barMinutes: 1,
+  historyBars: 100,
+  volumeLookbackBars: 20,
+  reentryCooldownSeconds: 30,
+} as const;
+
 @Component({
   selector: 'app-strategy-form',
   standalone: true,
@@ -62,6 +83,9 @@ export class StrategyFormComponent implements OnInit {
   // Exposed to the template so the hint/error text and the `min` binding
   // all read from the single constant rather than a hardcoded 15.
   readonly EOD_EXIT_FLOOR_MIN = EOD_EXIT_FLOOR_MIN;
+  // Engine constants, for the read-only band and for the unit hints that tell
+  // the reader what a "period" actually counts.
+  readonly ENGINE = ENGINE;
 
   instruments: string[] = [];
   readonly separatorKeysCodes = [ENTER, COMMA] as const;
@@ -93,6 +117,17 @@ export class StrategyFormComponent implements OnInit {
       delta_min: [0.6, [Validators.min(0.01), Validators.max(1)]],
       delta_max: [0.85, [Validators.min(0.01), Validators.max(1)]],
       min_open_interest: [3000, [Validators.min(0)]],
+      // Widest bid/ask the armed contract may show, as a FRACTION (0.20 = 20%).
+      max_bid_ask_spread: [0.2, [Validators.min(0.001), Validators.max(1)]],
+      // --- Entry signal ---------------------------------------------------
+      // These four lived in params_json and were reachable from no screen:
+      // shipped by the templates, displayed in the template gallery, editable
+      // nowhere. `ema_period` in particular was a nine-SECOND average until
+      // 2026-09-10 and nothing on the form said what a "period" counted.
+      ema_period: [9, [Validators.min(1), Validators.max(ENGINE.historyBars)]],
+      use_vwap: [true],
+      volume_spike_required: [true],
+      min_volume_multiplier: [1.5, [Validators.min(0.1), Validators.max(10)]],
       max_hold_time_minutes: [0, [Validators.min(0)]],
       entry_after_open_minutes: [0, [Validators.min(0)]],
       // Minimum 15, never 0. Mirrors the engine's hard floor
@@ -159,6 +194,15 @@ export class StrategyFormComponent implements OnInit {
           delta_min: p['delta_min'] ?? 0.6,
           delta_max: p['delta_max'] ?? 0.85,
           min_open_interest: p['min_open_interest'] ?? 3000,
+          max_bid_ask_spread: p['max_bid_ask_spread'] ?? 0.2,
+          ema_period: p['ema_period'] ?? 9,
+          use_vwap: p['use_vwap'] ?? true,
+          volume_spike_required: p['volume_spike_required'] ?? true,
+          // Engine default is 2.0 when the key is absent, but that number was
+          // calibrated against the OLD per-trade reading. Anything still
+          // carrying it under the per-minute reading is close to silent, so the
+          // form shows the current recommendation rather than the stale default.
+          min_volume_multiplier: p['min_volume_multiplier'] ?? 1.5,
           max_hold_time_minutes: p['max_hold_time_minutes'] ?? 0,
           entry_after_open_minutes: p['entry_after_open_minutes'] ?? 0,
           // Clamp up, don't just default: legacy strategies stored 0, and
@@ -234,6 +278,11 @@ export class StrategyFormComponent implements OnInit {
       delta_min: formValue.delta_min,
       delta_max: formValue.delta_max,
       min_open_interest: formValue.min_open_interest,
+      max_bid_ask_spread: formValue.max_bid_ask_spread,
+      ema_period: formValue.ema_period,
+      use_vwap: formValue.use_vwap,
+      volume_spike_required: formValue.volume_spike_required,
+      min_volume_multiplier: formValue.min_volume_multiplier,
       max_hold_time_minutes: formValue.max_hold_time_minutes,
       entry_after_open_minutes: formValue.entry_after_open_minutes,
       exit_before_close_minutes: formValue.exit_before_close_minutes,

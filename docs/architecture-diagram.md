@@ -2,13 +2,15 @@
 
 ## 1. High-Level System Architecture
 
-```mermaid
-graph TB
-    subgraph "Client Layer"
-        UI[Angular 20 UI<br/>Overview, Strategies,<br/>Positions, Trades,<br/>Performance, Admin]
-    end
+### 1a. Request path — UI to API to database
 
-    subgraph "API Layer - FastAPI"
+```mermaid
+%%{init: {'flowchart': {'rankSpacing': 30, 'nodeSpacing': 30, 'padding': 8}}}%%
+graph LR
+    UI[Angular 20 UI<br/>Overview, Strategies, Positions,<br/>Trades, Performance, Admin]
+
+    subgraph API["API Layer - FastAPI"]
+        direction TB
         AUTH[Auth Router<br/>Login returns JWT + User<br/>Register, Profile, Halt]
         STRAT[Strategies Router<br/>CRUD + Toggle]
         POS[Positions Router<br/>View + Close]
@@ -23,55 +25,62 @@ graph TB
         TRDR[Tradier Router<br/>Quotes, Chains, Balances<br/>Market Calendar]
     end
 
-    subgraph "Trading Engine - Event Driven"
-        SDW[StreamDrivenWorker<br/>Persistent Tasks<br/>Per Strategy]
+    DB[(AWS RDS PostgreSQL 16<br/>us-west-1, port 5432<br/><br/>vegapunkr_dev<br/>vegapunkr_prod<br/><br/>test still local on 5433)]
+    ENGINE[Trading Engine<br/>see 1b]
+
+    UI -->|REST + JWT| AUTH
+    UI --> STRAT
+    UI --> POS
+    UI --> TRADE
+    UI --> PERF
+    UI --> ADMIN
+    UI --> SYS
+    UI --> EXEC
+
+    AUTH ---|Read Write Users| DB
+    STRAT ---|Read Write Strategies| DB
+    POS ---|Read Write Positions| DB
+    TRADE ---|Read Write Trades| DB
+    PERF ---|Read Performance| DB
+    RISKR ---|Read Risk Events| DB
+
+    STRAT -.->|start strategy| ENGINE
+    EXEC -.->|start stop| ENGINE
+
+    classDef db fill:#f3e5f5,stroke:#4a148c,stroke-width:2px
+    class DB db
+```
+
+### 1b. Trading engine — stream to broker
+
+```mermaid
+%%{init: {'flowchart': {'rankSpacing': 30, 'nodeSpacing': 30, 'padding': 8}}}%%
+graph TB
+    subgraph STREAM["Market Stream"]
         TSM[TradierStreamManager<br/>Single WebSocket<br/>wss://ws.tradier.com]
         SR[StreamRouter<br/>Multiplexer<br/>Ref-Counted Queues]
-
-        subgraph "Execution Pipeline"
-            SE[StrategyExecutor<br/>Orchestrator]
-            RM[RiskManager<br/>Position Sizing<br/>Pre-Trade Validation]
-            SG[SignalGenerator<br/>EMA, VWAP, Volume<br/>Entry/Exit Logic]
-            OM[OrderManager<br/>Preview → Place<br/>Poll → DB Write]
-        end
     end
 
-    subgraph "Broker Integrations"
+    SDW[StreamDrivenWorker<br/>Persistent Tasks<br/>Per Strategy]
+
+    subgraph PIPE["Execution Pipeline"]
+        SE[StrategyExecutor<br/>Orchestrator]
+        RM[RiskManager<br/>Position Sizing<br/>Pre-Trade Validation]
+        SG[SignalGenerator<br/>EMA, VWAP, Volume<br/>Entry/Exit Logic]
+        OM[OrderManager<br/>Preview then Place<br/>Poll then DB Write]
+    end
+
+    subgraph BROKER["Broker Integrations"]
         TCM[TradingClientManager<br/>Paper OR Live Router<br/>BOTH return TradierClient]
         TC[TradierClient<br/>REST + WebSocket<br/>THE ONLY LIVE BROKER]
         ASM[TradierAccountStream<br/>order events - pushed fills]
     end
 
-    subgraph "Data Layer"
-        DB[(AWS RDS PostgreSQL 16<br/>us-west-1, port 5432<br/><br/>vegapunkr_dev<br/>vegapunkr_prod<br/><br/>test still local on 5433)]
-    end
+    TRADIER[Tradier API<br/>Sandbox + Live]
+    DB[(RDS PostgreSQL<br/>dev / prod)]
+    DISCORD[Discord Webhooks]
+    RECON[Reconciliation Service<br/>60s Forced Sync]
 
-    subgraph "External Services"
-        TRADIER[Tradier API<br/>Sandbox + Live]
-        DISCORD[Discord Webhooks<br/>Notifications]
-        EMAIL[Resend Email API<br/>Reports]
-    end
-
-    subgraph "Background Services"
-        EMAILSCHED[Email Report Scheduler<br/>APScheduler<br/>Daily/Weekly/Monthly]
-        RECON[Reconciliation Service<br/>60s Forced Sync]
-    end
-
-    %% Client connections
-    UI -->|REST API| AUTH
-    UI -->|REST API| STRAT
-    UI -->|REST API| POS
-    UI -->|REST API| TRADE
-    UI -->|REST API| PERF
-    UI -->|REST API| ADMIN
-    UI -->|REST API| SYS
-    UI -->|REST API| EXEC
-
-    %% Router to Engine
-    STRAT -.->|start strategy| SDW
-    EXEC -.->|start stop| SDW
-
-    %% Engine flow
     TSM -->|Events| SR
     SR -->|Per-Strategy Queue| SDW
     SDW -->|Entry Exit Tick| SE
@@ -83,30 +92,16 @@ graph TB
     %% Broker routing — paper vs live is Tradier SANDBOX vs Tradier LIVE.
     %% ACCOUNT calls only. Market data always uses the live endpoint.
     %% TradingClientManager is not a broker abstraction: both branches return TradierClient.
-    TCM -->|Paper Mode - sandbox| TC
-    TCM -->|Live Mode - live| TC
+    TCM -->|paper to sandbox<br/>live to live| TC
 
-    %% External calls
     TC <-->|REST| TRADIER
     OM -->|await fill| ASM
-    ASM <-->|WebSocket - account events| TRADIER
-    TSM <-->|WebSocket - market events| TRADIER
+    ASM <-->|WS account events| TRADIER
+    TSM <-->|WS market events| TRADIER
 
-    %% Database
-    AUTH ---|Read Write Users| DB
-    STRAT ---|Read Write Strategies| DB
-    POS ---|Read Write Positions| DB
-    TRADE ---|Read Write Trades| DB
-    PERF ---|Read Performance| DB
     SDW ---|Read Write Positions| DB
     OM ---|Write Trades Positions| DB
-    EMAILSCHED ---|Read Trades Performance| DB
-
-    %% Notifications
     OM -.->|Position Events| DISCORD
-    EMAILSCHED -.->|Scheduled Reports| EMAIL
-
-    %% Background
     SDW -.->|60s Interval| RECON
 
     classDef engine fill:#e1f5ff,stroke:#01579b,stroke-width:2px
@@ -117,21 +112,37 @@ graph TB
     class SDW,TSM,SR,SE,RM,SG,OM engine
     class TCM,TC,ASM broker
     class DB db
-    class TRADIER,DISCORD,EMAIL external
+    class TRADIER,DISCORD external
+```
+
+### 1c. Background services
+
+```mermaid
+%%{init: {'flowchart': {'rankSpacing': 30, 'nodeSpacing': 30, 'padding': 8}}}%%
+graph LR
+    EMAILSCHED[Email Report Scheduler<br/>APScheduler<br/>Daily/Weekly/Monthly]
+    RECON2[Reconciliation Service<br/>60s Forced Sync]
+    DB2[(RDS PostgreSQL)]
+    EMAIL[Resend Email API<br/>Reports]
+    TRADIER2[Tradier API]
+
+    EMAILSCHED ---|Read Trades Performance| DB2
+    EMAILSCHED -.->|Scheduled Reports| EMAIL
+    RECON2 ---|Sync Positions| DB2
+    RECON2 -->|poll positions orders| TRADIER2
 ```
 
 ## 2. Database Schema & Relationships
+
+### 2a. Core trading tables
 
 ```mermaid
 erDiagram
     USERS ||--o{ STRATEGIES : owns
     USERS ||--o{ POSITIONS : has
     USERS ||--o{ TRADES : executes
-    USERS ||--o{ RISK_EVENTS : triggers
     STRATEGIES ||--o{ POSITIONS : creates
-    STRATEGIES ||--o{ PERFORMANCE_METRICS : tracks
     POSITIONS ||--o{ TRADES : generates
-    STRATEGIES ||--o{ SYSTEM_EVENTS : logs
 
     USERS {
         uuid id PK
@@ -206,11 +217,34 @@ erDiagram
         string status "filled|rejected|canceled"
         jsonb notes
     }
+```
+
+### 2b. Metrics and event tables
+
+`USERS` and `STRATEGIES` appear here as stubs — their columns are in 2a.
+
+Enum values, kept out of the boxes so they stay narrow:
+`performance_metrics.period` = `daily|weekly|monthly|all_time` · `system_events.event_type` = `order_placed|position_opened|position_closed|risk_alert` · `risk_events.event_type` = `daily_loss|max_drawdown|position_limit` · `risk_events.action_taken` = `halt_entries|close_position|alert_only`
+
+```mermaid
+erDiagram
+    USERS ||--o{ RISK_EVENTS : triggers
+    STRATEGIES ||--o{ PERFORMANCE_METRICS : tracks
+    STRATEGIES ||--o{ SYSTEM_EVENTS : logs
+    STRATEGIES ||--o{ RISK_EVENTS : trips
+
+    USERS {
+        uuid id PK
+    }
+
+    STRATEGIES {
+        uuid id PK
+    }
 
     PERFORMANCE_METRICS {
         uuid id PK
         uuid strategy_id FK
-        string period "daily|weekly|monthly|all_time"
+        string period
         int total_trades
         int winning_trades
         decimal total_pnl
@@ -225,7 +259,7 @@ erDiagram
         uuid id PK
         uuid user_id FK
         uuid strategy_id FK
-        string event_type "order_placed|position_opened|position_closed|risk_alert"
+        string event_type
         string severity "info|warning|error"
         string title
         string detail
@@ -238,9 +272,9 @@ erDiagram
         uuid id PK
         uuid user_id FK
         uuid strategy_id FK
-        string event_type "daily_loss|max_drawdown|position_limit"
+        string event_type
         string severity "warning|critical"
-        string action_taken "halt_entries|close_position|alert_only"
+        string action_taken
         jsonb details
         timestamp timestamp
     }
@@ -248,7 +282,10 @@ erDiagram
 
 ## 3. Trading Execution Flow (Entry Signal → Filled Order)
 
+### 3a. Stream event to a validated buy decision
+
 ```mermaid
+%%{init: {'sequence': {'actorMargin': 10, 'width': 130, 'mirrorActors': false}}}%%
 sequenceDiagram
     participant WS as Tradier WebSocket
     participant TSM as TradierStreamManager
@@ -257,46 +294,29 @@ sequenceDiagram
     participant SE as StrategyExecutor
     participant SG as SignalGenerator
     participant RM as RiskManager
-    participant OM as OrderManager
-    participant TCM as TradingClientManager
-    participant TC as TradierClient
-    participant DB as Database
-    participant Discord as Discord Webhook
 
-    %% Stream event arrives
     WS->>TSM: trade event: SPY @ $502.45
     TSM->>SR: route(event)
     SR->>SDW: queue.put(event)
 
-    %% Accumulate state
     SDW->>SDW: market_state.apply(event)<br/>update underlying_price
-
-    %% Check position state
     SDW->>SDW: position.qty == 0?
     Note over SDW: Yes → Entry logic
 
-    %% Execute entry tick
-    SDW->>SE: execute_strategy_tick(strategy, market_state)
+    SDW->>SE: execute_strategy_tick(strategy, state)
 
-    %% Market hours check
     SE->>SE: is_market_hours()?
     Note over SE: ✓ Market open
-
-    %% Trading window check
     SE->>SE: is_in_entry_window()?
-    Note over SE: ✓ After 9:45 AM
-
-    %% Re-entry cooldown
+    Note over SE: ✓ After 9:45 ET
     SE->>SE: cooldown_expired()?
     Note over SE: ✓ 30s elapsed
 
-    %% Check entry signal
-    SE->>SG: check_entry_signal(market_state, params)
+    SE->>SG: check_entry_signal(state, params)
     SG->>SG: price > 9EMA?<br/>price > VWAP?<br/>volume_spike?
     SG-->>SE: SIGNAL: BUY
 
-    %% Risk validation
-    SE->>RM: calculate_position_size(account, strategy, price)
+    SE->>RM: calculate_position_size(account, price)
     Note over RM: risk pct then max_contracts,<br/>then the at-least-1 floor,<br/>then max_position_size_usd LAST
     RM-->>SE: qty = 1 contract
     Note over SE: qty 0 returns before any gate<br/>or broker call - a skipped entry,<br/>never a zero quantity order
@@ -311,38 +331,45 @@ sequenceDiagram
     Note over RM: Every gate blocks BUYS only.<br/>A sell is always allowed through<br/>so a position stays closeable.
     RM-->>SE: ✓ All checks passed
 
-    %% Execute order
+    Note over SE: Hand off to OrderManager — see 3b
+```
+
+### 3b. Order placement to filled position
+
+```mermaid
+%%{init: {'sequence': {'actorMargin': 10, 'width': 130, 'mirrorActors': false}}}%%
+sequenceDiagram
+    participant SE as StrategyExecutor
+    participant OM as OrderManager
+    participant TCM as TradingClientManager
+    participant TC as TradierClient
+    participant DB as Database
+    participant Discord as Discord Webhook
+
     SE->>OM: execute_signal(strategy, signal, qty)
 
-    %% Entry lockout
     OM->>DB: SELECT FOR UPDATE position<br/>WHERE strategy_id = X
     Note over OM: Row-level lock acquired
 
-    %% Order rate limit
     OM->>OM: check_rate_limit(user, symbol)
     Note over OM: ✓ Last order > 5s ago
 
-    %% Settled-cash precheck BEFORE any broker call
     OM->>OM: estimate = qty x price x 100 + fees
     OM->>OM: available = cached_settled_cash - reservations
     Note over OM: Buys only. If clearly unaffordable,<br/>skip WITHOUT calling the broker.<br/>Cash cached 60s, invalidated on fill.<br/>Sells skip this entirely.
 
-    %% Preview order
     OM->>TCM: preview_order(symbol, qty, side)
     TCM->>TC: POST /v1/accounts/123/orders/preview
     TC-->>TCM: {commission: $0.35, cost: $123.35}
     TCM-->>OM: preview_result
 
-    %% Authoritative cash gate — still decides
     OM->>TC: GET /v1/accounts/123/balances
     TC-->>OM: {cash.cash_available: $1214.07}
     OM->>OM: required = cost + fee_buffer vs settled - reservations
 
-    %% Cash reservation
     OM->>OM: reserve_cash(user_id, amount, 60s TTL)
     Note over OM: In-memory ledger hold
 
-    %% Place order
     OM->>TCM: place_order(SPY260424C00370000, 1, buy, market)
     TCM->>TCM: route_by_mode(user.trading_mode)
     Note over TCM: Mode = paper → Sandbox
@@ -350,7 +377,6 @@ sequenceDiagram
     TC-->>TCM: {id: "789", status: "ok"}
     TCM-->>OM: order_id = "789"
 
-    %% Poll for fill
     loop Every 1.5s (max 30s)
         OM->>TC: GET /v1/accounts/123/orders/789
         TC-->>OM: {status: "pending"}
@@ -359,57 +385,44 @@ sequenceDiagram
     OM->>TC: GET /v1/accounts/123/orders/789
     TC-->>OM: {status: "filled", avg_fill_price: $1.23}
 
-    %% Update database
     OM->>DB: INSERT INTO trades<br/>(symbol, side, qty, price, status)
     OM->>DB: INSERT INTO positions<br/>(symbol, option_symbol, qty, avg_entry_price)
     OM->>DB: INSERT INTO system_events<br/>(event_type: position_opened)
 
-    %% Release cash
     OM->>OM: release_cash_reservation(user_id)
-
-    %% Notifications
     OM->>Discord: POST webhook<br/>Position Opened: SPY Call @ $1.23
 
     OM-->>SE: Order filled successfully
-    SE-->>SDW: Entry complete
-
-    Note over SDW: Position now OPEN<br/>Switch to exit logic
+    Note over SE: Position now OPEN<br/>Switch to exit logic
 ```
 
 ## 4. Exit Signal Flow (Open Position → Close)
 
+### 4a. Deciding to exit
+
 ```mermaid
+%%{init: {'sequence': {'actorMargin': 10, 'width': 130, 'mirrorActors': false}}}%%
 sequenceDiagram
     participant WS as Tradier WebSocket
     participant SDW as StreamDrivenWorker
     participant SE as StrategyExecutor
     participant SG as SignalGenerator
-    participant OM as OrderManager
-    participant TC as TradierClient
-    participant DB as Database
-    participant Discord as Discord
 
-    %% Stream event arrives
     WS->>SDW: trade event: SPY @ $503.10
     SDW->>SDW: market_state.apply(event)
-
-    %% Check position state
     SDW->>SDW: position.qty > 0?
     Note over SDW: Yes → Exit logic
 
-    %% Execute exit tick
-    SDW->>SE: execute_exit_tick(strategy, position, market_state)
+    SDW->>SE: execute_exit_tick(strategy, position, state)
 
-    %% Get current P&L
-    SE->>SE: calculate_unrealized_pnl(position, current_price)
+    SE->>SE: calculate_unrealized_pnl(position, price)
     Note over SE: Entry: $1.23<br/>Current: $1.35<br/>P&L: +9.76%
 
     %% High-water mark, kept on the CONTRACT not the underlying
     SE->>SE: peak_price = max of peak_price and exit_price
     Note over SE: Marked off the held contract's bid.<br/>Marking off the underlying inflated<br/>unrealized P&L by roughly 100x.
 
-    %% Check exit signals
-    SE->>SG: check_exit_signal(position, market_state, params)
+    SE->>SG: check_exit_signal(position, state, params)
 
     %% 1. Stop loss — evaluated first, never gated behind anything
     SG->>SG: pnl_pct <= -stop_loss_pct?
@@ -431,15 +444,26 @@ sequenceDiagram
     Note over SG: Earliest of the EOD floor, the strategy<br/>window, the account window, and a<br/>flatten-mode halt. Most restrictive wins.
 
     SG-->>SE: SIGNAL: SELL trailing stop
+    Note over SE: Hand off to OrderManager — see 4b
+```
 
-    %% Execute sell order
-    SE->>OM: execute_signal(strategy, sell_signal, position.qty)
+### 4b. Selling and closing the position
 
-    %% Place order
-    OM->>TC: POST /v1/accounts/123/orders<br/>{symbol: SPY260424C00370000, qty: 1, side: sell}
+```mermaid
+%%{init: {'sequence': {'actorMargin': 10, 'width': 130, 'mirrorActors': false}}}%%
+sequenceDiagram
+    participant SDW as StreamDrivenWorker
+    participant SE as StrategyExecutor
+    participant OM as OrderManager
+    participant TC as TradierClient
+    participant DB as Database
+    participant Discord as Discord
+
+    SE->>OM: execute_signal(strategy, sell_signal, qty)
+
+    OM->>TC: POST /v1/accounts/123/orders<br/>{SPY260424C00370000, qty 1, sell}
     TC-->>OM: {id: "790", status: "ok"}
 
-    %% Poll for fill
     loop Every 1.5s
         OM->>TC: GET /v1/accounts/123/orders/790
         TC-->>OM: {status: "pending"}
@@ -448,19 +472,16 @@ sequenceDiagram
     OM->>TC: GET /v1/accounts/123/orders/790
     TC-->>OM: {status: "filled", avg_fill_price: $1.35}
 
-    %% Update database
     OM->>DB: INSERT INTO trades<br/>side sell, price $1.35, pnl $12.00,<br/>mfe_price and mae_price from the position
     OM->>DB: UPDATE positions SET<br/>qty = 0, closed_at = NOW()
     OM->>DB: INSERT INTO system_events<br/>(event_type: position_closed)
     OM->>DB: UPDATE performance_metrics
 
-    %% Notifications
     OM->>Discord: POST webhook<br/>Position Closed: SPY Call<br/>Entry: $1.23, Exit: $1.35<br/>P&L: +$12.00 (+9.76%)
 
     OM-->>SE: Exit complete
     SE-->>SDW: Position closed
 
-    %% Re-entry cooldown
     SDW->>SDW: set_cooldown_until(now + 30s)
     Note over SDW: Prevent immediate re-entry
 ```
@@ -477,20 +498,13 @@ sequenceDiagram
 > does not exist; the real one is `services/tradier_reconcile.py`.
 
 
+### 5a. API surface — routers, auth, models
+
 ```mermaid
+%%{init: {'flowchart': {'rankSpacing': 30, 'nodeSpacing': 30, 'padding': 8}}}%%
 graph LR
-    subgraph "Core Models"
-        M[models.py<br/>User, Strategy,<br/>Position, Trade,<br/>Performance]
-        DB[database.py<br/>Multi-Env<br/>Connection Pool]
-        CFG[config.py<br/>Settings<br/>API Keys]
-        SCH[schemas.py<br/>Pydantic<br/>Request/Response]
-    end
-
-    subgraph "Authentication"
-        AUTH[auth.py<br/>JWT<br/>Role Guards]
-    end
-
-    subgraph "Routers"
+    subgraph ROUTERS["Routers"]
+        direction TB
         R1[strategies.py]
         R2[positions.py]
         R3[trades.py]
@@ -499,34 +513,18 @@ graph LR
         R6[auth.py, performance.py,<br/>risk_events.py, system.py,<br/>trading.py, events.py]
     end
 
-    subgraph "Engine Core"
-        SDW[stream_driven_worker.py<br/>Singleton Task Manager<br/>arm - drift check - reselect]
-        TSM[tradier_stream_manager.py<br/>MARKET WebSocket]
-        TAS[tradier_account_stream.py<br/>ACCOUNT WebSocket<br/>pushed order events]
-        SR[stream_router.py<br/>Multiplexer]
-        SE[strategy_executor.py<br/>Orchestrator]
+    AUTH[auth.py<br/>JWT<br/>Role Guards]
+    SCH[schemas.py<br/>Pydantic<br/>Request/Response]
+
+    subgraph CORE["Core Models"]
+        direction TB
+        M[models.py<br/>User, Strategy,<br/>Position, Trade,<br/>Performance]
+        DB[database.py<br/>Multi-Env<br/>Connection Pool]
+        CFG[config.py<br/>Settings<br/>API Keys]
     end
 
-    subgraph "Execution Modules"
-        RM[risk_manager.py<br/>Position Sizing<br/>Pre-Trade Checks]
-        SG[signal_generator.py<br/>Indicators<br/>Entry/Exit Logic]
-        OM[order_manager.py<br/>Order Lifecycle<br/>Cash Ledger]
-        TCM[trading_client_manager.py<br/>Paper/Live Router]
-    end
+    ENG[Trading engine<br/>see 5b]
 
-    subgraph "Broker Clients"
-        TC[tradier_integration/client.py<br/>TWO factories:<br/>get_market_client - always LIVE<br/>get_tradier_client - env singleton,<br/>non-account calls only]
-        TR[tradier_integration/router.py<br/>uses _client per user]
-    end
-
-    subgraph "Services"
-        RPT[notifications/reports.py<br/>Email Reports]
-        SCHED[services/email_report_scheduler.py<br/>APScheduler]
-        RECON[services/tradier_reconcile.py<br/>account history to<br/>commission and fees]
-        DISC[notifications/discord.py<br/>per-user webhook<br/>from the USER row]
-    end
-
-    %% Dependencies
     R1 --> AUTH
     R2 --> AUTH
     R3 --> AUTH
@@ -536,12 +534,42 @@ graph LR
     R1 --> M
     R2 --> M
     R3 --> M
-    R4 --> SDW
     R5 --> M
+    R4 -.->|start stop| ENG
+
+    R1 --> SCH
+    R2 --> SCH
 
     M --> DB
     AUTH --> DB
     AUTH --> CFG
+
+    classDef core fill:#e3f2fd,stroke:#1565c0,stroke-width:2px
+    class M,DB,CFG,SCH core
+```
+
+### 5b. Engine core and execution modules
+
+```mermaid
+%%{init: {'flowchart': {'rankSpacing': 30, 'nodeSpacing': 30, 'padding': 8}}}%%
+graph LR
+    subgraph ENGINE["Engine Core"]
+        SDW[stream_driven_worker.py<br/>Singleton Task Manager<br/>arm - drift check - reselect]
+        TSM[tradier_stream_manager.py<br/>MARKET WebSocket]
+        TAS[tradier_account_stream.py<br/>ACCOUNT WebSocket<br/>pushed order events]
+        SR[stream_router.py<br/>Multiplexer]
+        SE[strategy_executor.py<br/>Orchestrator]
+    end
+
+    subgraph EXECMOD["Execution Modules"]
+        RM[risk_manager.py<br/>Position Sizing<br/>Pre-Trade Checks]
+        SG[signal_generator.py<br/>Indicators<br/>Entry/Exit Logic]
+        OM[order_manager.py<br/>Order Lifecycle<br/>Cash Ledger]
+        TCM[trading_client_manager.py<br/>Paper/Live Router]
+    end
+
+    M[models.py]
+    BROK[Broker clients<br/>and services<br/>see 5c]
 
     SDW --> TSM
     SDW --> SR
@@ -549,45 +577,79 @@ graph LR
     SDW --> M
     SDW --> OM
 
-    TSM --> TC
-    TAS --> TC
-
     SE --> RM
     SE --> SG
     SE --> OM
 
     OM --> TCM
     OM --> M
-    OM --> RPT
     OM --> TAS
 
-    TCM --> TC
+    TSM --> BROK
+    TAS --> BROK
+    TCM --> BROK
+    SDW --> BROK
+    SE --> BROK
+    OM --> BROK
 
+    classDef core fill:#e3f2fd,stroke:#1565c0,stroke-width:2px
+    classDef engine fill:#fff3e0,stroke:#e65100,stroke-width:2px
+
+    class M core
+    class SDW,TSM,SR,SE,RM,SG,OM,TCM engine
+```
+
+### 5c. Broker clients and services
+
+```mermaid
+%%{init: {'flowchart': {'rankSpacing': 30, 'nodeSpacing': 30, 'padding': 8}}}%%
+graph LR
+    OM[order_manager.py]
+    TCM[trading_client_manager.py]
+    TAS[tradier_account_stream.py]
+    TSM[tradier_stream_manager.py]
+
+    subgraph BROKERC["Broker Clients"]
+        TC[tradier_integration/client.py<br/>TWO factories:<br/>get_market_client<br/>- always LIVE<br/>get_tradier_client<br/>- env singleton,<br/>non-account calls only]
+        TR[tradier_integration/router.py<br/>uses _client per user]
+    end
+
+    subgraph SVCS["Services"]
+        RPT[notifications/reports.py<br/>Email Reports]
+        SCHED[services/<br/>email_report_scheduler.py<br/>APScheduler]
+        RECON[services/tradier_reconcile.py<br/>account history to<br/>commission and fees]
+        DISC[notifications/discord.py<br/>per-user webhook<br/>from the USER row]
+    end
+
+    M[models.py]
+    CFG[config.py]
+
+    TCM --> TC
+    TAS --> TC
+    TSM --> TC
+    TAS --> TCM
     TC --> CFG
 
+    OM --> RPT
+    OM --> DISC
     SCHED --> RPT
     SCHED --> M
-
     RECON --> TCM
     RECON --> M
-    OM --> DISC
-    TAS --> TCM
-    TSM --> TC
-    SDW --> TC
-    SE --> TC
 
     classDef core fill:#e3f2fd,stroke:#1565c0,stroke-width:2px
     classDef engine fill:#fff3e0,stroke:#e65100,stroke-width:2px
     classDef broker fill:#f3e5f5,stroke:#6a1b9a,stroke-width:2px
 
-    class M,DB,CFG,SCH core
-    class SDW,TSM,SR,SE,RM,SG,OM,TCM engine
+    class M,CFG core
+    class OM,TCM,TAS,TSM engine
     class TC,TR broker
 ```
 
 ## 6. Multi-Environment Database Routing
 
 ```mermaid
+%%{init: {'flowchart': {'rankSpacing': 30, 'nodeSpacing': 30, 'padding': 8}}}%%
 graph TB
     subgraph "API Process"
         REQ[Incoming Request<br/>JWT Token]
@@ -609,17 +671,11 @@ graph TB
         TEST[(vegapunk_test<br/>port 5433<br/>NOT migrated to RDS)]
     end
 
-    %% API routing
-    REQ -->|env dev| MW
+    %% API routing — one request path, three destinations
+    REQ -->|env claim| MW
     MW --> ROUTER
     ROUTER -->|select dev engine| DEV
-
-    REQ -->|env test| MW
-    MW --> ROUTER
     ROUTER -->|select test engine| TEST
-
-    REQ -->|env prod| MW
-    MW --> ROUTER
     ROUTER -->|select prod engine| PROD
 
     %% Engine routing
@@ -635,7 +691,10 @@ graph TB
 
 ## 7. Order Lifecycle State Machine
 
+### 7a. Entry: idle to an open position
+
 ```mermaid
+%%{init: {'state': {'nodeSpacing': 30, 'rankSpacing': 30}}}%%
 stateDiagram-v2
     [*] --> Idle: Strategy Active
 
@@ -656,7 +715,7 @@ stateDiagram-v2
     RateLimit --> Idle: Last Order<br/>< 5s ago
     RateLimit --> CashPrecheck: Rate Limit<br/>Passed
 
-    CashPrecheck --> Idle: BUY clearly unaffordable —<br/>skipped with NO broker call.<br/>SELLS bypass this entirely
+    CashPrecheck --> Idle: BUY clearly<br/>unaffordable — NO<br/>broker call. SELLS<br/>bypass this entirely
     CashPrecheck --> Preview: Estimate fits<br/>cached settled cash
 
     Preview --> Idle: Buying Power<br/>Insufficient
@@ -672,19 +731,58 @@ stateDiagram-v2
     PollStatus --> Unconfirmed: 30s Elapsed —<br/>broker never answered
 
     Filled --> UpdateDB: Write Trade<br/>+ Position
+    UpdateDB --> Notify: DB<br/>Committed
+    Notify --> OpenPosition: Discord<br/>+ Email
+
+    ReleaseCash --> Idle: Cash<br/>Available
+
+    note right of RiskValidation
+        Checks:
+        - Account daily loss cap
+        - Strategy daily loss limit
+        - Max drawdown
+        - Position limits
+        - Trading mode consistency
+    end note
+
+    note right of Preview
+        Tradier /preview:
+        - Validate contract
+        - Check buying power
+        - Get commission/fees
+    end note
+```
+
+### 7b. Unconfirmed orders: the reconcile path
+
+```mermaid
+%%{init: {'state': {'nodeSpacing': 30, 'rankSpacing': 30}}}%%
+stateDiagram-v2
+    PollStatus --> Unconfirmed: 30s Elapsed —<br/>broker never answered
 
     Unconfirmed --> Idle: Record order id.<br/>BLOCK further BUYS.<br/>Local state UNTOUCHED —<br/>the order may still fill!
 
     Unconfirmed --> Resolve: Reconcile tick (60s)<br/>re-polls the order
     Resolve --> Backfill: Broker says FILLED
     Resolve --> Idle: rejected canceled expired<br/>→ unblock, nothing taken
-    Backfill --> Idle: Write Trade at the broker's<br/>real avg_fill_price → unblock
+    Backfill --> Idle: Write Trade at the<br/>broker's real<br/>avg_fill_price → unblock
+```
 
-    UpdateDB --> Notify: DB<br/>Committed
-    Notify --> OpenPosition: Discord<br/>+ Email
+> **"Unconfirmed" is NOT "didn't happen".** We do not cancel and do not assume failure —
+> the broker may still fill it.
+>
+> On **2026-07-13** two orders timed out at 30s and **filled anyway**. The engine wrote no
+> `Position`, so it believed it was flat while holding 6 TSLA contracts: no stop, no
+> take-profit, and free to stack a second entry on top.
+>
+> Hence: block further **buys** (never sells — an exit must always be able to run), and
+> re-poll on the reconcile tick to backfill the `Trade` row.
 
-    ReleaseCash --> Idle: Cash<br/>Available
+### 7c. Exit: open position back to idle
 
+```mermaid
+%%{init: {'state': {'nodeSpacing': 30, 'rankSpacing': 30}}}%%
+stateDiagram-v2
     OpenPosition --> ExitSignalCheck: Stream Event<br/>(position open)
 
     ExitSignalCheck --> OpenPosition: No Exit<br/>Signal
@@ -703,38 +801,6 @@ stateDiagram-v2
     NotifyExit --> Cooldown: Discord<br/>+ Email
 
     Cooldown --> Idle: 30s<br/>Elapsed
-
-    note right of RiskValidation
-        Checks:
-        - Account daily loss cap
-        - Strategy daily loss limit
-        - Max drawdown
-        - Position limits
-        - Trading mode consistency
-    end note
-
-    note right of Preview
-        Tradier /preview:
-        - Validate contract
-        - Check buying power
-        - Get commission/fees
-    end note
-
-    note right of Unconfirmed
-        "Unconfirmed" is NOT "didn't happen".
-        We do NOT cancel and do NOT assume failure —
-        the broker may still fill it.
-
-        2026-07-13: two orders timed out at 30s and
-        FILLED anyway. The engine wrote no Position,
-        so it believed it was flat while holding 6
-        TSLA contracts: no stop, no take-profit, and
-        free to stack a second entry on top.
-
-        Hence: block further BUYS (never SELLS — an
-        exit must always run), and re-poll on the
-        reconcile tick to backfill the Trade row.
-    end note
 
     note right of ExitSignalCheck
         Exit Triggers:
@@ -782,22 +848,20 @@ singleton with no user of its own and cannot route itself.
 The account stream is an **accelerator, not a replacement** — REST polling remains the
 fallback, so if it drops the engine behaves exactly as it did before.
 
-```mermaid
-graph TB
-    subgraph "Tradier WebSockets (two sessions, one per type)"
-        WS[wss://ws.tradier.com<br/>/v1/markets/events<br/>MARKET DATA - always live]
-        WSA[wss://sandbox-ws OR ws.tradier.com<br/>/v1/accounts/events<br/>ORDER EVENTS - follows the USER's<br/>live or paper selection]
-    end
+### 8a. Account stream — pushed order events
 
-    subgraph "TradierAccountStreamManager (Singleton)"
+```mermaid
+%%{init: {'flowchart': {'rankSpacing': 30, 'nodeSpacing': 30, 'padding': 8}}}%%
+graph TB
+    WSA[wss://sandbox-ws OR ws.tradier.com<br/>/v1/accounts/events<br/>ORDER EVENTS - follows the USER's<br/>live or paper selection]
+
+    subgraph ASMGR["TradierAccountStreamManager (Singleton)"]
         ASM[Account Stream Manager<br/>events: order]
         ALATEST[latest event per order_id]
         AWAIT[wait_for_terminal<br/>wakes the fill poll instantly]
     end
 
-    subgraph "OrderManager"
-        OM[_await_terminal_order<br/>REST poll 1.5s / 30s deadline<br/>sleeps ON the stream]
-    end
+    OM[_await_terminal_order<br/>REST poll 1.5s / 30s deadline<br/>sleeps ON the stream]
 
     WSA -->|order pending open filled| ASM
     ASM --> ALATEST
@@ -805,32 +869,46 @@ graph TB
     AWAIT -.->|terminal - wake early| OM
     OM -.->|no stream? fall back to REST| OM
 
-    subgraph "TradierStreamManager (Singleton)"
+    classDef acct fill:#fce4ec,stroke:#880e4f,stroke-width:2px
+    class WSA,ASM,ALATEST,AWAIT,OM acct
+```
+
+The account stream carries **no symbol and no side**. Its fields are `id`, `status`,
+`avg_fill_price` and `executed_quantity` — it is a *notification* keyed on order id.
+The canonical order still comes from a REST `get_order`.
+
+### 8b. Market stream — price ticks fanned out per strategy
+
+```mermaid
+%%{init: {'flowchart': {'rankSpacing': 30, 'nodeSpacing': 30, 'padding': 8}}}%%
+graph TB
+    WS[wss://ws.tradier.com<br/>/v1/markets/events<br/>MARKET DATA - always live]
+
+    subgraph SMGR["TradierStreamManager (Singleton)"]
         SM[Stream Manager<br/>Single Persistent Connection]
         RECONN[Auto-Reconnect<br/>5s Backoff]
         PARSER[Event Parser<br/>trade quote tradex summary]
     end
 
-    subgraph "StreamRouter (Multiplexer)"
+    subgraph ROUTER["StreamRouter (Multiplexer)"]
         REF[Reference Counter<br/>Per Symbol]
         Q1[Queue: Strategy 1<br/>Symbols: SPY, SPX]
         Q2[Queue: Strategy 2<br/>Symbols: QQQ]
         Q3[Queue: Strategy 3<br/>Symbols: SPY, IWM]
     end
 
-    subgraph "StreamDrivenWorker"
+    subgraph WORKER["StreamDrivenWorker"]
         T1[Task 1: Strategy 1<br/>await queue.get]
         T2[Task 2: Strategy 2<br/>await queue.get]
         T3[Task 3: Strategy 3<br/>await queue.get]
     end
 
-    subgraph "Market State Accumulators"
+    subgraph STATE["Market State Accumulators"]
         MS1[Strategy 1 State<br/>SPY: $502.45<br/>SPX: $5,234.12]
         MS2[Strategy 2 State<br/>QQQ: $412.33]
         MS3[Strategy 3 State<br/>SPY: $502.45<br/>IWM: $198.76]
     end
 
-    %% Connections
     WS -->|WebSocket Events| SM
     SM -->|Parse| PARSER
     PARSER -->|Route by Symbol| REF
@@ -849,32 +927,27 @@ graph TB
     T2 -->|update| MS2
     T3 -->|update| MS3
 
-    %% Reconnect
     SM -.->|Connection Lost| RECONN
     RECONN -.->|Reconnect| WS
 
-    %% Subscriptions
     T1 -.->|subscribe SPY SPX| REF
     T2 -.->|subscribe QQQ| REF
     T3 -.->|subscribe SPY IWM| REF
 
-    Note1[Reference Counting is GLOBAL across strategies:<br/>SPY: 2 consumers → stays subscribed<br/>If Task 1 stops → SPY: 1 consumer<br/>If Task 3 stops → SPY: 0 → unsubscribe<br/><br/>Each strategy tracks its OWN streamed_symbols:<br/>unsubscribing a symbol it never subscribed would<br/>decrement another strategy's count and kill its feed]
-
-    Note2[Account stream carries NO symbol and NO side.<br/>Fields: id, status, avg_fill_price, executed_quantity.<br/>It is a NOTIFICATION keyed on order id —<br/>the canonical order still comes from REST get_order.]
-
-    style Note1 fill:#fff3e0,stroke:#e65100
-    style Note2 fill:#fff3e0,stroke:#e65100
-
     classDef ws fill:#e1f5ff,stroke:#01579b,stroke-width:2px
     classDef router fill:#f3e5f5,stroke:#4a148c,stroke-width:2px
     classDef worker fill:#e8f5e9,stroke:#1b5e20,stroke-width:2px
-    classDef acct fill:#fce4ec,stroke:#880e4f,stroke-width:2px
 
     class WS,SM,RECONN,PARSER ws
     class REF,Q1,Q2,Q3 router
     class T1,T2,T3,MS1,MS2,MS3 worker
-    class WSA,ASM,ALATEST,AWAIT,OM acct
 ```
+
+**Reference counting is GLOBAL across strategies.** SPY with 2 consumers stays
+subscribed; if Task 1 stops it drops to 1; if Task 3 also stops it hits 0 and
+unsubscribes. Each strategy tracks its **own** `streamed_symbols` — unsubscribing a
+symbol it never subscribed to would decrement another strategy's count and kill that
+strategy's feed.
 
 ## 9. Risk Management Hierarchy
 
@@ -892,7 +965,10 @@ graph TB
 > cap, so every strategy predating its enforcement behaves exactly as before.
 
 
+### 9a. Sizing and gates 1–6 (account-level)
+
 ```mermaid
+%%{init: {'flowchart': {'rankSpacing': 30, 'nodeSpacing': 30, 'padding': 8}}}%%
 graph TB
     SIZE[Position Sizing<br/>risk_manager.calculate_position_size]
     SIZE -->|qty one or more| START[Order Request]
@@ -920,8 +996,22 @@ graph TB
     L5 -->|Drawdown under 10%| L6{Level 6:<br/>Position Limits}
     L5 -->|Drawdown over 10%| REJECT5[Reject: Max drawdown exceeded.<br/>A limit, not a latch: it clears when<br/>equity recovers above the band]
 
-    L6 -->|Count under Max| L7{Level 7:<br/>Entry Trading Window}
+    L6 -->|Count under Max| NEXT[Continue to Level 7<br/>see 9b]
     L6 -->|Count at Max| REJECT6[Reject: Max positions<br/>reached]
+
+    classDef reject fill:#ffebee,stroke:#c62828,stroke-width:2px
+    classDef check fill:#fff3e0,stroke:#e65100,stroke-width:2px
+
+    class REJECT0,REJECT1,REJECTH,REJECT2,REJECT3,REJECT4,REJECT5,REJECT6 reject
+    class SIZE,L1,LH,L2,L3,L4,L5,L6 check
+```
+
+### 9b. Gates 7–13 (timing, lockout, cash) to placement
+
+```mermaid
+%%{init: {'flowchart': {'rankSpacing': 30, 'nodeSpacing': 30, 'padding': 8}}}%%
+graph TB
+    FROM[Passed Level 6<br/>see 9a] --> L7{Level 7:<br/>Entry Trading Window}
 
     L7 -->|Within window| L8{Level 8:<br/>Market Hours}
     L7 -->|Outside window| REJECT7[Reject: Outside<br/>trading window]
@@ -948,13 +1038,12 @@ graph TB
 
     PLACE --> SUCCESS[Order Placed]
 
-    %% Styling
     classDef reject fill:#ffebee,stroke:#c62828,stroke-width:2px
     classDef check fill:#fff3e0,stroke:#e65100,stroke-width:2px
     classDef success fill:#e8f5e9,stroke:#2e7d32,stroke-width:2px
 
-    class REJECT0,REJECT1,REJECTH,REJECT2,REJECT3,REJECT4,REJECT5,REJECT6,REJECT7,REJECT8,REJECT9,REJECT10,REJECT11,REJECT12,REJECT13 reject
-    class SIZE,L1,LH,L2,L3,L4,L5,L6,L7,L8,L9,L10,L11,L12,L13 check
+    class REJECT7,REJECT8,REJECT9,REJECT10,REJECT11,REJECT12,REJECT13 reject
+    class L7,L8,L9,L10,L11,L12,L13 check
     class PLACE,SUCCESS success
 ```
 
@@ -989,7 +1078,8 @@ graph TB
 > reset. A stored boolean would outlive the condition that set it.
 
 ```mermaid
-graph TB
+%%{init: {'flowchart': {'rankSpacing': 30, 'nodeSpacing': 30, 'padding': 8}}}%%
+graph LR
     subgraph "Angular 20 UI"
         subgraph "Pages (Lazy Loaded)"
             SHELL[Dashboard Shell<br/>Toolbar + Sidenav<br/>Role-Filtered Nav<br/>Done For The Day<br/>Hosts Cash Pause Banner]

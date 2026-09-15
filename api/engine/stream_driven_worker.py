@@ -198,6 +198,11 @@ class StrategyMarketState:
             "option_symbol": self.option_symbol,   # OCC symbol needed for order placement
             "price": self.underlying_price,
             "volume": self.tick_volume,
+            # Exchange cumulative intraday volume. SignalGenerator differences
+            # it across a minute to get that bar's real volume — summing the
+            # per-tick `volume` above would only capture the ~1 trade a second
+            # we sample out of the several hundred that print.
+            "cum_volume": self.cum_volume,
             "bid": self.option_bid,
             "ask": self.option_ask,
             # Age of the bid/ask above, in seconds. None means "never quoted".

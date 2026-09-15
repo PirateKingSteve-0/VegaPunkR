@@ -14,7 +14,7 @@ from engine.order_manager import OrderManager
 from engine.stream_driven_worker import StreamDrivenWorker
 from engine.signal_generator import Signal, SignalGenerator, resolve_direction
 import engine.signal_generator as sg
-from datetime import datetime
+from datetime import datetime, timedelta
 
 # Freeze the clock mid-session. The entry-time gate (lower bound market open,
 # upper bound the forced-exit time) runs before anything this file tests, so
@@ -86,8 +86,14 @@ def entry_signal_for(direction, price, entry_signal='price_above_9ema_and_vwap')
                                'ema_period': 9, 'use_vwap': True})
     db.add(st); db.flush(); db.commit()
     gen = SignalGenerator()
+    # One sample per MINUTE. The history aggregates into 1-minute bars as of
+    # 2026-09-10 (TODO.md G3), so 30 calls at the same wall-clock instant would
+    # produce zero completed bars and the EMA gate would block every entry.
+    # `ts` is injectable precisely so this does not need a real clock.
+    base = datetime(2026, 9, 10, 14, 0, 0)
     for i in range(30):                      # rising history -> EMA/VWAP below spot
-        gen._update_history("SPY", 700.0 + i, 1_000_000)
+        gen._update_history("SPY", 700.0 + i, 1_000_000,
+                            ts=base + timedelta(minutes=i))
     return gen.check_entry_signal(strategy=st, symbol="SPY", current_price=price,
                                   current_volume=1_000_000, user=u)
 

@@ -14,7 +14,7 @@
         <div class="form-section">
           <h2>Basic Information</h2>
 
-          <mat-form-field appearance="outline" class="full-width">
+          <mat-form-field appearance="outline" subscriptSizing="dynamic" class="full-width">
             <mat-label>Strategy Name</mat-label>
             <input matInput formControlName="name" placeholder="e.g., MACD Momentum Strategy">
             <mat-icon matPrefix>psychology</mat-icon>
@@ -27,7 +27,7 @@
           </mat-form-field>
 
           <div class="form-row">
-            <mat-form-field appearance="outline">
+            <mat-form-field appearance="outline" subscriptSizing="dynamic">
               <mat-label>Strategy Type</mat-label>
               <mat-select formControlName="strategy_type">
                 @for (type of strategyTypes; track type) {
@@ -58,7 +58,7 @@
           </div>
 
           <div class="form-row">
-            <mat-form-field appearance="outline">
+            <mat-form-field appearance="outline" subscriptSizing="dynamic">
               <mat-label>Timeframe</mat-label>
               <mat-select formControlName="timeframe">
                 <mat-option value="1m">1 Minute</mat-option>
@@ -111,7 +111,7 @@
           <h2>Risk Management</h2>
 
           <div class="form-row">
-            <mat-form-field appearance="outline">
+            <mat-form-field appearance="outline" subscriptSizing="dynamic">
               <mat-label>Stop Loss</mat-label>
               <input matInput type="number" formControlName="stop_loss_percentage" step="0.1">
               <span matSuffix>%</span>
@@ -169,12 +169,12 @@
           </p>
 
           <div class="form-row form-row-3">
-            <mat-form-field appearance="outline">
+            <mat-form-field appearance="outline" subscriptSizing="dynamic">
               <mat-label>Delta Min</mat-label>
               <input matInput type="number" formControlName="delta_min" step="0.05" min="0.01" max="1">
             </mat-form-field>
 
-            <mat-form-field appearance="outline">
+            <mat-form-field appearance="outline" subscriptSizing="dynamic">
               <mat-label>Delta Max</mat-label>
               <input matInput type="number" formControlName="delta_max" step="0.05" min="0.01" max="1">
             </mat-form-field>
@@ -184,6 +184,72 @@
               <input matInput type="number" formControlName="min_open_interest" step="100" min="0">
               <mat-hint>Liquidity floor. Contracts below this are skipped.</mat-hint>
             </mat-form-field>
+          </div>
+
+          <div class="form-row">
+            <mat-form-field appearance="outline" subscriptSizing="dynamic">
+              <mat-label>Max Bid/Ask Spread</mat-label>
+              <input matInput type="number" formControlName="max_bid_ask_spread"
+                     step="0.01" min="0.001" max="1">
+              <mat-hint>Fraction, not percent — 0.20 means 20%.</mat-hint>
+            </mat-form-field>
+          </div>
+        </div>
+
+        <!-- Entry Signal -->
+        <div class="form-section">
+          <h2>Entry Signal</h2>
+          <p class="section-hint">
+            The three checks that must ALL pass before an entry is considered.
+            EMA and VWAP average <strong>price</strong>; the volume filter is a
+            separate test on <strong>volume</strong>. Periods are counted in
+            bars, and one bar is {{ ENGINE.barMinutes }} minute — see Engine
+            Settings below.
+          </p>
+
+          <div class="form-row">
+            <mat-form-field appearance="outline" subscriptSizing="dynamic">
+              <mat-label>EMA Period (bars)</mat-label>
+              <input matInput type="number" formControlName="ema_period"
+                     step="1" min="1" [max]="ENGINE.historyBars">
+              <mat-hint>
+                {{ strategyForm.get('ema_period')?.value || 0 }} bars =
+                {{ (strategyForm.get('ema_period')?.value || 0) * ENGINE.barMinutes }} minutes.
+                Max {{ ENGINE.historyBars }} — the engine keeps no more history than that.
+              </mat-hint>
+            </mat-form-field>
+
+            <div class="checkbox-cell">
+              <mat-checkbox formControlName="use_vwap">
+                Require price on the right side of VWAP
+              </mat-checkbox>
+              <p class="checkbox-hint">
+                Session volume-weighted average price, accumulated from the open.
+                Calls need price above it, puts below.
+              </p>
+            </div>
+          </div>
+
+          <div class="form-row">
+            <mat-form-field appearance="outline" subscriptSizing="dynamic">
+              <mat-label>Min Volume Multiplier</mat-label>
+              <input matInput type="number" formControlName="min_volume_multiplier"
+                     step="0.1" min="0.1" max="10">
+              <mat-hint>
+                This bar's volume vs the last {{ ENGINE.volumeLookbackBars }} bars
+                ({{ ENGINE.volumeLookbackBars * ENGINE.barMinutes }} min).
+                1.5 is roughly the 80th percentile minute; 2.0 fires a few times a day.
+              </mat-hint>
+            </mat-form-field>
+
+            <div class="checkbox-cell">
+              <mat-checkbox formControlName="volume_spike_required">
+                Require a volume spike
+              </mat-checkbox>
+              <p class="checkbox-hint">
+                Off means the multiplier above is ignored entirely.
+              </p>
+            </div>
           </div>
         </div>
 
@@ -295,6 +361,55 @@
             </mat-checkbox>
             <mat-hint>Strategy will start executing trades when active</mat-hint>
           </div>
+        </div>
+
+        <!-- Engine Settings — read-only, account-wide -->
+        <div class="form-section">
+          <h2>Engine Settings</h2>
+          <p class="section-hint">
+            Everything above is <strong>per strategy</strong> and saved with this
+            form. The values below are <strong>compiled into the engine</strong>,
+            apply to every strategy, and can only be changed in code with a
+            restart. They are shown because they define the units the settings
+            above are measured in.
+          </p>
+
+          <dl class="engine-grid">
+            <div class="engine-item">
+              <dt>Bar size</dt>
+              <dd>{{ ENGINE.barMinutes }} minute</dd>
+              <p>
+                What one "period" counts. An EMA period of
+                {{ strategyForm.get('ema_period')?.value || 0 }} is
+                {{ (strategyForm.get('ema_period')?.value || 0) * ENGINE.barMinutes }}
+                minutes of price, not ticks and not seconds.
+              </p>
+            </div>
+            <div class="engine-item">
+              <dt>History kept</dt>
+              <dd>{{ ENGINE.historyBars }} bars</dd>
+              <p>
+                {{ ENGINE.historyBars * ENGINE.barMinutes }} minutes. Any period
+                longer than this cannot be computed, and an indicator that cannot
+                be computed <strong>blocks entries</strong> rather than being skipped.
+              </p>
+            </div>
+            <div class="engine-item">
+              <dt>Volume baseline</dt>
+              <dd>{{ ENGINE.volumeLookbackBars }} bars</dd>
+              <p>
+                What the volume multiplier compares against — the trailing
+                {{ ENGINE.volumeLookbackBars * ENGINE.barMinutes }} minutes.
+              </p>
+            </div>
+            <div class="engine-item">
+              <dt>Re-entry cooldown</dt>
+              <dd>{{ ENGINE.reentryCooldownSeconds }}s</dd>
+              <p>
+                Enforced after every close, on top of anything set above.
+              </p>
+            </div>
+          </dl>
         </div>
 
         <!-- Actions -->
