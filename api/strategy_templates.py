@@ -108,6 +108,7 @@ class StrategyTemplates:
 
                 # Time-based entry/exit windows
                 "entry_after_open_minutes": 30,
+                "entry_before_et": "11:30",
                 "exit_before_close_minutes": 15,
                 "max_hold_time_minutes": 30,
 
@@ -159,6 +160,7 @@ class StrategyTemplates:
                 "trailing_stop_activation": 20,
                 "trailing_stop_distance": 10,
                 "entry_after_open_minutes": 30,
+                "entry_before_et": "11:30",
                 "exit_before_close_minutes": 20,
                 "max_hold_time_minutes": 20,
                 "avoid_economic_news": True,   # DECLARED, NOT IMPLEMENTED — see docs/econ-calendar.md
@@ -209,6 +211,7 @@ class StrategyTemplates:
                 "trailing_stop_activation": 15,
                 "trailing_stop_distance": 10,
                 "entry_after_open_minutes": 30,
+                "entry_before_et": "11:30",
                 "exit_before_close_minutes": 15,
                 "max_hold_time_minutes": 30,
                 "avoid_economic_news": True,   # DECLARED, NOT IMPLEMENTED — see docs/econ-calendar.md
@@ -258,6 +261,7 @@ class StrategyTemplates:
                 "trailing_stop_activation": 20,
                 "trailing_stop_distance": 10,
                 "entry_after_open_minutes": 30,
+                "entry_before_et": "11:30",
                 "exit_before_close_minutes": 20,
                 "max_hold_time_minutes": 20,
                 "avoid_economic_news": True,   # DECLARED, NOT IMPLEMENTED — see docs/econ-calendar.md
@@ -308,6 +312,7 @@ class StrategyTemplates:
                 "trailing_stop_activation": 15,
                 "trailing_stop_distance": 10,
                 "entry_after_open_minutes": 30,
+                "entry_before_et": "11:30",
                 "exit_before_close_minutes": 15,
                 "max_hold_time_minutes": 30,
                 "avoid_economic_news": True,   # DECLARED, NOT IMPLEMENTED — see docs/econ-calendar.md
@@ -357,6 +362,7 @@ class StrategyTemplates:
                 "trailing_stop_activation": 18,
                 "trailing_stop_distance": 10,
                 "entry_after_open_minutes": 30,
+                "entry_before_et": "11:30",
                 "exit_before_close_minutes": 15,
                 "max_hold_time_minutes": 25,
                 "avoid_economic_news": True,   # DECLARED, NOT IMPLEMENTED — see docs/econ-calendar.md
@@ -406,6 +412,7 @@ class StrategyTemplates:
                 "trailing_stop_activation": 15,
                 "trailing_stop_distance": 10,
                 "entry_after_open_minutes": 30,
+                "entry_before_et": "11:30",
                 "exit_before_close_minutes": 15,
                 "max_hold_time_minutes": 30,
                 "avoid_economic_news": True,   # DECLARED, NOT IMPLEMENTED — see docs/econ-calendar.md
@@ -455,6 +462,7 @@ class StrategyTemplates:
                 "trailing_stop_activation": 15,
                 "trailing_stop_distance": 10,
                 "entry_after_open_minutes": 30,
+                "entry_before_et": "11:30",
                 "exit_before_close_minutes": 15,
                 "max_hold_time_minutes": 30,
                 "avoid_economic_news": True,   # DECLARED, NOT IMPLEMENTED — see docs/econ-calendar.md

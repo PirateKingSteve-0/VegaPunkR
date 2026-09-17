@@ -22,7 +22,14 @@ from sqlalchemy.orm import Session
 
 from models import User, Strategy, Position
 from engine.risk_manager import RiskManager, RiskCheckResult
-from engine.signal_generator import SignalGenerator, Signal, forced_exit_due
+from engine.signal_generator import (
+    SignalGenerator,
+    Signal,
+    entry_cutoff_reached,
+    forced_exit_due,
+)
+from engine.event_logger import log_event
+from engine import exit_shadow
 from engine.order_manager import OrderManager, OrderResult
 from utils.market_hours import is_market_open
 
@@ -70,6 +77,16 @@ class StrategyExecutor:
     # Class-level so the cooldown survives executor re-instantiation within
     # the same process. Keyed by (strategy_id, symbol).
     _last_closed_at: Dict[Tuple[int, str], datetime] = {}
+
+    # (strategy_id, ET date) we have already written ENTRY_BLOCKED_TIME_WINDOW
+    # for. The eval loop ticks about once a second and the entry cutoff holds for
+    # the REST OF THE DAY once crossed, so without this one strategy would write
+    # ~14,000 identical system_events between 11:30 and the close. Keyed by date
+    # rather than cleared on a transition because the block never lifts within a
+    # day — that is what distinguishes it from _unconfirmed_block_logged, which
+    # clears when its condition resolves. Class-level for the same reason as the
+    # cooldown above: it must survive executor re-instantiation in-process.
+    _entry_window_logged: set = set()
 
     def __init__(self, db: Session):
         self.db = db
@@ -221,6 +238,10 @@ class StrategyExecutor:
                 current_volume,
                 cum_volume=market_data.get('cum_volume'),
             )
+            # Exit shadow mode's 1-minute highs/lows for the structure stop
+            # (engine/exit_shadow.py). Observation only: fed unconditionally for
+            # the same reason as the line above, returns nothing, never raises.
+            exit_shadow.note_underlying(symbol, current_price)
 
             # 3. Check for entry signals (if we have room for more positions)
             await self._check_entry_signals(
@@ -280,6 +301,37 @@ class StrategyExecutor:
             logger.debug(
                 f"Re-entry cooldown active for {symbol} "
                 f"(strategy {strategy.id}): {wait_s:.1f}s remaining"
+            )
+            return
+
+        # Entry window closed for the day (the `entry_before_et` wall, or the
+        # forced-exit time). check_entry_signal enforces this itself and would
+        # return None a few lines below — this exists so the reason reaches the
+        # Overview's "why entries stopped" panel instead of only a debug log,
+        # which is the difference between a quiet afternoon being explained and
+        # looking identical to one where no signal ever fired.
+        #
+        # ENTRIES ONLY: this returns before the entry path and never touches
+        # _check_exit_signals, which the caller runs separately. A position open
+        # at the wall keeps its stop loss, take profit, trail and EOD exit.
+        window_closed = entry_cutoff_reached(strategy.params_json, user)
+        if window_closed:
+            log_key = (strategy.id, datetime.utcnow().date())
+            if log_key not in self._entry_window_logged:
+                self._entry_window_logged.add(log_key)
+                log_event(
+                    db=self.db,
+                    user_id=user.id,
+                    event_type="ENTRY_BLOCKED_TIME_WINDOW",
+                    title=f"No new entries: {symbol}",
+                    detail=window_closed,
+                    symbol=symbol,
+                    strategy_id=strategy.id,
+                    severity="info",
+                )
+            logger.debug(
+                f"Entry window closed for {symbol} (strategy {strategy.id}): "
+                f"{window_closed}"
             )
             return
 
@@ -543,6 +595,7 @@ class StrategyExecutor:
                                 or market_data.get('option_symbol'),
                         )
                         if close_result.success:
+                            exit_shadow.on_exit(position, close_result.filled_price, eod_reason)
                             results['positions_closed'].append({
                                 'symbol': symbol,
                                 'qty': close_result.filled_qty,
@@ -573,6 +626,25 @@ class StrategyExecutor:
             self.order_manager.update_position_prices(
                 user, strategy, symbol, exit_price,
                 option_symbol=position.option_symbol,
+            )
+
+            # Exit shadow mode — OBSERVATION ONLY (engine/exit_shadow.py). Records
+            # when alternative exit rules WOULD have sold, to gather evidence on
+            # trades the offline replay has not seen (docs/dynamic-exits-math.md
+            # §7). It is called before the real decision and told nothing about
+            # it, returns nothing, places nothing, and swallows its own errors, so
+            # it cannot change whether or when this position exits. Delta is only
+            # passed when the streamed contract IS the held one; the armed
+            # contract's delta says nothing about a different strike.
+            exit_shadow.observe(
+                position,
+                exit_price,
+                self.signal_generator.price_history.get(symbol, ()),
+                strategy.params_json,
+                delta=(market_data.get('delta')
+                       if market_data.get('option_symbol') == position.option_symbol
+                       else None),
+                underlying=symbol,
             )
 
             # Check for exit signal
@@ -638,6 +710,9 @@ class StrategyExecutor:
                     'reason': exit_signal.reason
                 })
                 logger.info(f"Exit order executed: {order_result.message}")
+                # After the close is confirmed, never before: a failed close
+                # leaves the position open and shadow must keep watching it.
+                exit_shadow.on_exit(position, order_result.filled_price, exit_signal.reason)
             else:
                 results['errors'].append(f"Exit order failed: {order_result.message}")
 

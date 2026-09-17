@@ -126,10 +126,29 @@ export class StrategyFormComponent implements OnInit {
       // 2026-09-10 and nothing on the form said what a "period" counted.
       ema_period: [9, [Validators.min(1), Validators.max(ENGINE.historyBars)]],
       use_vwap: [true],
+      // Maximum distance from VWAP at which a new entry may open, expressed as a
+      // MULTIPLE of how far price has typically sat from VWAP so far today (the
+      // session's volume-weighted standard deviation around VWAP). Self-scales
+      // through the day (~$0.41 at 10:00 ET, ~$1.05 at 15:00 ET) where a fixed
+      // dollar amount could not. The docs call this unit a "wiggle"; the UI
+      // deliberately does not, because the term means nothing to a reader.
+      //
+      // Blank means NO distance gate, matching the engine, so a strategy that has
+      // never had the field keeps its behaviour until someone sets one. Not
+      // Validators.required for that reason. Max 10 mirrors the API validator.
+      vwap_max_stretch: ['', [Validators.min(0.1), Validators.max(10)]],
       volume_spike_required: [true],
       min_volume_multiplier: [1.5, [Validators.min(0.1), Validators.max(10)]],
       max_hold_time_minutes: [0, [Validators.min(0)]],
       entry_after_open_minutes: [0, [Validators.min(0)]],
+      // Absolute ET wall on NEW entries — the midday/theta cutoff. Blank means
+      // no wall, matching the engine (an absent `entry_before_et` applies no
+      // gate), so an existing strategy that has never had the field keeps its
+      // current behaviour until someone deliberately sets one. Not
+      // Validators.required for that reason. An <input type="time"> hands back
+      // "HH:MM", which is exactly what the API validator and
+      // signal_generator._parse_hhmm expect.
+      entry_before_et: ['', [Validators.pattern(/^([01]\d|2[0-3]):[0-5]\d$/)]],
       // Minimum 15, never 0. Mirrors the engine's hard floor
       // (signal_generator.FORCED_EOD_EXIT_FLOOR_MINUTES); the API rejects
       // anything lower. Counts BACKWARDS from the bell, so a bigger number
@@ -205,6 +224,12 @@ export class StrategyFormComponent implements OnInit {
           min_volume_multiplier: p['min_volume_multiplier'] ?? 1.5,
           max_hold_time_minutes: p['max_hold_time_minutes'] ?? 0,
           entry_after_open_minutes: p['entry_after_open_minutes'] ?? 0,
+          // '' when absent, so a strategy with no cutoff shows an empty field
+          // and saving it back writes null rather than inventing a wall.
+          entry_before_et: p['entry_before_et'] ?? '',
+          // '' when absent, so a strategy with no distance gate shows an empty
+          // field and saving it back writes null rather than inventing a limit.
+          vwap_max_stretch: p['vwap_max_stretch'] ?? '',
           // Clamp up, don't just default: legacy strategies stored 0, and
           // `??` does not fire on 0 — it would load 0 and then fail to save.
           exit_before_close_minutes: Math.max(
@@ -285,6 +310,20 @@ export class StrategyFormComponent implements OnInit {
       min_volume_multiplier: formValue.min_volume_multiplier,
       max_hold_time_minutes: formValue.max_hold_time_minutes,
       entry_after_open_minutes: formValue.entry_after_open_minutes,
+      // null, not '', when the field is left blank. The backend MERGES this dict
+      // into the stored params_json, so sending '' would persist an empty string
+      // the API validator waves through and the engine then reads as "no wall" —
+      // storing a value that means nothing. null is the explicit "no cutoff".
+      entry_before_et: formValue.entry_before_et || null,
+      // null, not '', for the same reason as entry_before_et above: the backend
+      // MERGES, so '' would persist a value that means nothing. Number(), because
+      // an <input type="number"> hands back a STRING and the engine compares it
+      // against a float — '1.0' >= 1.0 raises in Python. The API validator coerces
+      // too, but the form should not be sending the wrong type in the first place.
+      vwap_max_stretch:
+        formValue.vwap_max_stretch === '' || formValue.vwap_max_stretch === null
+          ? null
+          : Number(formValue.vwap_max_stretch),
       exit_before_close_minutes: formValue.exit_before_close_minutes,
       trailing_stop: formValue.trailing_stop,
       trailing_stop_activation: formValue.trailing_stop_activation,

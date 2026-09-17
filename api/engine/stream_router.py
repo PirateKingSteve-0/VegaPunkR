@@ -7,6 +7,21 @@ from collections import defaultdict
 
 logger = logging.getLogger(__name__)
 
+# Payload types that are allowed to reach strategy/UI queues.
+#
+# The websocket subscribes to more than this (summary/timesale, TODO.md C2) so
+# the session recorder captures them, but those are research data — they must
+# never consume a queue slot. Both queues drop on overflow, and the message
+# displaced could be the underlying `trade` tick an entry fires on, or the
+# option `quote` that refreshes state.option_bid, which the exit path prices
+# against (the 2026-08-27 stale-bid take-profits). timesale alone roughly
+# doubles trade-side traffic.
+#
+# This set is exactly what was routed before C2, so filtering here is a no-op
+# for the trading path. Adding a type here is a behaviour change: it puts real
+# pressure on a 100-slot queue.
+_ROUTED_TYPES = frozenset({"trade", "tradex", "quote"})
+
 
 class StreamRouter:
     """
@@ -77,6 +92,8 @@ class StreamRouter:
         symbol = event.get("symbol")
         if not symbol:
             return
+        if (event.get("type") or "") not in _ROUTED_TYPES:
+            return  # captured by the recorder upstream; never queued
         for q in list(self._routes.get(symbol, [])):
             try:
                 q.put_nowait(event)

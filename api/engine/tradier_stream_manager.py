@@ -149,7 +149,12 @@ class TradierStreamManager:
             return
         payload = json.dumps({
             "symbols": symbols,
-            "filter": ["trade", "quote"],
+            # summary/timesale are CAPTURE-ONLY (TODO.md C2). The recorder runs
+            # before StreamRouter.dispatch, and dispatch drops any type outside
+            # _ROUTED_TYPES, so these land in stream-*.jsonl without adding a
+            # single message to the strategy/UI queues. Do not widen this filter
+            # without checking _ROUTED_TYPES in stream_router.py.
+            "filter": ["trade", "quote", "summary", "timesale"],
             "sessionid": self._session_id,
             "linebreak": True,
         })

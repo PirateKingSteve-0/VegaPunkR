@@ -158,10 +158,27 @@ Tradier's intraday history has a hard horizon (`docs/tradier/market/time_and_sal
 0DTE contract is a single bar covering its entire life. It cannot order a stop against a target, so
 it cannot backtest an intraday exit.
 
-**Consequence: option intraday history older than ~20 days is gone permanently, and no tool built
-later can recover it.** We currently hold zero option quote history. The only real option prices
-this project owns are the 8 live fills in E11. Every session that passes without a collector is a
-session that can never be backtested.
+`/v1/markets/timesales` **does** return intraday option data — measured 2026-09-15, not inferred.
+Both `interval=1min` and `interval=tick` return 200 with real rows for an OCC symbol, inside the
+20-day / 5-day horizons above. **The earlier claim here that option intraday history is entirely
+unrecoverable was too strong.** What it returns is still not a substitute for a chain snapshot:
+
+- **Trade prints only — no bid, no ask.** Exits evaluate on the **bid**
+  (`strategy_executor.py:562`), so a trades-only series cannot say what a position could have been
+  sold at. That is the optimistic-bias mistake with a receipt already in this repo.
+- **No greeks, no IV.** The ORATS block is bolted onto the chain and quote endpoints only.
+- **Sparse.** `SPY260916P00718000` — the highest-volume contract in the 09-16 chain, 57,489 — returned
+  **34 of 390 one-minute bars, 9% coverage.** Quieter strikes return nothing at all.
+- **Parse `timestamp`, never `time`.** The same print came back as `09:41:00` at `interval=1min` and
+  `13:41:29` at `interval=tick`; the epoch fields agree, the strings do not.
+
+**Consequence, narrowed: what expires is the trade tape, and the trade tape is partial anyway. What
+was never available at any horizon — and so can only ever be collected live — is the bid/ask across
+all strikes, and the greeks.** There is no historical-chain endpoint:
+`/v1/markets/options/chains` takes `symbol`, `expiration` and `greeks` and nothing else, so it can
+only ever answer *right now*. We hold zero option quote history beyond the ~6 contracts a session's
+stream happened to watch. Every session that passes without a collector is a session whose chain is
+gone.
 
 `docs/tradier/market/option_chains.md`: chains carry greeks and `bid_iv`/`mid_iv`/`ask_iv` (ORATS)
 when `greeks=true`. That is the measured IV and delta the 2026-09-14 cost budget currently has to
@@ -234,6 +251,133 @@ presentation, not evidence.
 Phase 0 today (perishable data). Phase 1 next — it is what answers "does the entry work", and it is
 where E11's sample-size problem gets solved by replay instead of by waiting 70-115 sessions. Phase 2
 only on demand.
+
+### C2. ~~Subscribe to `summary` and `timesale` — and filter the router by type~~ *(DONE 2026-09-15 — capture only, nothing consumes them yet)*
+
+**Landed 2026-09-15**, both halves, exactly as specced below:
+
+- `tradier_stream_manager.py:157` — filter is now
+  `["trade", "quote", "summary", "timesale"]`.
+- `stream_router.py:23,80` — `_ROUTED_TYPES = frozenset({"trade", "tradex", "quote"})`
+  and a type guard in `dispatch` ahead of `put_nowait`. That set is exactly what was routed
+  before, so the trading path sees the identical message stream it saw on 09-14.
+- `api/tests/test_stream_router_type_filter.py` — new, 10 checks, pins BOTH halves: the two
+  new types never reach a strategy **or** UI queue, and `trade`/`tradex`/`quote` still do.
+  A future widening of `_ROUTED_TYPES` fails this test on purpose.
+
+**Operationally: `LIVE_TEST_LOGGING=1` is now load-bearing.** `_lt_emit_stream` early-returns
+when `is_enabled()` is false, so starting prod without the flag subscribes to both new feeds
+and records **nothing** — all of the bandwidth, none of the data. `docs/monday-runbook.md`
+already carries it; do not drop it.
+
+Checked and unaffected: `scripts/replay_session.py` filters positively
+(`if '"kind": "quote"' not in line: continue`), so the new log lines are skipped rather
+than misparsed. Expect ~110 MB/session instead of ~60.8 MB.
+
+**`timesale` is recorded UNSAMPLED on purpose — the cost was measured, not assumed (2026-09-16).**
+A review flagged it as a hazard: `_lt_emit_stream` samples `quote` to 1/symbol/2s but passes
+`timesale` through, and `JsonlLogger` writes line-buffered under a global lock **on the websocket
+read coroutine** — the same loop that feeds the option quote the exit path prices against. The
+reasoning was sound; the magnitude was not. Benchmarked at the real volume (167,078 records, the
+09-11 trade count, same record shape):
+
+```
+  4.6 us per record   0.77 s per whole session   0.003% duty cycle
+  worst case, a 500-print burst: 2.3 ms of that second
+```
+
+So it stays unsampled, and **sampling it would be actively wrong**: `quote`'s 1-per-2s rule is
+*time*-based, which over-weights quiet minutes — fatal for the ask-side ratio this feed exists to
+count. If write pressure ever does need cutting, sample **1-in-N prints** (unbiased for a ratio),
+never 1-per-interval. Re-measure on the machine prod actually runs on if that changes, the way F3
+insists for its own 23 ms.
+
+**Two of the websocket's five payload types are free, unused, and each answers a question another
+TODO item is currently trying to infer indirectly.** The change is small; the *safe* version of it is
+two files instead of one, and the difference matters because the naive version adds pressure to a
+queue that silently drops ticks the exit path needs.
+
+#### What we subscribe to now, and what exists
+
+`tradier_stream_manager.py:149` sends `"filter": ["trade", "quote"]`. Tradier offers five
+(`docs/tradier/streaming/ws_market_data.md:31`), and the complete field list of each is documented —
+**none of the five carries greeks**, so this is not a route to delta/theta/vega. What the two unused
+ones do carry:
+
+```
+summary   → open, high, low, prevClose
+timesale  → exch, bid, ask, last, size, date, seq, flag, cancel, correction, session
+tradex    → same shape as trade (extended-hours variant) — not wanted
+```
+
+#### Why each one is worth having
+
+**`summary` — an authoritative session range, and prior close.** `StrategyMarketState.apply()`
+accumulates `session_high`/`session_low` from ticks, which is only correct if the worker was
+watching from the bell. A worker that starts or restarts at 09:50 has a partial range and **no way to
+know it** — the exact quiet-wrong-answer failure the ORB section of `BRAINSTORM.md` names as the
+reason stream-only range computation is not enough on its own. With `summary` the engine can compare
+its accumulated high/low against the exchange's and either correct itself or refuse to trade a range
+it knows is incomplete. `prevClose` arrives in the same message and is the prior-levels candidate
+(BRAINSTORM 2026-09-11, candidate 3) for free.
+
+**`timesale` — aggressor side, which upgrades the volume gate from "how much" to "which way."**
+`min_volume_multiplier` can tell that a minute was busy; it cannot tell whether buyers were paying
+the ask or sellers were hitting the bid. `timesale` carries bid and ask *alongside* each print, so
+that ratio is directly countable. A breakout on 70% ask-side prints is buyers chasing; the same
+volume at 30% is sellers unloading into a pop. It also carries `cancel` and `correction` flags —
+**the volume gate currently counts busted prints as real** — and a `session` flag separating regular
+hours from pre/post.
+
+It is also the honest measurement B1 wants. B1 infers fill quality from preview-vs-fill drift;
+`timesale` gives the prevailing bid/ask at the moment of each print.
+
+**REST is not a substitute — different product, same name.** `/markets/timesales` with
+`interval=tick` returns `{time, timestamp, price, volume}` and **no bid/ask** (verified 2026-09-14),
+so it cannot give aggressor side. Worth knowing separately: `interval=1min` returns OHLCV **plus the
+exchange's own vwap**, a free cross-check on the VWAP the engine accumulates itself. And **parse
+`timestamp`, never `time`** — the epoch fields agree across intervals, the strings do not
+(`interval=tick` returned `14:00:00` for a 10:00 ET query; `1min` returned `10:00:00`).
+
+#### Behaviour change from subscribing alone: none
+
+Traced 2026-09-14, all three layers already tolerate unknown types:
+
+- `StrategyMarketState.apply()` (`stream_driven_worker.py:135`) branches on `trade`/`tradex`/`quote`
+  and has **no else** — anything else falls through untouched.
+- The entry-signal check (`stream_driven_worker.py:408`) fires only on `trade`/`tradex` for the
+  underlying.
+- The recorder (`tradier_stream_manager.py:43`) logs **any** type generically by name, so both land
+  in `stream-*.jsonl` with no recorder change.
+
+So nothing needs writing for them to be captured, and neither can influence a decision.
+
+#### The risk, and why the safe version is two files
+
+`StreamRouter.dispatch()` (`stream_router.py:76`) routes **by symbol only — it does not filter by
+type** — and each strategy queue is `asyncio.Queue(maxsize=100)` that drops on overflow
+(`stream_router.py:84`, `pass  # drop stale tick rather than block`). `timesale` emits one message
+per trade, so it roughly **doubles** trade-side traffic: 09-11 carried 167,078 trades, so expect
+~167k more messages and a session log going from 60.8 MB to roughly 110 MB.
+
+Added queue pressure on a queue that silently drops means **the dropped message could be the `trade`
+tick the entry or exit needed**. That is the trading path, and research data is not worth it.
+
+**The recorder runs BEFORE dispatch and independently** (`tradier_stream_manager.py:125-127`).
+So the safe shape is:
+
+1. `tradier_stream_manager.py:149` — add `"summary"` and `"timesale"` to the filter array.
+2. `stream_router.py:76` — drop anything whose `type` is not in `{trade, tradex, quote}` before
+   `put_nowait`.
+
+Net: full capture in the logs, **zero** extra pressure on the strategy queues. Two small changes that
+together are strictly safer than doing only the first.
+
+#### Not in scope here
+
+Consuming either one. `summary` correcting the session range and `timesale` feeding a
+buy/sell-pressure gate are both behaviour changes to the entry path and want their own items, after
+there is recorded data to measure against. This item is capture only.
 
 ---
 
@@ -531,7 +675,42 @@ trades over a year). They would render confident-looking noise. Revisit at a few
 Other Fees). Tradier reports commission and fees as `0` even on live, and real fees are ~$0.18 per
 contract inferred from cash reconciliation — see the results doc.
 
-### E7. Deep-ITM puts structurally cannot clear the OI floor *(2026-09-03)*
+### E7. Deep-ITM puts structurally cannot clear the OI floor *(2026-09-03; measured across all sessions 2026-09-16)*
+
+> **MEASURED 2026-09-16 — this is not a put problem, it is THE binding gate on both sides.** Every
+> `No suitable contracts` line in `logs/livetest-*/engine-*.log`, parsed. The scan's counters are
+> **sequential** (`stream_driven_worker.py:1210-1230`): a contract reaches `low OI` only after it has
+> already passed the delta band, so that counter is in-band contracts lost to the floor alone.
+>
+> ```
+>   calls   3,696 failed scans   OI was the last blocker in 3,608  (98%)
+>   puts    1,002 failed scans   OI was the last blocker in 1,002 (100%)
+>   in-band contracts lost per scan: 2 to 8
+> ```
+>
+> Whole sessions sit unarmed this way: 09-09 (771 call scans), 09-10 (674), 09-14 (677), 09-15 (674).
+>
+> **Every contract ever armed clusters just above the line** — lowest armed is **3,054** (put) and
+> **3,495** (call) against `min_open_interest: 3000`. The gate is not selecting liquidity, it is
+> selecting whatever survived it. Meanwhile **the spread gate rejected zero contracts in every
+> session recorded**, so the liquidity risk the floor exists to prevent is already being checked
+> directly, and nothing fails that check.
+>
+> **The reframe, and why "just lower it" may be the wrong fix: open interest is the PRIOR day's
+> settlement count.** On a same-day expiry it says nothing about today — a 0DTE strike can show OI of
+> 500 and trade 50,000 contracts before noon. `min_open_interest: 3000` is longer-dated-options
+> logic, where OI is a fair liquidity proxy. For 0DTE, today's **volume** and the live **spread** are
+> the measures, and the spread gate is already passing everything.
+>
+> **What is missing to pick a number: the OI values of the rejected contracts are not logged, only
+> the count.** Two ways to get them, neither done: (a) one log line in the scan loop recording the OI
+> of delta-passing rejects — engine file, log-only, no behaviour change; (b) C1 Phase 0 chain
+> snapshots, which give OI, volume and spread per strike and answer "should this gate be volume or
+> spread instead" at the same time.
+>
+> **A replay cannot answer this.** OI decides which contract is ARMED, and only armed contracts have
+> recorded quotes — so a lower floor buys a strike with no price history to replay. Same wall C1
+> documents. Owner parked the decision 2026-09-16; do not change the floor without (a) or (b).
 
 The put strategy has now run two live sessions and **entered zero trades**. On 09-03 it rejected
 its contract scan **329 times**, always the same way:
@@ -634,6 +813,56 @@ Related: `take_profit_pct` is inert whenever `trailing_stop_activation <= take_p
 is the current config (15 vs 25). Raising the target to 50/75/100 changes nothing. Note that
 `trading_safeguards.validate_strategy_params` rejects `take_profit_pct > 100` — dead code today
 (nothing calls `check_pre_trade_safeguards`) but a landmine if it is ever wired up.
+
+
+### E14. Exit shadow mode — RUNNING since 2026-09-16, read the results *(observation only)*
+
+**Live, acts on nothing.** `api/engine/exit_shadow.py`, hooked into
+`strategy_executor._check_exit_signals` in three places: `observe()` on every priced tick *before*
+the real exit decision (and handed nothing about it), and `on_exit()` inside both confirmed-close
+branches, plus `note_underlying()` beside `_update_history` on every tick. It watches six alternative
+exit rules on every open position — keep 70%, keep 50%, volatility trail, dynamic take profit, dynamic
+take profit + live trail, and (since 2026-09-17) the **structure stop** — and records when each *would*
+have sold. The structure stop builds its own 1-minute underlying highs/lows from the price the engine
+already sees each second (`_BARS`, capped at 240 bars per symbol). Output: an INFO `SHADOW EXIT` line the first time a rule would sell, a
+`SHADOW SUMMARY` line on each real close, and one record per close in
+`logs/livetest-<date>/exit_shadow-*.jsonl` (when `LIVE_TEST_LOGGING` is on). Rules still holding at the
+real exit are recorded `open`, never flat. `ENABLED = False` in the module turns it off.
+
+**Why it exists:** `docs/dynamic-exits-math.md` §7 replayed all 28 real round trips under these rules.
+**No profit-side rule beat the live rule like-for-like** (keep 70% −$4 / TP+trail −$15 across all days).
+**The structure stop did, +$31** — but only by exiting three losing trades earlier, +$23 of it one
+trade whose trigger cleared the stop by 5¢. Its shadow version agrees with the replay on 26 of 26
+resolvable trades. Every idea
+there — including E8's tiered trail — was generated by the same trades it was measured on. Shadow
+mode gathers evidence on trades the analysis has not seen, with no exit-path risk.
+
+**It already caught a real bug.** Run over all 28 real trades, the module disagreed with
+`scripts/dynamic_exits_review.py` on 6 of 128 rule/trade pairs. The script measured volatility
+*including the minute of the decision* — prices from after the entry. That look-ahead manufactured an
+apparent "+$45 edge" for TP + trail, all of it from one trade (09-09 11:01: $4.60 vs an honest
+$4.00). Script fixed (completed minutes only); the two now agree on **128 of 128**. The +$45 claim is
+retracted in the doc.
+
+**Safety, pinned by `api/tests/test_exit_shadow.py`:** the module contains no order, preview, DB or
+network call; `observe`/`on_exit` swallow every exception; `observe` precedes the real decision and
+is not handed it; both `on_exit` calls are owned by `if ...result.success:` branches; nothing reads its
+return value. Plus rule-by-rule correctness on synthetic prices.
+
+**Known gaps:**
+- State is in memory. A restart mid-trade starts a fresh snapshot flagged `late` (delta, volatility
+  and the dynamic target then describe the restart moment, not the entry).
+- Delta is only used when the streamed contract *is* the held one; otherwise a 0.70 default, flagged
+  `delta_known: false`.
+- It does not see closes that happen outside the executor's exit loop (reconcile, manual); those
+  snapshots are pruned after a day.
+
+**To do:**
+- [ ] After ~2-3 weeks of live trades, collect the `exit_shadow-*.jsonl` records and compare each rule
+      to the real exit on the same trades — the only evidence not generated by the 28-trade sample.
+- [ ] Only then decide whether any rule (or E8's tiered trail) earns a selectable exit mode.
+- [ ] If it ends up worth keeping long-term, consider persisting the entry snapshot so restarts don't
+      produce `late` records.
 
 ### E11. Re-run the edge analysis at adequate sample size *(BLOCKED on n — do not judge the strategy before this)*
 
@@ -869,6 +1098,65 @@ settled-cash cache, throttles and unconfirmed-order map are all in-memory class 
 server deployment is one pinned process anyway. That argues for **(c)**, with **(a)** as the
 fallback if the UI toggle must keep working.
 
+### F3. The engine's per-tick DB read costs 23ms, and all of it is wire time to us-west-1 *(2026-09-15)*
+
+**Measured, not estimated.** The `Position` lookup the worker runs on every eval tick
+(`stream_driven_worker.py`, the "single source of truth" read that decides entry-vs-exit) against
+the RDS instance, 60 runs, warm pool, from the machine prod actually runs on:
+
+```
+Position query      min 19.48ms   median 22.87ms   p95 29.15ms   max 30.79ms
+raw TCP connect     min 20.70ms   median 23.20ms
+```
+
+**The query and a bare TCP handshake cost the same.** Postgres does ~0ms of work — the entire cost
+is the round trip to `us-west-1`. So this is NOT a query problem: indexing it, rewriting the SQL or
+caching the row would save nothing measurable. It is a "where does the process run" problem, and it
+arrived with the RDS migration. Before RDS the same call was a local socket and was free.
+
+**Why it blocks everything.** `database.py` builds a **synchronous** engine (`create_engine` +
+`sessionmaker`), and the worker calls `db.query(...)` directly on the asyncio event loop.
+`asyncio.to_thread` appears 8 times in `stream_driven_worker.py` and **every one of them wraps a
+broker call, never a DB call**. So each 23ms freezes the whole loop: every strategy worker and the
+websocket reader.
+
+**Scale, stated honestly.** Evals are debounced to 1/second (`_EVAL_INTERVAL`), so this is one
+query per second per strategy, not one per tick. At the 2 prod strategies:
+
+```
+2 strategies x 22.87ms = ~46ms/sec blocked  ->  4.6% duty cycle
+```
+
+Plus `db.refresh(strategy)` every 30s, a heartbeat `count()` every 30s, and reconcile every 60s.
+
+**This is not losing trades, and should not be treated as if it were.** 23ms of buffered ticks is
+absorbed by the socket buffer, and 23ms on a one-second exit check is irrelevant against 30-minute
+0DTE holds. It is overhead. The engine rules forbid refactoring without a behavioural reason, and
+4.6% is not one.
+
+**The trigger to revisit is strategy count, because it scales linearly:**
+
+```
+2 strategies   4.6%
+4 strategies   9.2%
+6 strategies  ~14%
+```
+
+**Two real fixes, neither a one-liner:**
+
+1. **Co-locate the engine with RDS in us-west-1.** Zero code. Collapses 23ms to sub-millisecond and
+   deletes the item outright. This is the same move F2 is already planning for ("once the engine is
+   remote"), so **F3 probably resolves as a side effect of F2 and should be sequenced behind it
+   rather than fixed on its own.**
+2. **Move the worker's DB access off the event loop**, if the engine stays outside us-west-1.
+   Note the hazard: SQLAlchemy `Session` is **not thread-safe**, so `to_thread` cannot simply be
+   sprinkled on individual calls while other code touches the same session on the loop. It needs the
+   worker's DB access moved consistently onto a dedicated session — a refactor of the most
+   safety-critical read in the loop, for a 4.6% win. Do not do this speculatively.
+
+**Do not re-measure this from the laptop.** 23ms is Pacific-to-us-west-1 physics. The number is only
+meaningful from whichever machine is actually running `APP_ENV=prod`.
+
 ---
 
 ## G. Entry selection *(from the 2026-09-09 prod review — 14 live round trips)*
@@ -973,9 +1261,9 @@ produces by accident before adding a second one.
 - How often a roll entry would have been *avoided* rather than merely delayed by a 9-EMA touch
   requirement, i.e. what the rule actually costs in missed trades.
 
-### G3. ~~`ema_period: 9` is nine SECONDS — and raising it past 100 deletes the gate~~ *(FIXED 2026-09-10 — warm-up seeding still open, and UNCOMMITTED)*
+### G3. ~~`ema_period: 9` is nine SECONDS — and raising it past 100 deletes the gate~~ *(FIXED 2026-09-10 — warm-up seeding still open)*
 
-> **Fixed in the working tree 2026-09-10, not yet committed.** Both parts of the fix shape below
+> **Fixed 2026-09-10, committed in `902286f`.** Both parts of the fix shape below
 > landed, and the live sessions on **2026-09-11 and 2026-09-14** ran on it (engine processes started
 > after the 21:28 PT save on 09-10). `api/tests/test_bar_aggregation.py` pins it and passes.
 >
@@ -1209,10 +1497,181 @@ backwards — late is when contracts are cheapest and the fixed percentage stop 
 (see G3's premium-vs-volatility note). Fix: a per-clock-minute profile built from prior sessions
 instead of a trailing window. Needs no new data; 8 sessions are on disk.
 
-**G4b. Distance from VWAP rather than side of it.** The gate is binary, so a penny above and 2% above
-pass identically. 2026-09-10 spent 97.6% of the post-10:20 session blocked on it with price **$0.58**
-above VWAP. Measurable straight from the replay — record distance in standard deviations at entry,
-bucket outcomes — before deciding whether a band threshold earns its place.
+**G4b. Distance from VWAP rather than side of it.** *(MEASURED 2026-09-15 — BUILT AND LIVE on prod
+3/4 since 2026-09-15; watching sessions is what remains)*
+The gate is binary, so a penny above and 2% above pass identically. 2026-09-10 spent 97.6% of the
+post-10:20 session blocked on it with price **$0.58** above VWAP.
+
+**Result: price 0.5-2 "wiggles" past VWAP tends to come BACK, and chasing it is where the replay's
+losses concentrate.** A wiggle is the volume-weighted standard deviation of price around VWAP since
+the open (the usual VWAP-band construction). Full reasoning and the ideas around it: BRAINSTORM.md,
+"VWAP distance — the rule chases, the tape pulls back". Numbers: JOURNAL.md, 2026-09-15.
+
+- 20 sessions of SPY 1-min bars (`scripts/distance_test.py`): at 1+ wiggles, SPY moves **~3.0 bp
+  back toward VWAP** over 30m once each day's drift is removed; shuffle test **p = 0.001**. Same
+  direction in both 10-day halves.
+- 138 replayed trades (`scripts/distance_trades.py`): entries **1-2 wiggles** past VWAP in the
+  trade's direction — **27 trades, 22% won, -10.4% avg, -$534** per contract, more than the whole
+  strategy's -$425. Spread over 6 of 7 days, calls and puts both.
+- Replay with a **1.0-wiggle block**: ~~**-$425 -> -$54**~~ — **CORRECTED 2026-09-15, do not cite
+  -$54.** That number is a POST-FILTER: it deletes the blocked trades from the baseline list and
+  keeps the rest. Re-running the strategy with the gate *in the loop* — where a block leaves the
+  strategy flat and a later signal takes the freed slot — gives **-$425 -> -$183 on this same 8-day /
+  138-trade sample** (09-02..09-14, excluding 09-15). `scripts/replay_session.py --all --max-stretch
+  1.0` can now model the gate; the -$425 baseline reproduces to the dollar. The ~$130 difference is
+  the replacement effect this section's own note predicted. Win rate 44.9% -> 48.6% was also
+  post-filter.
+  **Every stretch number here must name its sample.** The two in circulation are the same measurement
+  on different spans: the 8-day / 138-trade one above, and the full **9-day / 146-trade** one
+  (**-$405 -> -$163**) once 09-15 is included. The whole difference is that one session: 8 trades,
+  +$20, unaffected by the gate. Subtract it and the 9-day figures become the 8-day ones exactly.
+- **The replay does NOT calibrate the threshold.** Per-day attribution: of the +$242 total benefit
+  (on the full 9-day / 146-trade sample, -$405 -> -$163), **+$245 comes from 09-10 and 09-11 alone**;
+  the other seven days net -$3. Two of nine sessions carrying 100% of an effect is too fragile to
+  calibrate a threshold on, whatever the cause. **This is a sample-size objection, not a data
+  objection** — see the next bullet, which retracts an earlier claim that it was the latter.
+- 📍 **DIAGNOSED 2026-09-15 — the "wiggle divergence" on 09-10/09-11 was a CORRUPT REFERENCE FILE,
+  and an earlier version of this bullet blamed the wrong thing twice.** The 0.69-vs-1.24 and
+  0.58-vs-2.44 figures come from the REBUILD CHECK in `scripts/distance_trades.py`, which compares
+  **two minute-bar constructions** — our stream rebuild against the Tradier 1-minute file's per-bar
+  `vwap` field. Neither side is `engine_wiggle`, so those numbers were never evidence about the
+  engine's accumulator, and they are not evidence of a mid-session restart either (there are none;
+  see below). The actual defect is in the reference: **a bar's VWAP must lie inside its own
+  [low, high], and in `data/backtest/underlying/SPY_1min.json` it frequently does not** —
+  1.3% of bars on 09-02 rising to **11.5% on 09-10 and 10.5% on 09-11**, with max |vwap-close| of
+  **$7.68 on 09-11, a day whose entire close range was $2.61**. The corruption rate tracks the
+  apparent "divergence" exactly: 09-02 at 1.3% bad → wiggles agree (1.16 vs 1.15); the two ~11% days
+  → they blow apart. **Our stream rebuild is the sound side**: its bar closes match the file's to a
+  mean absolute error of **$0.003 on all 9 days**, total volume to 1.00x, price range exactly, 390
+  bars with zero empty minutes. So `session_wiggle` — built from our bars — is trustworthy, and the
+  -$163 stands as a measurement.
+  **Consequences:** (a) FIXED 2026-09-15 in both consumers — `distance_test.py` and the REBUILD CHECK
+  in `distance_trades.py` now read **`price`**, not `vwap`. **With the corrupt field out of the
+  comparison the divergence vanishes entirely**, which is the cleanest confirmation in this whole
+  thread that our rebuild was always the sound side: 09-10 at 10:30 goes 0.69-vs-1.24 -> **0.69 vs
+  0.72**, 09-11 at 15:00 goes 0.58-vs-2.44 -> **0.58 vs 0.56**, and the daily VWAP disagreement drops
+  from a $0.006-$0.570 spread to **$0.002-$0.016** across all 9 days. The replayed-trade statistics are
+  byte-identical before and after, because they were always built on our bars. Use **`price`**
+  (`typ = b.get("price") or b["close"]`): it is the bar MIDPOINT — verified `price == (high+low)/2`
+  exactly on 3510 of 3510 bars — so it is a standard typical price (HL2) and less endpoint-biased than
+  `close` on a trending minute. Note its in-range-ness is *tautological*, not a validation: a midpoint
+  cannot fall outside its own [low, high]. **The drift result is robust to all three conventions**,
+  which matters more than the choice: +30m gives -1.54 bp / p = 0.000 on the corrupt `vwap`,
+  -1.63 / p = 0.000 on `close`, -1.65 / p = 0.000 on `price` (+15m: p = 0.007 / 0.005 / 0.004).
+  Three typical prices are now in play — HL2 from the file, mean-of-prints from our stream rebuild,
+  and whatever the engine's per-tick sampling effectively yields; name which one is meant wherever a
+  wiggle is quoted. (b) The REBUILD CHECK's label "wiggle ours vs file" reads as ours-being-wrong; it is the
+  file that is wrong, and it should say so. (c) **The 24-session drift test SURVIVES the fix** —
+  re-run with `typ = b["close"]` it gives **-1.63 bp, p = 0.000** at +30m against -1.54 bp / p = 0.000
+  before (and p = 0.005 vs 0.007 at +15m), so the independent support for the IDEA is intact; the
+  corruption distorts individual days' absolute wiggle level, not the pooled result.
+- **There are also NO mid-session restarts in this sample.** Checked
+  2026-09-15 by enumerating every stream file per session dir with its first/last print: all six
+  replayed pairs start pre-market and run CONTINUOUSLY for days (the 09-09 process covers 09-09 and
+  09-10 without interruption; the small files are single-print pre-market boot failures, not
+  restarts). `stream_driven_worker.py:365` drops ticks while the market is closed, so the accumulator
+  starts at 09:30 with a full session on all 9 days. Consequently the **30-minute warm-up guard is a
+  provable no-op on this sample** — `warmup_blocked = 0`, P&L identical to no guard; it first binds at
+  45 minutes (and at 45 the result gets *worse*, -$274). The guard is still right on its own terms
+  (never act on a too-young reading — the hazard is real and documented in BRAINSTORM idea 5) but it
+  is insurance against a hazard this sample never contained, not a repair for anything observed.
+  **`engine_wiggle` vs `session_wiggle` — MEASURED 2026-09-15, and 1.0 transfers.**
+  `scripts/measure_engine_wiggle.py` drives the real `_update_history` and `StrategyMarketState.apply`
+  at the real eval cadence, RTH-gated, against `session_wiggle` from the clean `price` field.
+  72 snapshots, 9 sessions, 8 clock points a day: **ratio engine/session median 0.962**, mean 0.945,
+  sd 0.102, range 0.710-1.302. So `engine_wiggle` runs ~4% SMALLER, which means a larger stretch and a
+  marginally **stricter** gate than the research intends — the safe direction to be wrong.
+  `vwap_max_stretch = 1.0` enforces about **0.962** in research units (and reproducing a research
+  1.0 would need `vwap_max_stretch ≈ 1.04`) — this sentence said 1.04 until 2026-09-16, contradicting
+  the conversion paragraph two bullets down; `measure_engine_wiggle.py` printed the same inversion and
+  is fixed. Derive it rather than remembering it: `engine_wiggle = 0.962·session_wiggle`, the engine
+  blocks at `|d| >= T·engine_wiggle`, so `T = 1.0` trips at `0.962·session_wiggle`. **Caveat:** sd 0.102 means the
+  effective threshold wanders ~±10% day to day and occasionally 30% (09-15 sat at 0.83-0.92 all
+  afternoon), so a recorded stretch should never be read to two decimals. That is a scale wobble, not
+  a scale error, and an order of magnitude smaller than the 45-76% gap wrongly inferred from the
+  corrupt-field comparison above.
+  **Conversion for the replay:** the engine blocks at `|p-vwap| >= engine_wiggle ≈ 0.962·session_wiggle`,
+  so reproducing a live `vwap_max_stretch = 1.0` in `replay_session.py` — which measures in
+  `session_wiggle` — means `--max-stretch 0.962`, not 1.0. At 1.0 the replay models a slightly LOOSER
+  gate than production. **So the live-equivalent replayed figure is `-$405 -> -$193` (115 trades), not
+  the `-$163` (116 trades) that `--max-stretch 1.0` prints.** One trade's difference, $30, and in the
+  unflattering direction — quote -$193 when the question is "what would production have done".
+- **Latent coupling: `_VWAP_WARMUP_MINUTES` (30) == `entry_after_open_minutes` (30).** The first
+  in-hours print lands 22-328 ms after 09:30:00 on all 9 sessions, so the live accumulator age at
+  10:00:00 is 29.99-30.00 — just under the threshold, daily. A strict `age < 30` blocks the first
+  evaluation of the entry window every day, then passes a second later. Harmless now; but lower
+  `entry_after_open_minutes` or raise the warm-up and the guard silently eats the start of the entry
+  window. Neither constant's file mentions the other.
+- **Net position on the threshold.** The 24-session drift test (p = 0.000, and it survives the corrupt
+  `vwap` field) supports the IDEA of not chasing, and the measurement above shows **1.0 TRANSFERS to
+  the live gate** — `engine_wiggle` tracks `session_wiggle` to a median 0.962, erring strict. What is
+  still missing is evidence that **1.0 is the right number rather than a working one**: the replay's
+  apparent confirmation rests on 2 of 9 sessions, so it cannot calibrate. 1.0 was fixed before any
+  result was seen, which is the right discipline; the honest summary is that it is now known to be
+  *implementable as intended*, not known to be *optimal*. Do not tune it against the sessions on disk.
+- Two wiggles, two questions, never interchangeable: **engine_wiggle** is tick-accumulated and
+  restart-truncated (what the live gate sees; predicts live behaviour) and **session_wiggle** is
+  rebuilt from full-session minute bars (what the replay and `distance_trades.py` see; measures
+  whether the idea has edge). Any number quoted from one must say which.
+- **Distance from the 9-minute EMA carries nothing** (shuffle p = 0.30 / 0.91, halves disagree).
+  Dropped.
+
+**It is a leak fix, not an edge.** Still negative after the block, and the replay is optimistic by
+about half the spread. Break-even needs ~52% at the payoff the exits actually produce.
+
+**BUILT AND LIVE 2026-09-15/16 — `vwap_max_stretch` (entry gate, off by default).** All in
+`signal_generator.py`, as specced:
+1. `sum_p2v` (price² × volume) in `_vwap_accumulators`, beside `sum_pv` / `sum_v`.
+2. `_calculate_vwap_wiggle()` = sqrt(sum_p2v/sum_v − vwap²); None when not computable.
+3. In the VWAP gate, after the side check: when `params_json.vwap_max_stretch` is set, block if
+   `|price − vwap| / wiggle >= vwap_max_stretch`, and block when the wiggle is unavailable
+   (most-restrictive, same as G3). Records `indicators['vwap_stretch']` either way. **Entries only —
+   no exit path touched.**
+
+Two things the spec did not anticipate, both load-bearing:
+- **`_VWAP_WARMUP_MINUTES = 30`** blocks while the in-memory tally is younger than 30 minutes, and it
+  equals `entry_after_open_minutes` exactly — see the latent-coupling note above before changing
+  either.
+- **Recording `vwap_stretch` unconditionally would have loosened `confirmation_required`** (an
+  always-present observation counting as an indicator). `_OBSERVED_NOT_GATED` is excluded from that
+  count in the same change, and `test_vwap_stretch.py` monkeypatches the set empty as a negative
+  control so the fix cannot rot silently.
+
+**Before switching it on:**
+- [x] Test file in the style of `test_bar_aggregation.py` — `api/tests/test_vwap_stretch.py`.
+- [x] Check the engine's **tick-sampled** wiggle against the **minute-bar** wiggle — done via
+      `scripts/measure_engine_wiggle.py`; median ratio 0.962. See the conversion paragraph above.
+- [x] Use **1.0**. Set on prod strategies 3 and 4 on 2026-09-15.
+- [ ] Watch 2+ live sessions: count "not chasing" blocks, and re-run `distance_trades.py` on them.
+      `replay_session.py` now also prints the warm-up block count separately, so a warm-up block can
+      never be read as the gate declining a chase.
+- [x] **Decide whether it ships with the `entry_before` afternoon cutoff — YES, owner confirmed
+      2026-09-16.** Both shipped together: prod 3 and 4 carry `entry_before_et: "11:30"`, and all 8
+      templates match prod so a cloned strategy behaves like the ones actually running. **The reason
+      of record is the lunch gap, not the sweep row** — SPY volume troughs midday (97,052/min at
+      09:30 against 33,950 at 12:30, G4a) and theta runs ~2% at 10:00 ET against ~28% at 15:30, so a
+      late entry is stopped out by the clock rather than by the signal. Revisit when G4a's
+      per-clock-minute volume profile lands, which is what would make midday tradable. Full
+      reasoning: `entry_cutoff_time_et`'s docstring. **Two gates changed at once on an account that
+      funds ~3 entries a day, so attribution between them will be slow — expect to need weeks, not
+      sessions.**
+- [x] **`entry_before_et` no longer fails silently** (2026-09-16). It is the only gate in the entry
+      chain that fails OPEN, and it stays that way — `_parse_hhmm`'s "None == unset" contract is
+      shared with `forced_exit_time_et`, and blocking every entry on a typo would stop the strategy
+      outright. But `"11.30"` / `1130` / `"11:60"` now log `logger.error` once per distinct bad
+      value. Contrast `_coerce_max_stretch`, which fails CLOSED because its contract is not shared.
+      The asymmetry is deliberate; both are now loud.
+
+**Keep the sample growing.** `scripts/fetch_1min_bars.py` tops up
+`data/backtest/underlying/SPY_1min.json` (24 sessions, 2026-08-12..09-15 as of 2026-09-16) and `data/`
+is untracked. Tradier keeps 1-min history for only ~20 days, so run it weekly or those days are gone
+— same perishability argument as C1 Phase 0.
+
+Verified while scoping: the VWAP accumulator only receives ticks while the market is open
+(`stream_driven_worker.py:365`), so the wiggle starts at the bell. But it is in-memory, so **after a
+mid-session restart both VWAP and the wiggle cover only the time since restart.** That already
+affects today's VWAP gate; it belongs with G3's warm-up seeding (Tradier's REST 1-min bars carry a
+per-bar vwap).
 
 **G4c. Prior levels** — yesterday's close, overnight high/low, pre-market range. ORB is already one
 member of this family and the only one measured (**105 breakouts, 59.0% right at +30m, CI excludes
@@ -1263,6 +1722,52 @@ names a different one. Exit pricing is safe (`_check_exit_signals` compares the 
 `position.option_symbol` and falls back to REST on mismatch), but that REST fallback then runs on
 every 1s eval tick — ~60 quote calls/minute for a position that could have been streamed. The
 declined branch could arm the strategy's own open contract instead.
+
+### H4. No broker-side stop exists — a dead engine leaves an open position unprotected *(2026-09-16)*
+
+**Every exit lives in the engine process. Nothing rests at the broker.** Verified 2026-09-16: entries
+and exits are both `order_type='market'` (`order_manager.py`), and no path places a `stop`,
+`stop_limit`, OCO or OTOCO order. Stop loss, take profit, trailing stop and the 15:45 ET forced exit
+are all evaluated by `check_exit_signal` on the streamed **bid**, once a second
+(`_EVAL_INTERVAL`), and only then is a market sell sent.
+
+That design is deliberate and mostly right — option stop orders trigger off erratic prints and can
+fill far away, and a trail or a clock exit cannot be expressed as one resting order. **But it means
+the stop only exists while the process runs.** If the engine crashes, the laptop sleeps, the network
+drops or the stream stalls while a position is open, nothing sells it. For a 0DTE contract:
+
+- it rides to the close and expires worthless — a 100% loss on a stop meant to cap it at 15%, or
+- it finishes in the money and may be **auto-exercised into 100 shares of SPY (~$75,000)**, which a
+  ~$1,460 cash account cannot settle; the broker would force a close-out on its own terms.
+
+**Proposed: a broker-side "disaster stop" as a failsafe, not a replacement.** After an entry fills,
+place a resting `sell` `stop` (or `stop_limit`) order well BELOW the engine's stop — e.g. -40% — with
+`duration=day`. The engine keeps doing every normal exit; the disaster stop only fires if the engine
+has gone silent. Tradier supports `stop` / `stop_limit` on option orders
+(`docs/tradier/trading/place_option_order.md`); consult `docs/tradier/` before any code.
+
+**Design hazards — the reason this is not a quick add:**
+1. **It can BLOCK the engine's own exit.** A broker will very likely reserve the contracts for an
+   open sell order, so the engine's market sell would be rejected for insufficient quantity while
+   the disaster stop rests. The engine must **cancel the stop, confirm the cancel, then sell** — and
+   a failed or slow cancel must never leave the position unsellable. **Exits are sacred: this is the
+   hazard that decides the design.** Verify the reservation behaviour against the docs/broker first.
+2. **Double-fire.** Stop and engine both trigger in a fast move. In a cash account the second sell
+   should be rejected (no position), but that has to be confirmed, not assumed — and reconcile
+   (`_reconcile_position`, `_update_position_exit`) must handle an exit it did not place.
+3. **Orphans.** An engine exit that forgets to cancel leaves a resting sell order behind. Needs a
+   sweep, likely in the reconcile loop, and a startup check.
+4. **Where it sits in the gates.** Placement must go through the same preview / order path as every
+   other order (`_preview_or_abort`, no direct `place_order`), and the cash-reservation ledger must
+   not count it as a buy.
+5. **Level.** Too close and it fires on the same noise the 15% stop already does; too far and it
+   protects little. Start from the cost budget's noise figures, not a round number.
+
+**Cheaper alternative worth weighing first:** a watchdog outside the engine process that alerts (or
+flattens via the normal exit path) when heartbeats stop while a `Position` row is open. It does not
+help if the whole machine is down, which is the case the broker-side stop exists for.
+
+Not started. Engine change — needs sign-off and a design pass before any code.
 
 ---
 

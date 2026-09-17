@@ -57,6 +57,10 @@ const ACTIVITY_TYPES = [
   'ENTRY_BLOCKED_BY_ROLE',
   'ENTRY_BLOCKED_BAD_CONTRACT',
   'ENTRY_BLOCKED_UNCONFIRMED',
+  // The entry_before_et wall (midday/theta cutoff) or the forced-exit time.
+  // Emitted once per strategy per day, so it reads as "entries are done for
+  // today" rather than as a recurring alarm.
+  'ENTRY_BLOCKED_TIME_WINDOW',
   'STRATEGY_STARTED',
 ].join(',');
 

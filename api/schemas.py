@@ -224,6 +224,118 @@ def _validate_time_exit_params(params: Optional[Dict[str, Any]]) -> Optional[Dic
     return params
 
 
+def _validate_vwap_max_stretch(params: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """Reject a `vwap_max_stretch` the engine would refuse at run time.
+
+    The value is a DISTANCE FROM VWAP measured in "wiggles" -- multiples of the
+    session's own volume-weighted standard deviation of price around VWAP -- above
+    which no new entry opens (engine.signal_generator, the don't-chase gate).
+    Blank/absent means no distance gate, which is the shipped default.
+
+    The engine already refuses a value it cannot read (`_coerce_max_stretch`
+    blocks every entry and logs an error). This exists so the refusal happens at
+    the form instead of at 09:31 tomorrow: a stored value the engine will only
+    ever reject is a strategy that silently stops trading.
+
+    Rejected, and why each is not merely unusual:
+      - unparseable, or a bool -- `true` would otherwise coerce to 1.0 and look
+        deliberate
+      - <= 0 -- every distance is >= 0, so the gate would block every entry for
+        the life of the strategy
+      - > 10 -- reachable only in a market unlike any on record; ~2 wiggles is
+        already the far tail (see TODO.md G4b), so this is a fat-finger guard,
+        not a claim about where the useful range ends
+
+    NOT rejected: anything in (0, 10]. 1.0 is the measured starting point, but the
+    threshold is NOT calibrated -- the evidence supports the effect, not the exact
+    cut -- so this deliberately does not force one value.
+    """
+    if not isinstance(params, dict) or params.get('vwap_max_stretch') in (None, ""):
+        return params
+
+    raw = params['vwap_max_stretch']
+    if isinstance(raw, bool):
+        raise ValueError("vwap_max_stretch must be a number of wiggles, not a boolean")
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        raise ValueError(
+            f"vwap_max_stretch must be a number of wiggles (got {raw!r})"
+        )
+    if value != value or value <= 0:
+        raise ValueError(
+            f"vwap_max_stretch must be greater than 0 (got {value}); "
+            f"0 or less would block every entry"
+        )
+    if value > 10:
+        raise ValueError(
+            f"vwap_max_stretch of {value} wiggles is implausibly far from VWAP "
+            f"(about 2 is already the far tail) — leave it blank to disable the gate"
+        )
+    params['vwap_max_stretch'] = value
+    return params
+
+
+def _validate_entry_before_et(params: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """Reject an `entry_before_et` the engine would ignore or that can never fire.
+
+    The wall is an absolute ET "HH:MM" after which no NEW entry opens (see
+    engine.signal_generator.entry_cutoff_time_et). Three ways to get it wrong,
+    all of them silent without this:
+
+    1. Unparseable — `_parse_hhmm` returns None on anything it does not like, and
+       the engine then applies NO wall at all. A typo would quietly disable the
+       gate the user thinks they switched on, which is the worst failure mode a
+       safety gate has.
+    2. Outside 09:30-16:00 — meaningless, and a value before the open would block
+       every entry forever.
+    3. At or before the strategy's own earliest entry
+       (market_open + entry_after_open_minutes). That composes to an empty entry
+       window: the strategy would never take a trade again and nothing would say
+       why. Most-restrictive-bound is correct, a bound that is restrictive to the
+       point of never trading is a configuration error.
+
+    Same honesty boundary as _validate_time_exit_params: the engine is the safety
+    boundary, this makes what is STORED match what actually runs.
+    """
+    if not isinstance(params, dict) or params.get('entry_before_et') in (None, ""):
+        return params
+
+    from engine.signal_generator import _parse_hhmm
+
+    raw = params['entry_before_et']
+    parsed = _parse_hhmm(raw)
+    if parsed is None:
+        raise ValueError(
+            f"entry_before_et must be a 24-hour ET time as \"HH:MM\" (e.g. "
+            f"\"11:30\"), got {raw!r}. The engine silently applies no cutoff at "
+            f"all when it cannot parse this, so a typo would disable the gate."
+        )
+
+    minutes = parsed[0] * 60 + parsed[1]
+    if not (9 * 60 + 30 <= minutes <= 16 * 60):
+        raise ValueError(
+            f"entry_before_et must fall inside market hours 09:30-16:00 ET, got "
+            f"{raw!r}."
+        )
+
+    after_open = params.get('entry_after_open_minutes') or 0
+    try:
+        earliest = 9 * 60 + 30 + int(after_open)
+    except (TypeError, ValueError):
+        earliest = 9 * 60 + 30
+    if minutes <= earliest:
+        h, m = divmod(earliest, 60)
+        raise ValueError(
+            f"entry_before_et {raw!r} is at or before this strategy's earliest "
+            f"entry of {h:02d}:{m:02d} ET (market open + "
+            f"entry_after_open_minutes={after_open}), which leaves no window in "
+            f"which it could ever enter. Use a LATER cutoff or a smaller "
+            f"entry_after_open_minutes."
+        )
+    return params
+
+
 def _validate_direction(params: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     """Reject a `direction` the engine would silently reinterpret.
 
@@ -286,7 +398,8 @@ class StrategyCreate(StrategyBase):
     @field_validator("params_json")
     @classmethod
     def _check_time_exit(cls, v):
-        return _validate_direction(_validate_time_exit_params(v))
+        return _validate_vwap_max_stretch(
+            _validate_entry_before_et(_validate_direction(_validate_time_exit_params(v))))
 
 
 class StrategyUpdate(BaseModel):
@@ -305,7 +418,8 @@ class StrategyUpdate(BaseModel):
     @field_validator("params_json")
     @classmethod
     def _check_time_exit(cls, v):
-        return _validate_direction(_validate_time_exit_params(v))
+        return _validate_vwap_max_stretch(
+            _validate_entry_before_et(_validate_direction(_validate_time_exit_params(v))))
 
 
 class StrategyResponse(StrategyBase):

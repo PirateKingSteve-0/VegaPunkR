@@ -5,6 +5,8 @@
     ./venv/bin/python scripts/replay_session.py --session logs/livetest-2026-09-08
     ./venv/bin/python scripts/replay_session.py --all --entry-end 12:00
     ./venv/bin/python scripts/replay_session.py --all --sweep window
+    ./venv/bin/python scripts/replay_session.py --all --max-stretch 1.0
+    ./venv/bin/python scripts/replay_session.py --all --sweep windowstretch
 
 WHY THIS EXISTS
 ---------------
@@ -33,7 +35,7 @@ history for an unselected contract exists. It answers exactly one question:
 given the entries the strategy actually generated, what do the EXIT rules and
 the trading window do with them?
 
-Two known biases, both stated so nobody has to rediscover them:
+Three known biases, all stated so nobody has to rediscover them:
 
   * Entry fills at the mid the engine logged; a real buy pays closer to the ask.
     So results here are optimistic by roughly half the spread (~0.35% on these
@@ -42,10 +44,48 @@ Two known biases, both stated so nobody has to rediscover them:
     strike, so a position still open at that moment cannot be resolved. Those
     are reported separately as `unresolved` and excluded from every statistic,
     never silently counted as flat.
+  * `--max-stretch` measures distance from VWAP in a DIFFERENT wiggle than the
+    live gate does. The two are named apart on purpose, here and in
+    signal_generator.py, because a number from one says nothing about the other:
+
+      session_wiggle  rebuilt from full-session minute bars (what THIS script
+                      and distance_trades.py use). Answers "does the stretch
+                      idea have edge at all".
+      engine_wiggle   accumulated tick by tick in memory from the first tick the
+                      worker sees, so it is TRUNCATED by any mid-session restart
+                      (what signal_generator.vwap_max_stretch actually reads).
+                      Answers "what will the live gate do".
+
+    MEASURED 2026-09-15 (scripts/measure_engine_wiggle.py, 72 snapshots over the
+    same 9 sessions): ratio engine/session median 0.962, mean 0.945, sd 0.102,
+    range 0.710-1.302. engine_wiggle runs about 4% SMALLER, so the live gate is
+    marginally STRICTER than a session_wiggle reading of the same threshold.
+
+    CONVERSION, which matters if you are trying to reproduce production here:
+    the engine blocks at |price - vwap| >= engine_wiggle ~= 0.962 * session_wiggle,
+    so a live `vwap_max_stretch = 1.0` corresponds to `--max-stretch 0.962` in
+    THIS script's units. Passing 1.0 models a slightly LOOSER gate than
+    production. The sd of 0.102 means that conversion is good to about +/-10% on
+    any given afternoon and occasionally 30%, so do not read a stretch here to
+    two decimals.
+
+    An earlier version of this note claimed the two diverge by 45-76% on restart
+    days, citing engine 0.69 against session 1.24 on 09-10. That was wrong twice:
+    those figures compared two minute-bar constructions (ours against the Tradier
+    file's per-bar `vwap`), and that `vwap` field is CORRUPT — up to 11.5% of its
+    bars fall outside their own [low, high]. There are also no mid-session
+    restarts in these 9 sessions. See TODO.md G4b.
+
+    What remains true: a stretch row here measures whether the IDEA works, not
+    whether 1.0 is the right number. Of the +$242 total benefit this script
+    attributes to a 1.0-wiggle gate, +$245 comes from 09-10 and 09-11 alone and
+    the other seven days net -$3 — two of nine sessions cannot calibrate a
+    threshold, whatever the wiggle definition.
 """
 import argparse
 import glob
 import json
+import math
 import os
 import re
 import statistics
@@ -144,6 +184,136 @@ def find_pairs(session_dir, min_bytes=100_000):
 
 
 # --------------------------------------------------------------------------
+# VWAP and its dispersion, rebuilt from the recorded underlying prints
+#
+# Lives here rather than in scripts/distance_trades.py because BOTH tools now
+# need it and two copies of a stretch calculation is how the same entry ends up
+# with two different stretch values. distance_trades.py imports these.
+# --------------------------------------------------------------------------
+def spy_bars(stream_path, symbol="SPY"):
+    """{et_date: {'HH:MM': (bar_price, close, volume)}} for 09:30-16:00 ET.
+
+    Rebuilt from the `trade` prints in one stream-*.jsonl: bar_price is the mean
+    print price of the minute (the typical price VWAP wants), close is the last
+    print, and volume is the exchange CUMULATIVE counter differenced across the
+    minute — the same counter stream_driven_worker feeds the live accumulator.
+    """
+    prints = defaultdict(list)          # (date, hhmm) -> [(ts, price, cvol)]
+    with open(stream_path, errors="ignore") as fh:
+        for line in fh:
+            if '"kind": "trade"' not in line or '"symbol": "%s"' % symbol not in line:
+                continue
+            try:
+                rec = json.loads(line)
+                ev = rec["event"]
+                ts = datetime.fromisoformat(rec["ts_utc"]).replace(tzinfo=None)
+                px = float(ev["price"])
+                cv = int(ev.get("cvol") or 0)
+            except (KeyError, ValueError, TypeError):
+                continue
+            et = ts + ET_OFFSET
+            hhmm = et.strftime("%H:%M")
+            if "09:30" <= hhmm < "16:00" and px > 0:
+                prints[(et.date().isoformat(), hhmm)].append((ts, px, cv))
+
+    out = defaultdict(dict)
+    last_cv = {}
+    for (day, hhmm) in sorted(prints):
+        p = sorted(prints[(day, hhmm)])
+        cvs = [c for _, _, c in p if c > 0]
+        vol = 0
+        if cvs:
+            start = last_cv.get(day, cvs[0])
+            vol = max(0, cvs[-1] - start)
+            last_cv[day] = cvs[-1]
+        out[day][hhmm] = (statistics.mean(x for _, x, _ in p), p[-1][1], vol)
+    return out
+
+
+def vwap_track(bars):
+    """{'HH:MM': (vwap, session_wiggle)} using every bar up to and including that minute.
+
+    This is the **session_wiggle**: the volume-weighted standard deviation of
+    price around VWAP computed over the whole session so far. Same
+    E[p^2]-E[p]^2 route as signal_generator._calculate_vwap_wiggle, but NOT the
+    same number — that one is the engine_wiggle and restarts with the process.
+    The module docstring explains why the distinction is load-bearing.
+    """
+    spv = sv = spv2 = 0.0
+    track = {}
+    for hhmm in sorted(bars):
+        typ, _close, v = bars[hhmm]
+        spv += typ * v
+        sv += v
+        spv2 += typ * typ * v
+        if sv > 0:
+            vw = spv / sv
+            track[hhmm] = (vw, math.sqrt(max(0.0, spv2 / sv - vw * vw)))
+    return track
+
+
+def stretch_tracks(stream_path):
+    """(bars_by_day, tracks_by_day) for one stream file."""
+    bars = spy_bars(stream_path)
+    return bars, {day: vwap_track(b) for day, b in bars.items()}
+
+
+def accumulator_age_minutes(bars, entry_ts):
+    """Minutes between the first in-hours bar of the entry's day and the entry.
+
+    Mirrors signal_generator._vwap_accumulator_age_minutes, which measures from
+    the first tick THIS PROCESS fed the accumulator. The worker drops every tick
+    while `is_market_open()` is false (stream_driven_worker.py:365), so on a
+    session with no mid-process restart that first tick is the first print after
+    09:30 and this bar-based age matches the live one to within a minute.
+
+    Returns None when the day is unknown.
+
+    FIDELITY NOTE: bars are minute-granular, so the first bar is 09:30:00 and the
+    age at 10:00 reads exactly 30.00. Live, the first in-hours print actually
+    lands 22-328 ms AFTER 09:30:00 on all 9 recorded sessions, so the live age at
+    10:00:00 is 29.99-30.00 — a hair UNDER the 30-minute threshold. The replay
+    therefore passes the first entry evaluation of the day where the engine
+    blocks it for about one second. That one second is the only place the two
+    disagree on a clean session.
+    """
+    et_dt = entry_ts + ET_OFFSET
+    day = et_dt.date().isoformat()
+    bd = bars.get(day)
+    if not bd:
+        return None
+    first = min(bd)                      # 'HH:MM' of the first in-hours bar
+    fh, fm = (int(x) for x in first.split(":"))
+    first_dt = et_dt.replace(hour=fh, minute=fm, second=0, microsecond=0)
+    return (et_dt - first_dt).total_seconds() / 60.0
+
+
+def stretch_at(bars, tracks, entry_ts):
+    """|price - VWAP| / session_wiggle at `entry_ts`, or None if not computable.
+
+    ABSOLUTE, matching signal_generator's live gate — which blocks a call sitting
+    far BELOW VWAP as well as one far above. distance_trades.py signs the same
+    quantity by trade direction for its buckets; the GATE does not, and this
+    mirrors the gate.
+
+    Read off the last COMPLETED minute before the entry, which is what a
+    minute-bar view can honestly claim the strategy knew.
+    """
+    et_dt = entry_ts + ET_OFFSET
+    day = et_dt.date().isoformat()
+    tr, bd = tracks.get(day), bars.get(day)
+    if not tr or not bd:
+        return None
+    prev = (et_dt.replace(second=0, microsecond=0) - timedelta(minutes=1)).strftime("%H:%M")
+    if prev not in tr or prev not in bd:
+        return None
+    vwap, wiggle = tr[prev]
+    if wiggle <= 0:
+        return None
+    return abs(bd[prev][1] - vwap) / wiggle
+
+
+# --------------------------------------------------------------------------
 # the exit walk — a faithful copy of signal_generator.check_exit_signal
 # --------------------------------------------------------------------------
 def walk_exit(ticks, entry_ts, entry_px, cfg):
@@ -207,12 +377,35 @@ def strategy_of(option_symbol):
     return 3 if "C00" in option_symbol else 4
 
 
-def replay(pairs, cfg):
-    """Walk every session under one config. Returns (trades, unresolved, late)."""
+def replay(pairs, cfg, stats=None):
+    """Walk every session under one config. Returns (trades, unresolved, late).
+
+    `stats`, when given, is filled with counts that do not belong in the return
+    tuple — three other call sites unpack exactly three values, so this stays an
+    optional out-parameter rather than a fourth element.
+    """
     trades, unresolved, late = [], 0, 0
+    blocked_stretch = unavail_stretch = 0
+    # The engine re-emits ENTRY SIGNAL on every evaluation tick while a strategy
+    # is flat, so a single stretch of chased tape produces hundreds of identical
+    # blocks. Counting distinct (day, strategy, minute) gives something closer to
+    # "opportunities declined"; the raw tick count is kept beside it because the
+    # ratio is itself informative — a high one means price sat out there a while.
+    blocked_minutes = set()
+    warmup_blocked = 0
+    max_stretch = cfg.get("max_stretch")
+    # Mirrors signal_generator._VWAP_WARMUP_MINUTES. Like the engine's, it lives
+    # inside the `max_stretch is not None` branch, so it is inert while the
+    # don't-chase gate is off.
+    warmup_minutes = cfg.get("warmup_minutes", 30)
     for lg, st in pairs:
         sigs = load_signals(lg)
         quotes = load_quotes(st)
+        # Only rebuilt when the gate is on: it re-reads the whole stream file,
+        # which is the expensive part of a sweep row.
+        bars = tracks = None
+        if max_stretch is not None:
+            bars, tracks = stretch_tracks(st)
         # Each strategy holds at most one position (max_positions=1), so a
         # signal arriving while that strategy is still in a trade is not an
         # opportunity — it is the same trade still running.
@@ -229,6 +422,36 @@ def replay(pairs, cfg):
                 continue
             if cfg["max_per_day"] and taken_today[(et_dt.date(), sid)] >= cfg["max_per_day"]:
                 continue
+            # DON'T CHASE — the live gate is signal_generator's `vwap_max_stretch`.
+            #
+            # Placed AFTER the time window and BEFORE the exit walk so a blocked
+            # signal leaves `busy` untouched: the strategy stays flat and the very
+            # next signal is eligible. That is what the engine does — returning
+            # None from check_entry_signal costs nothing and opens no position —
+            # and it is the whole reason a block can be REPLACED by a later,
+            # sometimes worse, entry.
+            #
+            # An uncomputable stretch BLOCKS, mirroring the engine's
+            # most-restrictive-bound rule rather than trading ungated.
+            if max_stretch is not None:
+                # Warm-up guard, checked BEFORE the wiggle exactly as the engine
+                # orders it: refuse to act on a reading too young to mean
+                # anything rather than trusting it. Most-restrictive-bound — it
+                # can only ever block.
+                if warmup_minutes:
+                    age = accumulator_age_minutes(bars, ts)
+                    if age is None or age < warmup_minutes:
+                        warmup_blocked += 1
+                        continue
+                stretch = stretch_at(bars, tracks, ts)
+                if stretch is None:
+                    unavail_stretch += 1
+                    continue
+                if stretch >= max_stretch:
+                    blocked_stretch += 1
+                    blocked_minutes.add(
+                        (et_dt.date(), sid, et_dt.replace(second=0, microsecond=0)))
+                    continue
             ticks = quotes.get(sym)
             if not ticks:
                 continue
@@ -255,6 +478,11 @@ def replay(pairs, cfg):
                 pnl=(xpx - mid) * 100.0,
                 held_min=(xts - ts).total_seconds() / 60.0))
     trades.sort(key=lambda t: t["entry_ts"])
+    if stats is not None:
+        stats["stretch_blocked"] = blocked_stretch
+        stats["stretch_blocked_minutes"] = len(blocked_minutes)
+        stats["stretch_unavailable"] = unavail_stretch
+        stats["warmup_blocked"] = warmup_blocked
     return trades, unresolved, late
 
 
@@ -452,14 +680,29 @@ SWEEP_HDR = "  %-26s %4s %6s %8s %8s %10s %11s %20s" % (
     "variant", "n", "win%", "avg win", "avg loss", "exp/trade", "$/contract", "95% CI")
 
 
-def sweep_row(label, trades):
+def sweep_row(label, trades, stats=None):
+    """One grid row. `stats` is replay()'s out-dict; when the don't-chase gate
+    ran, its block count is appended so a row's n can be read against what the
+    gate actually declined."""
+    suffix = ""
+    if stats:
+        suffix = "  blocked %dm" % stats.get("stretch_blocked_minutes", 0)
+        if stats.get("stretch_unavailable"):
+            suffix += " (+%d no wiggle)" % stats["stretch_unavailable"]
+        # Warm-up blocks are counted separately and must be shown separately:
+        # folded into the stretch count they would read as the gate declining
+        # chases, when the tally was simply too young to judge. Zero on every
+        # session recorded so far (no mid-session restarts), so a non-zero here
+        # is itself the news.
+        if stats.get("warmup_blocked"):
+            suffix += " (+%d warming up)" % stats["warmup_blocked"]
     s = summarise(trades)
     if s is None:
-        print("  %-26s   (no trades)" % label)
+        print("  %-26s   (no trades)%s" % (label, suffix))
         return
-    print("  %-26s %4d %5.0f%% %+7.1f%% %+7.1f%% %+9.2f%% %11s  %+6.2f%% to %+6.2f%%" % (
+    print("  %-26s %4d %5.0f%% %+7.1f%% %+7.1f%% %+9.2f%% %11s  %+6.2f%% to %+6.2f%%%s" % (
         label, s["n"], s["win_rate"], s["avg_win"], s["avg_loss"], s["exp"],
-        format(s["pnl"], "+,.0f"), s["ci_lo"], s["ci_hi"]))
+        format(s["pnl"], "+,.0f"), s["ci_lo"], s["ci_hi"], suffix))
 
 
 def run_sweep(kind, pairs, cfg):
@@ -515,6 +758,27 @@ def run_sweep(kind, pairs, cfg):
         for v in (1, 2, 3, 4, 5, 8, 0):
             sweep_row("max %s entries/day" % (v or "unlimited"),
                       replay(pairs, dict(cfg, max_per_day=v))[0])
+    elif kind == "stretch":
+        # The don't-chase gate alone, at the entry cutoff cfg already carries.
+        print("  (blocked = signals declined for sitting too far from VWAP)")
+        for v in (None, 2.0, 1.5, 1.0, 0.75, 0.5):
+            stats = {}
+            rows = replay(pairs, dict(cfg, max_stretch=v), stats)[0]
+            sweep_row("max stretch %s" % ("off" if v is None else "%.2f wiggles" % v),
+                      rows, stats)
+    elif kind == "windowstretch":
+        # The question TODO.md G4b asks and nothing could answer until now: does
+        # the entry cutoff still want to be 11:30 once the don't-chase gate is
+        # ON? The two interact — blocking a morning chase frees the slot for a
+        # later entry, and the later entries are the ones the cutoff removes.
+        print("  (entry cutoff moves, forced exit held at 15:45 ET, "
+              "don't-chase gate ON at 1.0 wiggles)")
+        for hh, mm, lab in CUTOFFS:
+            stats = {}
+            c = dict(cfg, entry_end_t=dtime(hh, mm), exit_by_t=dtime(15, 45),
+                     max_stretch=1.0)
+            rows = replay(pairs, c, stats)[0]
+            sweep_row("entries until " + lab, rows, stats)
     else:
         raise SystemExit("unknown sweep: %s" % kind)
 
@@ -553,7 +817,12 @@ def main():
     p.add_argument("--max-per-day", type=int, default=0, metavar="N",
                    help="cap entries per strategy per session (0 = no cap)")
     p.add_argument("--sweep", choices=("window", "close", "stop", "trail", "target",
-                                       "cooldown", "losscooldown", "maxday"))
+                                       "cooldown", "losscooldown", "maxday",
+                                       "stretch", "windowstretch"))
+    p.add_argument("--max-stretch", type=float, default=None, metavar="WIGGLES",
+                   help="don't-chase gate: block entries sitting this many "
+                        "volume-weighted standard deviations from VWAP or more "
+                        "(mirrors params_json.vwap_max_stretch; off by default)")
     p.add_argument("--trades", action="store_true", help="print every round trip")
     p.add_argument("--verify", action="store_true",
                    help="compare against the fills that actually happened (reads PROD, read-only)")
@@ -578,7 +847,8 @@ def main():
                max_per_day=args.max_per_day,
                entry_start_t=parse_hhmm(args.entry_start),
                entry_end_t=parse_hhmm(args.entry_end),
-               exit_by_t=parse_hhmm(args.exit_by or args.entry_end))
+               exit_by_t=parse_hhmm(args.exit_by or args.entry_end),
+               max_stretch=args.max_stretch)
 
     print("=" * 100)
     print("REPLAY  —  %d session log pair(s)" % len(pairs))
@@ -592,6 +862,10 @@ def main():
         cfg["target"], " (suppressed while trail armed)" if cfg["trail"] else ""))
     print("window:     entries %s-%s ET, forced exit %s ET" % (
         args.entry_start, args.entry_end, cfg["exit_by_t"].strftime("%H:%M")))
+    print("don't chase: %s" % (
+        "off" if cfg["max_stretch"] is None
+        else "block entries >= %.2f wiggles from VWAP (minute bars, not ticks)"
+             % cfg["max_stretch"]))
     print("entries fill at the logged mid; exits evaluate on the bid — optimistic")
     print("by about half the spread. See the module docstring.")
     print("=" * 100)
@@ -600,10 +874,24 @@ def main():
         run_sweep(args.sweep, pairs, cfg)
         return
 
-    trades, unresolved, late = replay(pairs, cfg)
+    stats = {}
+    trades, unresolved, late = replay(pairs, cfg, stats)
     s = summarise(trades)
     print()
     print_summary(s, unresolved, late)
+    if cfg["max_stretch"] is not None:
+        print("  %-28s %d minutes declined for sitting >= %.2f wiggles from VWAP "
+              "(%d signal ticks)"
+              % ("not chasing:", stats.get("stretch_blocked_minutes", 0),
+                 cfg["max_stretch"], stats.get("stretch_blocked", 0)))
+        if stats.get("stretch_unavailable"):
+            print("  %-28s %d more had no computable wiggle and were blocked too"
+                  % ("", stats["stretch_unavailable"]))
+        # Reported even at zero: "0 warming up" is the evidence that the 30-minute
+        # guard never bound on this sample, which is a load-bearing claim in
+        # TODO.md G4b. Silence would leave it looking unmeasured.
+        print("  %-28s %d blocked by the %d-minute VWAP warm-up guard"
+              % ("", stats.get("warmup_blocked", 0), cfg.get("warmup_minutes", 30)))
     if trades:
         print_breakdowns(trades)
     if args.verify and trades:

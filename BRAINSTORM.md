@@ -8,6 +8,160 @@ once something becomes work, it moves to `TODO.md` and this keeps only the decis
 
 ---
 
+## Who is pushing, and does price move with them? *(2026-09-17 — bookmarked, not measured)*
+
+**Decision: nothing built. Keep recording `timesale` and measure this once ~2 weeks of sessions exist.
+The idea is a *check* on the signals the strategy already has, not a way to pick direction.** Prompted
+by *"who was more on the bid or ask and how does that help us"* and *"so if it's heavy on the bid you
+put and if not you call?"* Related: TODO.md C2 (the feed), G4 (measure on the tape before building),
+the VWAP-distance section below (same test method), JOURNAL 2026-09-16/17 §2.
+
+### What the data is
+
+Since 2026-09-16 each `timesale` print carries the bid and ask at that instant. A trade **at or above
+the ask** is a buyer crossing the spread (impatient buyer); **at or below the bid**, a seller crossing
+it. "Heavy on the bid" in this sense means *trades printing at the bid* — selling pressure. (Resting
+order *sizes* on the bid are a different thing and can be pulled in a second; not what is recorded.)
+
+### The trap: "bid-heavy → put, ask-heavy → call" is wrong
+
+2026-09-16, share of SPY volume by who crossed the spread:
+
+```
+  hour ET   buyers at ask   sellers at bid   push*    SPY did
+  11:00        39.9%            27.5%        +0.18    flat ~$760
+  13:00        41.7%            23.6%        +0.28    flat ~$760
+  15:00        30.9%            34.5%        −0.06    fell $5+ (low $749.80 at 15:26)
+  close         8.2%            87.8%          —      closing auction — ignore
+  * push = (buy − sell) ÷ (buy + sell)
+```
+
+The naive rule says **buy calls** all morning. SPY went nowhere for four hours and then fell $9.
+
+**What matters is how far price moves for the amount of pushing:**
+
+| Push | Price over the same window | Reading |
+|---|---|---|
+| strong + | up | real buying — confirms a call |
+| strong + | ~flat | **absorption** — a big seller soaking up buyers; argues *against* calls |
+| strong − | down | real selling — confirms a put |
+| strong − | ~flat | **absorption** — a big buyer soaking up sellers; argues *against* puts |
+| weak | big move | **air pocket** — the other side stepped away; price falls/rises through empty space |
+
+09-16 showed both warning patterns: **absorption 11:00-14:00 ET** (push +0.18 to +0.28, price flat),
+then an **air pocket at 15:00 ET** (push only −0.06, SPY down $5+ — buyers vanished rather than sellers
+piling in).
+
+### How it would be measured
+
+- **Push** (order-flow delta, as a share): `(ask-side volume − bid-side volume) ÷ (both)`, −1 to +1.
+- **Price response**, in the same units as the VWAP work: `(price now − price at window start) ÷ typical
+  move over that window` — so a calm morning and a wild afternoon compare fairly.
+- **Window** matched to how long trades last (~5-30 min). 1 minute is noise; hours are stale (09-16's
+  "buyers winning" lasted four hours and said nothing about 14:45). Worth testing a **volume clock**
+  too — "the last 500,000 shares" instead of "the last 10 minutes" — which stretches over quiet lunch
+  and compresses at the open, the way the wiggle adapts to calm vs wild days.
+
+### How it would fit the strategy
+
+As a filter on existing signals, not a direction picker: the call signal fires → over the last few
+minutes, are buyers aggressive **and** is price actually rising? Yes → take it. Buyers aggressive but
+price stalled → skip. Mirror for puts.
+
+### Before any of that — the test, pre-declared
+
+Same discipline as VWAP distance: **pick 2-3 windows before looking** (e.g. 5 / 15 / 30 min, plus one
+volume-clock version), check whether absorption / confirmation / air pocket predict SPY's next 15-30
+minutes, split the sessions in half, and run a shuffle test. Do not try twenty windows and keep the
+best-looking one.
+
+### Caveats to carry
+
+- **One day of data** so far (09-16); every session from here adds one automatically.
+- **~35% of volume prints between bid and ask** and can't be classified either way.
+- **690 quotes arrived crossed** on 09-16 (bid above ask) — normalise, and check the rate per day.
+- **The closing auction** (87.8% bid-side on 09-16) must be excluded, or it dominates the last window.
+- `LIVE_TEST_LOGGING=1` is what records `timesale` — without it the data silently isn't kept (C2).
+
+---
+
+## VWAP distance — the rule chases, the tape pulls back *(2026-09-15)*
+
+**Decision: a "don't chase" entry block at 1.0 wiggle from VWAP is the one measured, cheap
+improvement; it goes to TODO.md G4b as off-by-default work awaiting sign-off. It is a leak fix, not
+an edge. Distance from the 9-minute EMA is dropped.** Prompted by *"measure the distance above or
+below the EMA or VWAP — how does that work, and is it usable?"* Related: the candidate list below
+(this is candidate 2, measured), the cost budget and greeks sections, TODO.md G3/G4b. Numbers:
+JOURNAL.md 2026-09-15.
+
+### Measure in wiggles, never dollars
+
+A "wiggle" is how far price has typically sat from VWAP so far today — the volume-weighted standard
+deviation, i.e. the usual VWAP-band width. It resizes itself per day and per hour: median **$0.41 at
+10:00 ET, $0.62 at 10:30, $0.93 at 12:00, $1.05 at 15:00**; at noon, **$0.36** on the calmest of 20
+days and **$1.77** on the wildest. Through the morning it grows almost exactly with the square root
+of time since the open (predicted 44c / 62c / 98c against measured 41c / 62c / 93c). It falls short
+in the afternoon because the market calms (average 1-minute range 33c at 10:00 ET, 14c at 15:00 ET).
+**So 50c from VWAP is stretched at 10:00 ET and nothing at 15:00 ET.** Any fixed-dollar threshold is
+wrong in both directions at once.
+
+### What was found
+
+- **The tape reverts at moderate stretch.** At 0.5-2 wiggles, SPY drifted back toward VWAP over 30
+  minutes (~1.7 bp raw, ~3.0 bp with each day's drift removed). The shuffle test put it at p = 0.001
+  on 20 sessions, 15 of which went down.
+- **Our trades agree.** The 27 replayed entries made 1-2 wiggles past VWAP won 22% and lost $534 — more
+  than the whole strategy's $425.
+- **Beyond 2 wiggles is unknown.** 5 trades, and a wide interval on the tape.
+- **EMA distance carries no information at all.**
+
+### The reframe
+
+**The current VWAP gate is a trend-following bet** — calls when price is above the line, puts below —
+**and at moderate stretch the tape does the opposite.** "Above VWAP" is not strength on its own. The
+side check is fine near the line; it goes wrong exactly when price has already run.
+
+### Options weighed
+
+| Option | Verdict | Why |
+|---|---|---|
+| Block entries at ≥1.0 wiggle | **chosen** | Measured on two independent-ish datasets. Off by default. Entries only. Keeps the $234 / $129 winners. |
+| Fade the stretch (buy the pullback) | not now | ~13-23c of pullback against a stop needing ~10 bp (~74c). Revisit if the cost budget's IV/friction inputs are revised down (JOURNAL 09-14 §7 says they may be too pessimistic). |
+| Block 0.5-2 but allow 2+ (trend days) | rejected | Rests on 5 trades. Designing around the flattering tail is how a sample fools you. |
+| Fixed-dollar distance | rejected | See above — too strict in the morning and too loose in the afternoon. |
+| Distance from 9-minute EMA | dropped | Shuffle p = 0.30 / 0.91; the two halves disagree in sign. |
+| Tune the cutoff (1.5, 2.0 …) | no | 1.0 was fixed before results. 1.5 and 2.0 were run only to show they barely help. |
+
+### Ideas surrounding this, not yet work
+
+1. **Log the stretch even while the gate is off.** `indicators['vwap_stretch']` on every entry costs
+   nothing, makes every future session measurable without rebuilding VWAP from the tape, and gives
+   the gate-chain view (section below) a real per-node value to show.
+2. **Blocking a bad entry frees the slot for a worse one.** At 1.0, the block removed 36 trades
+   (-$607) and let 7 new ones in — **all 7 stopped out**, mostly 15:25-15:35 ET. The leak moves later
+   in the day, where theta already guarantees the stop. **The don't-chase block and the
+   `entry_before` cutoff probably want to ship together.**
+3. **Cash is the live version of the same effect.** The replay assumes unlimited cash; the account
+   funds ~3 entries a day. Live, a blocked morning chase keeps settled cash for a later signal.
+   Whether that helps depends entirely on the later signal, and on this data it did not.
+4. **ORB and stretch interact.** A range break made close to VWAP and one made already 1.5 wiggles
+   out are different trades. Worth a column in any ORB tape test before ORB is built.
+5. **Restart breaks VWAP as well as the EMA.** The accumulator is in memory, so after a restart both
+   VWAP and the wiggle start from the restart instead of the open. G3's warm-up seeding should seed
+   VWAP too; Tradier's REST 1-min bars carry a per-bar vwap to seed from.
+6. **The stop may want the same normalisation.** A fixed 15% stop sits at a different number of
+   wiggles every hour (cost budget). Expressing stop distance in today's dispersion is the same idea
+   applied to the exit. Untested, and exits are sacred — measure first.
+7. **Grow the sample before it expires.** Tradier's 1-min history is ~20 days deep. Every week not
+   appended to `SPY_1min.json` is lost for this test.
+
+### The rule this produces
+
+> **Normalise a distance by today's dispersion before comparing it to a threshold.** A number of
+> cents from a line means something different at every hour of the day.
+
+---
+
 ## The strategy view should render the gate chain, not the form *(2026-09-14)*
 
 **Decision: build the flowchart view READ-ONLY and LIVE — every gate between a tick and an order,
@@ -51,6 +205,209 @@ liability. Nodes come from a gate registry the engine itself reads, so adding a 
 Sequencing: block reasons must be observable first — they log at DEBUG and the engine runs at INFO
 — which is small, useful on its own, and a prerequisite either way. No graph library in the UI
 today (chart.js, lightweight-charts only); hand-rolled SVG over pulling in dagre/mermaid for this.
+
+---
+
+## What the greeks mean, and which ones this book can act on *(2026-09-14)*
+
+**Decision: the greeks are not extra data to buy — four of them are recoverable from the stream
+logs already on disk, and the two that govern this strategy (theta, vega) have never been looked
+at.** Prompted by *"what do theta, gamma, delta mean and how can we use them?"* Related: the cost
+budget section above, TODO.md C1 (Phase 0), G4, and `docs/negative-expectancy.md`.
+
+### The four numbers, in one line each
+
+A contract's price moves for four reasons. Each greek answers *"if only this one thing changes, how
+much does the price move?"* Numbers below are real, from `SPY260915C00761000` priced at $1.90 with
+SPY at $760.88.
+
+| | Plain meaning | Real value | What it means here |
+|---|---|---|---|
+| **delta** | What you gain per $1 of SPY | 0.505 | SPY up $1 -> contract up ~50c. Also ~the odds of finishing in the money. |
+| **gamma** | How fast delta itself changes | 0.0798 | SPY up $1 -> delta becomes ~0.585. Wins accelerate, losses decelerate. |
+| **theta** | The clock tax, per day | -1.0853 | Loses ~$1.09/day with SPY flat. On a $1.90 contract that is over half its value. |
+| **vega** | Cost of the market getting calmer | 0.1588 | Expected movement down 1 point -> contract loses ~16c (~8%). SPY need not move. |
+
+(rho and phi — interest rates and dividends — are noise on a same-day contract. Ignore them.)
+
+The input behind all four is **implied volatility**: the market's own estimate of how much SPY will
+move, backed out of what people are paying. Every greek is computed from it.
+
+### Why this book only gets hurt by two of them
+
+This engine **only ever buys** options. That splits the four cleanly:
+
+```
+  delta   can help or hurt   — this is the bet we are making
+  gamma   helps              — the one structural gift of being long
+  theta   ALWAYS hurts       — every second held, no exceptions
+  vega    ALWAYS hurts       — a calmer market is a loss, never a gain
+```
+
+A seller has theta and vega working *for* them. That is the volatility risk premium, and it is the
+best-documented edge in the literature — we are on the wrong side of it by construction. So the
+directional call has to be big enough to pay two certain costs before it pays anything.
+
+### How each one is (or should be) used
+
+- **delta — already wired, and the lever most likely to help.** `delta_min`/`delta_max` in every
+  template is the strike selector. At 0.60 the contract is mostly betting money; at 0.85 it is mostly
+  real value, which cuts theta and vega **and** widens the stop in underlying terms. Quantified in the
+  cost budget above: noise-triggered stops fall from 93% to 65%. Blocked on the capital profile
+  (~$7.57 vs ~$3.89 a contract against F3's cash ceiling), not on evidence. See TODO.md E13.
+- **theta — argues for a hard afternoon cutoff.** Decay over a 30-minute hold runs ~2% at 10:00 ET
+  and ~28% at 15:30 ET against a 15% stop. Past about 14:30 ET the position stops itself out on the
+  clock. `exit_before_close_minutes: 15` does not express this — it bounds when we *leave*, not when
+  we may still *enter*. An `entry_before` bound is the missing gate, and it composes
+  most-restrictive-wins with everything else.
+- **vega — measure before acting.** Never looked at, and it is the one this book cannot hedge or
+  avoid. See the measurement below: it is real and it is not small.
+- **gamma — do not gate on it, just know why exits feel violent.** It is why the cost budget had to be
+  solved numerically rather than with a linear delta approximation: over a 30-minute 0DTE hold, delta
+  moves too much to treat as fixed.
+
+### Worked examples — what each value would actually change
+
+Each one is a real decision the engine makes today, the number it currently ignores, and what it
+would do instead. None of these is built; the point is that each is now sized.
+
+**delta — which contract gets bought.** 10:00 ET, SPY 760, the call strategy fires.
+
+```
+  today   first contract clearing delta >= 0.60  ->  strike 758, $3.89
+  at 0.85                                        ->  strike 753, $7.57
+          stop survives an SPY move of   11.8 bp  vs  17.6 bp
+          stopped out by noise alone         93%  vs      65%
+          clock cost over a 14m hold        1.3%  vs     0.4%
+          contracts affordable                 2  vs        1
+```
+
+The only thing blocking it is the capital profile, not evidence. E13, option 2.
+
+**theta — an entry cutoff that does not exist.** A signal fires at 15:30 ET. The engine buys it.
+Over a 30-minute hold the clock takes **28.5%** of premium against a **15%** stop, so the position is
+stopped out by time unless SPY moves favourably immediately. `exit_before_close_minutes: 15` does not
+express this — it bounds when we *leave*, not when we may still *enter*. The missing gate is an
+`entry_before` bound, composing most-restrictive-wins with `entry_after_open_minutes` and the account
+trading window. Past roughly 14:30 ET the stop stops measuring the signal.
+
+**vega — a reason for a flag that already exists.** `avoid_economic_news: True` ships on every
+template and is **implemented nowhere** (`docs/econ-calendar.md`). The mechanism is now concrete:
+the sharpest collapses in expected movement happen immediately *after* a scheduled release, because
+the uncertainty being paid for has resolved. Measured size: roughly **9% of the contract for a
+5-point drop**, more than half a 15% stop, with the underlying flat. That turns an unimplemented flag
+written on instinct into one with a mechanism and a magnitude. Measure across all trades first — one
+instance is not a pattern.
+
+**gamma — build nothing, model it properly.** It is why the cost budget had to be solved by bisection:
+over a 30-minute 0DTE hold delta moves too much to treat as constant, and the linear approximation is
+**20% optimistic** at delta 0.60 (12.48 bp vs a true 10.36 bp). Its only other use is understanding
+why exits feel violent — the next dollar of SPY earns more than the last.
+
+**prior close — a direction filter, and a trap.** 10:30 ET, SPY 758, yesterday's close 762, the put
+strategy armed. The engine has no idea 762 exists. A filter allowing puts only below prior close and
+calls only above would have **silenced the put side for most of the measured week** — which is where
+the losses were. That is also exactly why it cannot be trusted yet: four up-drifting sessions flatter
+any bullish filter by construction, and the cost budget says it must be worth 3-4 bp to pay for
+itself. Prior close arrives free in a `summary` payload (C2).
+
+**timesale — the volume gate stops being direction-blind.** SPY breaks the opening-range high and
+`min_volume_multiplier` reports 2x normal activity. The engine knows the minute was busy; it cannot
+know *who* was busy. With bid and ask attached to each print, the ask-side share is countable: **70%
+ask-side is buyers chasing the break; the same volume at 30% is sellers unloading into a pop.**
+Identical input to today's gate, opposite meaning. See C2.
+
+**summary — a session range the engine can trust.** A worker restarting at 09:50 ET accumulates its
+high and low from 09:50, believes that is the session range, and cannot tell it is wrong. The
+exchange's own open/high/low makes the discrepancy detectable, so the engine can correct itself or
+refuse to trade a range it knows is partial. This is the specific failure the ORB section says
+stream-only range computation cannot avoid.
+
+### The ordering these imply
+
+theta is the only one that is free, certain, and already costing money — an `entry_before` gate needs
+no new data and no measurement, because 28.5% against a 15% stop is arithmetic. delta is next and is
+blocked on capital rather than knowledge. vega wants the decomposition run across all sessions
+first. prior close, timesale and summary all want recorded data before anything gates on them.
+
+### The greeks are recoverable from the logs — demonstrated, not proposed
+
+**The websocket carries no greeks at all.** Confirmed three ways: every `stream-*.jsonl` in `logs/`
+holds only `quote` and `trade` records; `tradier_stream_manager.py:149` sends
+`"filter": ["trade","quote"]`; and Tradier documents exactly five payload types whose complete field
+lists contain no delta, theta, vega, gamma or IV. Greeks are *calculated* (ORATS), and that
+calculation is attached to the REST endpoints only.
+
+But implied volatility is by definition the number that reproduces the observed price — and the
+observed price **is** in the logs. So solve for it, and every greek follows. Run against
+`SPY260911P00767000` (the 09-11 10:36 entry) using only SPY's price, the option's recorded bid/ask,
+and the strike/expiry parsed from the OCC symbol: **5,898 greek samples recovered for one contract.**
+
+```
+      ET      SPY    mid   spr      IV   delta   gamma   vega  theta/d
+10:16:31   765.08   2.39  0.02   15.3%  -0.739  0.1089  0.064    -2.03
+12:16:53   765.41   1.81  0.02   12.3%  -0.793  0.1477  0.045    -1.78
+14:09:26   765.70   1.38  0.01   10.4%  -0.870  0.1836  0.024    -1.59
+15:15:31   764.91   2.10  0.01   16.2%  -0.967  0.0654  0.005    -1.37
+
+session IV: start 15.3%  min 7.4%  max 18.8%  end 16.1%
+```
+
+Sanity checks pass: vega collapses to ~0 into expiry, delta pushes to -1.0 as the put goes deeper in
+the money, theta of $1.20-2.50/day on a $1.40-2.80 contract is the whole contract per day.
+
+**The P&L decomposition that falls out.** 10:16 -> 14:09, SPY went 765.08 -> 765.70 (flat, +62c) while
+the put went 2.39 -> 1.38:
+
+```
+  SPY moving against the put   ~ -$0.50
+  expected movement dropping   ~ -$0.22      15.3% -> 10.4%
+  the clock                    ~ -$0.35
+                               ----------
+                                 ~ -$1.07     (actual -$1.01)
+```
+
+**About 22c of that loss — 9% of the contract, more than half a 15% stop — was the market simply
+getting calmer, with SPY going nowhere.** That is the risk the 2026-09-11 candidate list set aside as
+needing a data-collection project. It does not. It is recoverable tonight, on all 8 live round trips
+and all ~110 replayed ones.
+
+Caveat on "exactly": the arithmetic is exact *given the model*. This uses Black-Scholes; ORATS uses
+American exercise, dividends and a smoothed surface (`smv_vol`). For 0DTE SPY the gap is small, but
+these numbers will not match the broker's to the penny. Fine for decomposing P&L, not a substitute
+for recorded greeks.
+
+**What this does not solve: breadth.** It works only for contracts whose price was recorded — six a
+session. The 304 never subscribed to have no price to solve from, so "would a deeper contract have
+done better" still needs C1 Phase 0 or purchased history.
+
+### Plumbing facts found while confirming the above
+
+- **Recorded quotes are 2-second samples, not every tick.** `tradier_stream_manager.py:20` thins them
+  deliberately ("they arrive 10+/s"). Measured: minimum gap exactly 2.00s, median 2.1-2.4s, every
+  symbol. Trades are complete. Exits evaluate on the **bid**, and the live engine evaluated every 1s —
+  so a replay is strictly coarser than what happened. A ceiling on replay fidelity, not a bug.
+- **We subscribe to 2 of 5 payload types.** `summary` and `timesale` are free on the same socket.
+  `summary` carries the exchange's own session open/high/low/prevClose — which would fix the
+  "worker restarts at 09:50 and computes a partial opening range without saying so" failure the ORB
+  section flags, and supplies prior close for the prior-levels candidate. `timesale` carries bid **and**
+  ask alongside each print, so it reveals whether a trade hit the bid or paid the ask — direct
+  measurement of aggressor side, and of our own fill quality (TODO B1) — plus `cancel`/`correction`
+  flags, which the volume gate currently counts as real prints.
+- **REST `/markets/timesales` is NOT the websocket `timesale`.** Same name, different product. REST
+  `interval=tick` returns `{time, timestamp, price, volume}` — **no bid/ask**, so it cannot give
+  aggressor side. REST `interval=1min` returns OHLCV **plus the exchange's own vwap**, which is a free
+  cross-check on the VWAP the engine accumulates itself (candidate 2 above).
+- **Use `timestamp`, not `time`, from REST timesales.** The epoch fields agree across intervals; the
+  string ones do not (`interval=tick` returned `14:00:00` for a 10:00 ET query, `1min` returned
+  `10:00:00`). A collector that parses `time` will silently be four hours off on one path.
+
+### The rule this produces
+
+> **Before buying or collecting data, check whether the answer is already implied by what is on
+> disk.** Implied volatility and all four greeks were recoverable from logs we already had; the
+> question was framed as a data-collection project for three days because nobody tried solving for
+> them.
 
 ---
 

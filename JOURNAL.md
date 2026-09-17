@@ -10747,3 +10747,900 @@ which may or may not be intended, given the RDS move was specifically so both ma
 4. Point `resolve_mode()` at `orders-*.jsonl` so the SUSPECT warning can be resolved rather than
    merely raised.
 5. Watch the cash banner render; decide whether it should clear at the bell or at midnight ET.
+
+---
+
+## Session Date: September 14-15, 2026 — The stop was measuring noise, and the greeks were already on disk
+
+Started as *"do any edges actually exist, and how does anyone confirm one without backtesting"* and
+turned into an audit of what this project can and cannot measure with the data it already has. Two
+findings changed the plan; three things I asserted during the session turned out to be wrong and are
+retracted below.
+
+### 1. The cost budget — the stop sits inside the noise in every configuration
+
+New tool: `scripts/cost_budget.py` (stdlib only, no DB, no network). Given spot, IV, hold time,
+stop/target and a delta, it solves Black-Scholes by bisection for two numbers the project had never
+computed separately:
+
+- **break-even room** — the favourable move needed just to cover spread and decay
+- **stop room** — the *adverse* move that fires the percentage stop
+
+The second one is where the strategy dies. SPY moves about **26.4 bp in a typical 30 minutes**.
+Against that, a 15% premium stop sits at:
+
+```
+  delta  hold   stop room   in sigma   P(stopped by noise alone)
+   0.60   30m     10.36 bp      0.39            ~100%
+   0.70   30m     12.79 bp      0.48              99%
+   0.70   14m     13.92 bp      0.77              84%
+   0.85   14m     17.58 bp      0.97              65%     <- best cell in the grid
+```
+
+**The best case is stopped out by random movement about two thirds of the time.** The measured ORB
+edge is 3.69 bp = **0.14 sigma**. A 0.14-sigma signal cannot be expressed through a 0.4-sigma barrier.
+
+**This is the mechanism behind the eight flat parameter sweeps.** Entry window, forced-exit, stop,
+trail, target, cooldown, loss-cooldown, trades-per-day all landing between −1% and −3% is the
+signature of noise-triggered exits: the knobs change *which* random move closes the trade, never
+*whether* one does. The sweeps were not underpowered — they were measuring a random walk.
+
+Model is calibrated, not assumed: it reproduces the 09-02 $3.27 fill and independently returns
+**10.36 bp** where a hand estimate from a single contract had said **~9.7 bp**. Bisection mattered —
+the linear delta shortcut is **20% optimistic** at delta 0.60 (12.48 vs 10.36 bp).
+
+Second finding from the same model: **past roughly 14:30 ET the trade is arithmetically dead.** At
+delta 0.60-0.70 with a 30-minute hold, decay at 15:00 ET is **17.9%** against a **15%** stop — stop
+room goes *negative* (−0.92 bp at 15:00, −2.48 bp at 15:30). The position needs a favourable move
+just to survive the clock, and the exit is logged as a stop-loss. Every late-session win rate and
+exit-reason statistic in the DB is measuring the passage of time.
+
+**And it compounds with G3's finding in the same direction.** `min_volume_multiplier` is *loosest*
+into the close (a typical 15:45 minute scores ~2.2x with no spike), so the gate opens widest exactly
+when the stop is guaranteed to fire on decay. Two independently-found defects pointing the same way.
+
+Written up in `BRAINSTORM.md`, "The cost budget comes before the signal search".
+
+### 2. E13 — every template shipped a negative-expectancy stop/target pair. Fixed.
+
+Found while calibrating the model. All eight templates in `api/strategy_templates.py` shipped the
+stop **wider** than the target — break-even win rates of 53.3% to 66.7%, against a coin flip at 50%.
+`scripts/fix_strategy_expectancy.py` patched the *prod rows* on 2026-07-13 and the templates were
+missed, so every strategy created from the default path since then was born with the exact defect
+`docs/negative-expectancy.md` was written about.
+
+```
+  spy / qqq / aapl / meta / amzn   50/25 -> 15/30      all eight now break even at 33.3%
+  amd                              45/30 -> 18/36
+  tsla                             40/30 -> 20/40
+  nvda                             40/35 -> 20/40
+```
+
+The stop was set to each template's own `trailing_stop_activation` and the target to twice that, so
+the wider stops stay on the more volatile names — the relative ordering the file already encoded,
+rescaled the way `min_volume_multiplier` was on 2026-09-10. SPY lands on exactly the 15/30 prod
+strategies 3 and 4 run.
+
+Both key spellings written together, **all 32 values verified equal** — the July trap where the UI
+showed 15% and the engine enforced 50% cannot recur from a template.
+`test_strategy_risk_field_sync` and `test_trailing_stop_arming` both pass. Neither reads the
+templates, so this is coverage-neutral: **no test asserts on template defaults, and one should.**
+
+Deliberately not changed: `delta_min` stays 0.60 on all eight. Raising it toward 0.85 is the other
+half of the recommendation and collides with F3's cash ceiling (~$7.57 vs ~$3.89 a contract).
+
+### 3. What the stream actually contains — six contracts out of 310
+
+Audited every `stream-*.jsonl` in `logs/`. Findings, all measured:
+
+- **Only two record types exist, in every session ever recorded**: `quote` and `trade`.
+- **One session covers 6 option contracts.** A full SPY 0DTE chain is **310**. About 2%. They appear
+  and disappear in sequence as the engine re-arms to a new strike — subscriptions are ref-counted
+  (`tradier_stream_manager.py:52`), so a contract is recorded only while a strategy has it armed.
+- **It records while the strategy is *watching*, not while holding.** `SPY260911P00762000` streamed
+  00:41 -> 10:16 ET on 09-11 and was never bought; the day's first fill was 10:36 on a different
+  strike.
+- **Coverage within the day is partial even for those six** — 242 of 390 minutes for the best, 46
+  for the worst.
+- SPY itself is complete: 100% of minutes, 159,039 of the session's 207,229 records (77%). It is also
+  what wakes the eval loop.
+
+**The division of labour, which explains what is and is not testable:** entries are decided on SPY
+(9-EMA, VWAP, volume), exits on the contract's bid (`strategy_executor.py:562`). That is why the
+entry could be measured on the tape without any option data — the entry never reads option data —
+and why alternative *contracts* cannot be tested at all.
+
+### 4. The greeks are recoverable from the logs. Demonstrated.
+
+**The websocket carries no greeks**, confirmed three ways: only `quote`/`trade` in every log; the
+subscription filters to `["trade","quote"]`; and Tradier documents exactly five payload types whose
+complete field lists contain no delta, theta, vega, gamma or IV. Greeks are *calculated* (ORATS) and
+bolted onto the REST endpoints only.
+
+But implied volatility is by definition the number that reproduces the observed price, and the
+observed price is in the logs. So solve for it and every greek follows. Run against
+`SPY260911P00767000` using only SPY's price, the option's recorded bid/ask, and the strike/expiry
+parsed from the OCC symbol: **5,898 greek samples recovered for one contract.** IV ran 15.3% at
+10:16 ET down to 10.4% by 14:09 and back to 16.2% by 15:15.
+
+Sanity checks pass — vega collapses to ~0 into expiry, delta marches to −1.0 as the put goes deeper
+in the money, theta of $1.20-2.50/day on a $1.40-2.80 contract is the whole contract per day.
+
+**The decomposition that falls out.** 10:16 -> 14:09, SPY went 765.08 -> 765.70 (flat, +62c) while
+the put went 2.39 -> 1.38:
+
+```
+  SPY moving against the put   ~ -$0.50    delta
+  the market getting calmer    ~ -$0.22    vega     15.3% -> 10.4%
+  the clock                    ~ -$0.35    theta
+                               ----------
+                                 ~ -$1.07   (actual -$1.01)
+```
+
+**~22 cents — 9% of the contract, more than half a 15% stop — was the market simply getting quieter,
+with SPY going nowhere.** Script is in scratchpad, not yet promoted to `scripts/`.
+
+### 5. C1 respecced, C2 opened
+
+**C1 (backtesting) was a stub; it is now a three-phase spec.** The reordering driver is that
+Tradier's intraday history expires — tick 5 days, 1-min 20 days
+(`docs/tradier/market/time_and_sales.md`) — and `/markets/history` accepts OCC symbols but returns
+*daily* bars, one per 0DTE contract's entire life, which cannot order a stop against a target. So
+option history older than ~20 days is **permanently unrecoverable**, and Phase 0 (a REST chain
+snapshot collector, measured at **14 MB/session gzipped** for all 310 contracts) is the only part
+with a deadline.
+
+> **Correction 2026-09-15.** "Permanently unrecoverable" was too strong, and the error was
+> asserting a limit for `/markets/timesales` that had only been tested on `/markets/history`.
+> `timesales` *does* serve intraday option data on OCC symbols at both `1min` and `tick` within the
+> 20/5-day horizons. It carries **no bid/ask and no greeks**, and coverage is sparse — the 09-16
+> chain's highest-volume contract returned 34 of 390 one-minute bars. So Phase 0's deadline stands,
+> but it is the **bid/ask across all strikes and the greeks** that can only be collected live, not
+> the trade tape. See TODO C1 Phase 0 for the measurement. Phase 1 is a local CLI built on `replay_session.py`. Phase 2 (API + UI, behind a
+`User.can_backtest` flag and a `BACKTEST_ENABLED` mount switch) is optional and last — the
+access-control requirement only binds Phase 2, and a laptop CLI has no access surface at all.
+
+**C2 (new): subscribe to `summary` and `timesale`.** Two of the five payload types are free and
+unused. `summary` carries the exchange's own session open/high/low/prevClose — which fixes the
+"worker restarts at 09:50 and computes a partial opening range without saying so" failure the ORB
+section names, and supplies prior close for free. `timesale` carries bid **and** ask alongside each
+print, so aggressor side becomes countable: a breakout on 70% ask-side prints is buyers chasing, the
+same volume at 30% is sellers unloading. It also carries `cancel`/`correction` flags — **the volume
+gate currently counts busted prints as real.**
+
+Subscribing alone changes no behaviour: `apply()` branches on `trade`/`tradex`/`quote` with **no
+else**, the signal check fires only on `trade`/`tradex`, and the recorder logs any type generically.
+But `StreamRouter.dispatch()` routes by symbol **without filtering type**, and each strategy queue is
+`maxsize=100` that silently drops on overflow — so `timesale` roughly doubling trade traffic (+167k
+messages on 09-11, log 60.8 -> ~110 MB) would add pressure to a queue whose dropped message could be
+the `trade` tick an exit needed. The recorder runs **before** dispatch, so the safe shape is two
+changes: add the filter entries, and drop non-consumed types in `dispatch()`. Full capture, zero
+added queue pressure. Not made — engine files, wants sign-off.
+
+### 6. ORATS sample reviewed — right shape, two things to confirm
+
+A vendor sample was on hand (`~/Downloads/intraday-sample-data/`, 5 files, one per minute,
+2022-08-08 10:00-10:04 ET). It carries `callBidPrice`/`callAskPrice`/`putBidPrice`/`putAskPrice`,
+bid/ask **sizes**, volume, open interest, full greeks and six IV columns. **Bid and ask are both
+present** — that was the one dealbreaker question, since a trades-only dataset hides the spread and
+would flatter every backtest in the optimistic direction, which is the sandbox mistake with a
+receipt.
+
+Two things still to confirm before paying the quoted **$1,500** for 1-min intraday back to 2007:
+
+1. **Does SPY coverage include `dte=0`?** The sample is **AAPL**, whose nearest expiry in it is
+   `dte=5`. There is no `dte=0` row anywhere. AAPL has no daily expiries, so the sample cannot
+   demonstrate that the expiring-today series is kept. The entire book is `dte=0`.
+2. **Depth is worth less than it sounds.** Daily SPY expiries are roughly a 2022-onward product
+   (Mon/Wed/Fri from ~2016, Friday-only before). The usable window is ~2022-present, about 880
+   sessions — which is already past the ~600 independent observations the power math asks for.
+
+Layout note: one row = one *strike*, carrying call and put together; Tradier is one row per contract.
+Trivial converter. Storage: ~524 KB/min for one ticker, so SPY is likely 600-800 MB/day raw —
+manageable only if filtered to `dte=0` on ingest (~1 MB/day compressed).
+
+**Also worth stating plainly: $1,500 is more than the entire trading account** (equity $1,060 ->
+$1,214). Recommendation was to gate the purchase on the permutation test, which is free: if random
+entries do as well as the signal, no amount of history helps.
+
+### 7. Three things I got wrong in this session
+
+- **"Recorded stream data is every tick."** Wrong for quotes. `tradier_stream_manager.py:20` thins
+  them deliberately ("they arrive 10+/s"); measured minimum gap is exactly **2.00s**, median
+  2.1-2.4s, every symbol. Trades are complete. Exits evaluate on the **bid** and the live engine
+  evaluated every 1s, so **a replay is strictly coarser than what happened** — a real ceiling on
+  replay fidelity.
+- **"Whether a calmer market hurts us needs data we don't have."** Wrong — see §4. It is recoverable
+  from every session already on disk, retroactively, for free. That claim sat in a
+  what-we-have/what-we-need table for three exchanges before being tested.
+- **"A synthetic backtester would need estimated option prices."** Wrong. `stream-*.jsonl` carries
+  real recorded bid/ask for held contracts, so `replay_session.py` is already a real backtester on
+  real prices. Its ceiling is breadth (6 contracts), not fidelity.
+
+The IV input to `cost_budget.py` is also now **uncertain rather than settled**: a live chain snapshot
+showed **11.8%** on a near-dated SPY contract against the model's assumed **35%**. The
+stop-in-the-noise conclusion is unaffected (stop distance and sigma both scale with IV, so the ratio
+holds), but the **break-even margin is not** — decay scales with IV while the 3.69 bp edge does not,
+so a lower IV moves that comparison from "barely loses" toward "clears comfortably". Unsettled until
+real 0DTE snapshots exist. Also measured: real spreads on those contracts are **1-4 cents**, not the
+$0.20 `max_bid_ask_spread` allows, so the 2.5% friction assumption may be several times too
+pessimistic.
+
+### 8. A commit landed mid-session
+
+`902286f "changes for ema9 minute, strat form changes, test, docs"` (22:21 PDT) swept this session's
+finished work — the E13 template fix, `scripts/cost_budget.py`, the cost-budget BRAINSTORM section,
+and the E13/C1 TODO changes — in with a parallel stream's own: the `ema_period` nine-minute fix and
+its `test_bar_aggregation.py`, the strategy-form changes, the architecture diagram, and
+`scripts/replay_session.py` and `scripts/permutation_test.py` becoming tracked.
+
+Worth noting for anyone reading the history: **the E13 fix is in that commit and its message does not
+mention it.** Eight templates changed from stop-wider-than-target to 1:2; the commit says "strat form
+changes". `scripts/distance_test.py` and `scripts/distance_trades.py` also appeared untracked in the
+tree during the session and are not this session's work — presumably the VWAP-distance candidate
+(BRAINSTORM 2026-09-11, candidate 2).
+
+### 9. Written this session
+
+- `scripts/cost_budget.py` — break-even and stop-room per hour, per delta
+- `api/strategy_templates.py` — E13 fix, all eight templates
+- `docs/greeks-and-iv.md` — new plain-language reference for delta/gamma/theta/vega/IV, with the
+  real decomposition above and a glossary
+- `BRAINSTORM.md` — "The cost budget comes before the signal search"; "What the greeks mean, and
+  which ones this book can act on", including worked examples per value
+- `TODO.md` — E13 (found and fixed), C1 respecced to three phases, C2 opened
+- `JOURNAL.md` — this entry
+
+### 10. Open
+
+1. **~~Permutation test~~ — RUN 2026-09-15. The entry signal does not beat random entry times.**
+   `scripts/permutation_test.py` (landed in `902286f`) holds session day, strategy and the ET
+   half-hour fixed and shuffles only the entry instant, neutralising both confounds that govern every
+   other read here — the up-drifting sample and the 4x fall in premium through the day. 2000
+   permutations, seed 20260914, 138 usable trades across 6 sessions:
+
+   ```
+                    n | SIGNAL exp / win | RANDOM exp (5th-95th)   | p(better) p(worse)
+     ALL          138 |  -2.16% / 45.7%  | -1.23%  (-3.35 .. +0.97) |   0.749    0.252
+     CALLS (s3)    36 |  -1.62% / 38.9%  | -2.42%  (-6.54 .. +2.69) |   0.355    0.646
+     PUTS  (s4)   102 |  -2.35% / 48.0%  | -0.82%  (-3.29 .. +1.81) |   0.844    0.157
+   ```
+
+   **Both p-values nowhere near 0.05 — the real entries sit inside the random pile, and the signal is
+   if anything slightly worse than the random mean.** This is story (b) from the script's docstring:
+   the entry is irrelevant; any moment loses about this much once the stop, spread and decay are
+   paid. It also confirms the cost budget's prediction that random entries would land in the same
+   -1% to -3% band as the eight sweeps. The random 95th percentile is only +0.97%, so even a
+   1-in-20 lucky random schedule barely clears zero — **the exit geometry and costs define the
+   outcome, not the entry.**
+
+   Sanity checks clean: armed-contract rebuild matched the signal's contract 138/138; stream mid vs
+   engine-logged mid differs $0.014. Sample grew from 118 to 138 by picking up 09-11 and 09-14.
+
+   **The put side is worse than random** (-2.35% vs -0.82%, p=0.157). Not significant alone, but the
+   tape test independently put puts at 39.1% against a 50.6% baseline — two methods agreeing the put
+   entry is actively harmful.
+
+   **What it settles:** entry timing is inert, and exit tuning was already inert across eight sweeps.
+   Two of three legs proven not to matter. **What it does not settle:** contract selection, which the
+   test deliberately holds fixed (a random entry buys whatever was armed). So deeper-ITM remains
+   untested — and it is now the only remaining hypothesis.
+
+   **Consequence for the $1,500.** The gate was "if random does as well, no history purchase helps."
+   Random does as well. The surviving hypothesis is the one the data would test, which cuts the other
+   way — but `scripts/cost_budget.py` already says even delta 0.85, the deepest the gate allows, is
+   stopped by noise **65%** of the time. Buying $1,500 of history to test a hypothesis the model says
+   probably fails, against a $1,060 account, is a poor bet. Collector for 2-3 weeks, test 0.85 vs
+   0.60, then decide.
+
+   **The structural read.** Entry inert, exits inert; what is left is the design — buying premium with
+   a tight percentage stop whose distance sits inside the noise. The two exits from that are no stop
+   (accept the built-in 100% cap and size for it) or much deeper ITM. **Both are blocked by account
+   size** — F3 and D6 arriving from a third independent direction.
+2. **Two sessions on disk that no analysis has touched** — `logs/livetest-2026-09-11` (1,439 entry
+   signals, larger than any session the BRAINSTORM conclusions rest on) and `logs/livetest-2026-09-14`
+   (7). `replay_session.py --all` picks both up. Free.
+3. **C1 Phase 0 collector** — not written. Every session that passes is permanently unbacktestable
+   beyond the ~20-day horizon.
+4. **Promote the IV-solver out of scratchpad into `scripts/`** and run the decomposition across all 8
+   live round trips and ~110 replayed ones. Answers "how much of our loss was direction, clock, or a
+   calmer market" on data already held.
+5. **An `entry_before` gate.** theta past 14:30 ET is arithmetic, needs no new data, and nothing
+   currently expresses it — `exit_before_close_minutes` bounds leaving, not entering.
+6. **A test asserting template defaults break even below 50%.** E13 was a silent two-month regression
+   precisely because nothing checked.
+7. **C2's two-file change** — awaiting sign-off.
+8. **Confirm with ORATS**: SPY `dte=0` coverage, and whether a 2022-onward tier exists at lower cost.
+9. **Schwab 1-min option history** — asked, still unanswered. No Schwab docs vendored in-repo.
+
+---
+
+## Session Date: September 15, 2026 — VWAP distance: the rule chases, and the tape pulls back
+
+A parallel session to the entry above. Started from *"the other chat wants to run a permutation test
+— what would that entail?"*, and went on to the idea of measuring **how far** price sits from VWAP
+and the EMA instead of only which side. This is where `scripts/distance_test.py` and
+`scripts/distance_trades.py` came from (the entry above found them untracked and could not place
+them). Nothing in the engine was changed.
+
+### 1. The permutation test
+
+Written here as `scripts/permutation_test.py`; results are recorded in the entry above (§10.1) and
+not repeated. What the test holds fixed and shuffles: the entry instant is shuffled. Session,
+strategy, ET half-hour, the armed-contract selection (rebuilt from the engine's own
+`Selected put/call` and `disarming` log lines), the exit rules and the trade count are all held.
+The headline: the signal's entries were no better than random times (p = 0.74), and random entries
+lose about 1.3% a trade on their own.
+
+### 2. A stale TODO, and my mistake
+
+I told the user `ema_period: 9` was still a 9-second EMA, reading TODO.md G3's text. **Wrong — it was
+fixed 2026-09-10** (1-minute bars, history fed unconditionally, a missing indicator blocks), and the
+09-11 and 09-14 live sessions ran on it. The TODO had never been marked. G3 is now struck through,
+with a status block naming what landed and the one open part: nothing seeds history after a restart,
+so a mid-session restart costs ~20 minutes of entries. The user committed it in `902286f`.
+
+**Lesson: the code is the source of truth for "is this fixed", not the TODO prose.**
+
+### 3. What a "wiggle" is
+
+It is distance normalised by the day's own dispersion: the volume-weighted standard deviation of price
+around VWAP since the open, the usual VWAP-band construction. Measured on the 20-day file
+(`data/backtest/underlying/SPY_1min.json`, 2026-08-12 .. 09-09):
+
+```
+  ET      median wiggle   calmest   wildest
+  10:00       $0.41        $0.15     $0.91
+  10:30       $0.62        $0.29     $1.34
+  12:00       $0.93        $0.36     $1.77
+  15:00       $1.05        $0.58     $2.19
+
+  share of 10:00-15:45 ET minutes beyond:  0.5 -> 67%   1 -> 41%   2 -> 7%   3 -> ~0%
+```
+
+Through the morning it grows almost exactly with the square root of time since the open (44c / 62c /
+98c predicted, 41c / 62c / 93c measured). By 15:00 ET it is $1.05 against a predicted $1.46, because
+the afternoon is calmer (average 1-minute range 33c at 10:00 ET, 14c at 15:00 ET).
+
+Cutoffs were **fixed in code before any result was seen**: 0.5 / 1 / 2 wiggles.
+
+### 4. Tape test — 20 sessions, 6,900 minutes (`scripts/distance_test.py`)
+
+The sample is 15 down days and 5 up, the reverse of every earlier test. Each minute is folded so
++ means price kept moving away from the line and − means it came back. Confidence intervals are
+clustered by day.
+
+```
+  VWAP, +30m        min   kept going   avg bp    95% CI (by day)
+  <0.5             2188     47.6%      -0.43    -1.52 .. +0.65
+  0.5-1            1686     40.4%      -1.69    -3.21 .. -0.18   comes back
+  1-2              2255     41.3%      -1.71    -3.28 .. -0.13   comes back
+  >2                471     54.1%      +0.40    -2.91 .. +3.71
+```
+
+- **Shuffle test** (within each day, rotate the outcome series against the distance series): at 1+
+  wiggles the actual reading was −1.34 bp against +1.63 bp for chance. **p = 0.001** at +30m, 0.017 at
+  +15m. The chance mean is positive because a trending day puts price on one side of VWAP and keeps
+  it moving that way; with each day's drift subtracted, the pullback is **−2.99 bp at 30m**.
+- **Split halves:** same direction in both (first 10 days −2.06 / −1.80; last 10 −1.20 / −1.64 for
+  0.5-1 / 1-2). Only one bucket's CI excludes zero in either half.
+- **EMA distance: nothing.** Shuffle p = 0.30 / 0.91, and the halves disagree in sign.
+- **Only minutes the current rule would buy** (547 of them): at 1-2 wiggles from VWAP, SPY went the
+  trade's way 38.6% of the time (−2.41 bp, CI −5.41 .. +0.58).
+
+### 5. Our own trades — 138 replayed round trips (`scripts/distance_trades.py`)
+
+VWAP and the wiggle were rebuilt from the recorded SPY stream. Cross-checked against the Tradier
+minute file on the 5 overlapping days: VWAP agrees within $0.006-$0.234, the wiggle mostly within
+~10-20c. Stretch is signed in the trade's direction (+ = a call above VWAP or a put below it, i.e.
+chasing).
+
+```
+  stretch at entry   n   won   avg trade   $/contract   SPY +30m your way
+  wrong side (<0)   31   45%     +0.05%       +144          +6.56 bp
+  <0.5              41   49%     -0.74%        -69          -0.71
+  0.5-1             34   56%     +0.09%        -58          -2.17
+  1-2               27   22%    -10.43%       -534          -2.77
+  >2                 5   60%     +1.79%        +92          +0.96
+```
+
+**The 1-2 group lost more than the whole strategy (−$534 vs −$425).** Its CI is −14.5% to −6.4% a
+trade. The losses are spread over 6 of 7 days, calls and puts both: 09-03 10 trades / 2 won; 09-08,
+09-09, 09-10 nine trades / 0 won; 09-11 5 / 2. The "wrong side" group is not a real exception. It
+averages only 20c from VWAP, where the engine's tick VWAP and this minute-bar rebuild can disagree
+on side.
+
+Caveats: 4 of these 8 dates are also in the 20-day file, so this is not fully independent
+confirmation. The 09-10, 09-11 and 09-14 trades are new, and they agree.
+
+### 6. Replay with a don't-chase block
+
+Signals at or beyond the cutoff were removed before the replay, so the busy clock is free and later
+signals can take the slot.
+
+```
+                         n    win     avg      total    trailing wins / $
+  block off (today)    138   44.9%   -2.16%    -$425      59 / +$1,728
+  block at 1.0         109   48.6%   -0.65%     -$54      50 / +$1,456
+  block at 1.5         128   44.5%   -1.91%    -$368      54 / +$1,574
+  block at 2.0         137   45.3%   -2.03%    -$397      60 / +$1,630
+```
+
+At 1.0 the $371 improvement decomposes as: **36 trades removed (9 won, −$607); 7 replacement trades
+let in, all 7 stop-outs (−$236), mostly 15:25-15:35 ET puts; 102 unchanged (+$182).** The whole gain
+came from avoiding trades, none from better ones.
+
+**Big winners:** the top two ($234, $129) are kept. Of the top 10, 2 are blocked: $88 (#3) and $47
+(#10), both entered beyond 2 wiggles. Wins from 1-2 wiggle entries were the smallest (6 trailing
+wins, $15 average).
+
+**Not an edge.** Payoff 0.92x needs ~52% to break even, and the replay is optimistic by about half
+the spread.
+
+### 7. The gate, sketched and deliberately not built
+
+The user asked what would change in the code, and chose to save the build for later. The sketch is
+now in TODO.md G4b: a `sum_p2v` accumulator, `_calculate_vwap_wiggle()`, and an off-by-default
+`params_json.vwap_max_stretch` that blocks entries at or beyond the cutoff and blocks when the wiggle
+is unavailable. Entries only. The pre-enable checklist is there too, including a tick-vs-bar wiggle
+check.
+
+Found while scoping: the VWAP accumulator only receives ticks while the market is open
+(`stream_driven_worker.py:365`). But it lives in memory, so **after a restart VWAP covers only the
+time since the restart**. That already affects today's VWAP gate. It is filed with G3's warm-up
+seeding.
+
+### 8. Written this session
+
+- `scripts/permutation_test.py` — entry timing vs random, identical exits (tracked in `902286f`)
+- `scripts/distance_test.py` — VWAP/EMA distance on 20 sessions of 1-min bars, with split halves and
+  a shuffle test (untracked)
+- `scripts/distance_trades.py` — replayed trades bucketed by stretch at entry (untracked)
+- `TODO.md` — G3 marked fixed; G4b measured, with the build spec and checklist
+- `BRAINSTORM.md` — "VWAP distance — the rule chases, the tape pulls back", with the options weighed
+  and the ideas around it
+- `JOURNAL.md` — this entry
+
+All three scripts are read-only. `data/` (which `distance_test.py` reads) is still untracked.
+
+### 9. Open
+
+1. **Build `vwap_max_stretch`** — awaiting sign-off (TODO G4b).
+2. **Decide whether it ships with an `entry_before` cutoff.** Its replacement trades were late-day
+   stop-outs (BRAINSTORM idea 2).
+3. **Top up `SPY_1min.json` from 2026-09-10 onward** before those days fall out of Tradier's ~20-day
+   1-min window. The file ends 09-09, and every day not appended is lost for this test.
+4. **Seed VWAP and the EMA after a restart** (G3 warm-up).
+5. **Add a stretch column to any ORB tape test** before ORB is built.
+
+*(Items 1-3 were all done the same night — see the next entry.)*
+
+---
+
+## Session Date: September 15-16, 2026 — Both gates shipped, and a corrupt reference file
+
+The build half of the previous two entries. A parallel session wrote the engine changes, the tests,
+the UI fields and four new scripts; this session reviewed them, checked what is live, and corrected
+what did not survive checking. **Two entry gates are now live on prod strategies 3 and 4.**
+
+### 1. What is live, and since when
+
+`params_json` on both prod strategies, set 2026-09-15 ~23:30 PT:
+
+```
+  vwap_max_stretch: 1.0        don't buy when price is already 1 wiggle past VWAP
+  entry_before_et: "11:30"     no new entries after 11:30 ET
+```
+
+Read straight from PROD, not inferred. **The entry window is now 10:00-11:30 ET rather than
+10:00-15:45.** Exits are untouched in both cases — a position opened at 11:29 still runs to its
+stop, target, trail or the 15:45 forced exit.
+
+**The `entry_before_et` design is the part worth keeping.** It is a separate function from
+`forced_exit_time_et`, not a branch inside it. `User.trading_window_end` conflates the two, so a
+wall added there would have **flattened open positions at 11:30** instead of merely stopping new
+buys — converting paper drawdown into realised loss, which is exactly what the engine rules forbid.
+Verified: `forced_exit_time_et` is byte-identical with and without the wall, and no exit path reads
+either new param.
+
+### 2. Why 11:30 — the reason of record is the lunch gap
+
+Confirmed by the owner 2026-09-16, and it is a mechanism rather than a fitted number. SPY's volume
+troughs midday (**97,052/min at 09:30 against 33,950 at 12:30**) and theta over a 30-minute hold runs
+**~2% at 10:00 ET against ~28% at 15:30**, so a late entry is stopped out by the clock rather than by
+the signal being wrong. On 2026-09-15 live it cost a real trade: a 12:30 ET entry gave back **$54** of
+the **$192** the two morning entries had made.
+
+The sweep agrees on the SHAPE and cannot settle the minute — 11:00 and 11:30 sit inside each other's
+confidence intervals, and the 11:30 row's runs -7.86% to +11.27%, which includes zero. Revisit when
+G4a's per-clock-minute volume profile lands, since that is what would make midday tradable.
+
+**A correction I owe the record:** I told the owner 11:30 had "no written justification anywhere".
+Wrong — I grepped the three markdown files and not the code. It was fully argued in
+`entry_cutoff_time_et`'s docstring the whole time. **Grep the code before claiming nothing documents
+a decision.**
+
+### 3. Two gates at once, on ~3 trades a day
+
+Both shipped the same night. Attribution between them will take weeks, not sessions, and the 11:30
+wall also cuts the sample rate that every other open question is waiting on (E11, G4a). Recorded
+here because it will not be obvious in three weeks why the data got thin.
+
+### 4. The corrupt reference file — the biggest correction of the night
+
+`data/backtest/underlying/SPY_1min.json`'s **per-bar `vwap` field is unusable**. A bar's VWAP must
+sit inside that bar's own [low, high]; independently verified across all 24 sessions / 9,360 bars,
+**382 bars (4.08%) do not** — 1.28% on 09-02, **11.54% on 09-10**, **10.51% on 09-11**. Worst case:
+09-11 14:21 reports vwap 760.95 for a bar whose low is 765.20, on a day whose entire close range was
+$2.61.
+
+**It had already caused a wrong diagnosis, twice.** The rebuild check in `distance_trades.py`
+compares two minute-bar constructions, and reading the corrupt field made it look as though *our*
+stream rebuild diverged on exactly the two days carrying the stretch result — first blamed on
+mid-session restarts (there are none in the sample), then on the engine's accumulator (never
+involved). Our rebuild was the sound side all along: bar closes match the file to **$0.003** mean
+absolute error, volume to 1.00x, range exactly.
+
+Both consumers now use `price`, the bar midpoint (`price == (high+low)/2` on 9,360 of 9,360 bars).
+**The finding survives all three conventions** — >1 wiggle at +30m gives -1.54 bp on the corrupt
+field, -1.63 on `close`, -1.65 on `price`, p = 0.000 in every case.
+
+### 5. Numbers that changed, and the one I got wrong
+
+- **My `-$425 -> -$54` is retracted.** It was a post-filter: delete blocked trades from a finished
+  list. Re-run with the gate *in the loop*, where a block frees the slot for a later entry, the same
+  8-day sample gives **-$425 -> -$183**; the 9-day sample gives **-$405 -> -$163**; and the
+  production-equivalent figure (see below) is **-$193**. Always name the sample.
+- **`engine_wiggle` != `session_wiggle`, and the conversion was printed backwards.**
+  `scripts/measure_engine_wiggle.py` drives the real `_update_history` at the real cadence: ratio
+  **median 0.962**, sd 0.102. So a live `vwap_max_stretch: 1.0` trips at **0.962** research units —
+  marginally STRICTER than the research intends, which is the safe direction. The script printed
+  0.96 and 1.04 the wrong way round and one sentence of TODO G4b had copied the inversion; both
+  fixed 2026-09-16. Derive it, do not remember it:
+  `engine blocks at |d| >= T * 0.962 * session_wiggle`.
+- **The replay does not calibrate the threshold.** Of the +$242 benefit, **+$245 comes from 09-10 and
+  09-11 alone**; the other seven days net **-$3**. 1.0 is known to be implementable as intended, not
+  known to be optimal.
+- The tape sample is now **24 sessions (08-12..09-15), 6 up and 18 down** — the opposite skew to
+  every earlier test. At +15m the 0.5-1 bucket reads **-0.88 bp, CI -1.49 to -0.28**.
+
+### 6. Fixed tonight
+
+- **`entry_before_et` no longer fails silently.** It was the only gate in the entry chain that fails
+  OPEN: `"11.30"`, `1130` or `"11:60"` disabled the cutoff with no message at any level, leaving an
+  operator believing an afternoon wall was live. It still fails open on purpose — `_parse_hhmm`'s
+  "None == unset" contract is shared with `forced_exit_time_et`, and blocking every entry on a typo
+  would stop the strategy outright — but it now logs `logger.error` once per distinct bad value.
+  Contrast `_coerce_max_stretch`, which fails CLOSED because its contract is not shared. Verified:
+  bad values log and pass through, `''`/absent stay silent, `"11:30"` unchanged, all three new test
+  files still pass.
+- **`measure_engine_wiggle.py`** conversion inverted -> fixed, with the derivation inline.
+- **`replay_session.py`** now prints the warm-up block count separately (and at zero), so a warm-up
+  block can never be misread as the gate declining a chase. It was collected and never surfaced.
+- **`distance_test.py`** staleness: "20 sessions" -> counts the file, "first/last 10 days" -> counts
+  the halves (12/12), and a literal `0.01%%` in a plain print.
+- **`_coerce_max_stretch`'s docstring** said the param has no UI field. It has one now.
+
+### 7. Measured rather than assumed: the `timesale` recorder
+
+A review flagged unsampled `timesale` writes on the websocket coroutine as a tick-drop hazard —
+`quote` is sampled to 1/symbol/2s, `timesale` is not, and `JsonlLogger` is line-buffered under a
+global lock. Sound reasoning, so it got benchmarked at the real volume (167,078 records):
+**4.6 us each, 0.77 s across a whole session, 0.003% duty cycle**, worst-case 2.3 ms for a 500-print
+burst. **Left unsampled deliberately**, and noted in C2 that sampling it *time*-wise would bias the
+ask-side ratio the feed exists to measure; if it ever needs cutting, sample 1-in-N prints.
+
+### 8. Still open
+
+1. **Nothing is committed.** The engine gates, three new test files, the UI fields, five scripts and
+   these doc updates are all uncommitted.
+2. **Watch 2+ live sessions** with both gates on, then re-run `distance_trades.py` (TODO G4b).
+3. **The strategy form has no role gate** — a `viewer`/`auditor` can open it and get a 403 on save.
+   Pre-existing, not from tonight; `canWrite()` exists on the dashboard and overview and is unused in
+   `pages/strategies/`.
+4. **`api/tests/test_market_hours.py` fails on `ModuleNotFoundError: No module named 'utils'`** —
+   pre-existing path bug, unrelated to any of this work.
+5. **G3 warm-up seeding** still unbuilt, and it now matters more: `_VWAP_WARMUP_MINUTES` (30) blocks
+   entries after a restart, and equals `entry_after_open_minutes` exactly.
+
+---
+
+## Session Date: September 16-17, 2026 — First day with both gates, exits under the microscope, and the open-interest floor is a hidden direction filter
+
+The first live session with the don't-chase gate and the 11:30 ET wall, then a long evening on
+three questions: what the gates actually did, whether a smarter exit beats the live one, and why
+the call side keeps sitting empty. **Nothing that decides or places a trade was changed.** Engine
+edits were observation and logging only. Everything is still uncommitted, deliberately, through the
+Thursday session.
+
+### 1. The 2026-09-16 session — one trade, and what the gates did
+
+**Real result: one put, +$9.** Bought SPY260916P00760000 at 10:07 ET for $2.52, sold at 10:37 ET for
+$2.61 on the trailing stop. Entry drift +0.20%, exit drift 0.00%, zero errors all session. The trade
+recorded `vwap_stretch: 0.3` — the new observation field working end to end. Both
+`ENTRY_BLOCKED_TIME_WINDOW` events fired at 11:30 ET.
+
+New tool: `scripts/gate_review.py`. A plain replay can't see a blocked entry (it never writes an
+`ENTRY SIGNAL` line), so this rebuilds the decision minute by minute from the recorded SPY tape and
+re-runs the day four ways. Self-check: it reproduces the real trade (10:06 vs 10:07, +$11 vs +$9).
+
+```
+  both gates on (what ran)        1 trade    +$11
+  without the 11:30 wall          3 trades  −$124
+  without the don't-chase gate    2 trades   +$49
+  neither gate (last week)        6 trades   −$33   (21 unpriceable)
+```
+
+- **The wall saved $136** — it blocked two call entries at 12:43 and 14:06 ET that both stopped out
+  (−$66, −$69). Both were near VWAP (stretch 0.04 / 0.67), so only the wall stopped them.
+- **The chase gate cost $38** — it blocked a 10:59 ET call at 1.94 wiggles that trailed out +$38.
+- **The day's biggest move is the part that can't be priced.** SPY fell from $759.13 at 14:45 ET to
+  $749.80 at 15:26 ET (close $754.31, −0.69% on the day). The rule wanted puts at 14:31–14:59 ET; every
+  one was blocked by the wall and most would also have been "chasing" (stretch 1.96–4.53). No put was
+  armed during the drop, so those 21 candidates have no option prices. **Both gates helped on what can
+  be measured, and both kept us out of the one big directional move.**
+
+### 2. Who was the aggressor — the first `timesale` data
+
+First session with the C2 feeds recording: **100,599 `timesale` and 233 `summary` records.** Each
+print carries the bid and ask at that moment, so a trade at or above the ask is a buyer crossing the
+spread (buyer-initiated), at or below the bid a seller crossing it. Share of SPY volume:
+
+```
+  hour ET    volume     buyers paying ask   sellers hitting bid   in between
+  09:00      2.71M           39.1%                27.8%              33.1%
+  10:00      2.71M           36.2%                27.5%              36.3%
+  11:00      2.76M           39.9%                27.5%              32.6%
+  12:00      1.38M           41.3%                25.2%              33.6%
+  13:00      1.61M           41.7%                23.6%              34.7%
+  14:00      9.68M           32.7%                26.3%              41.0%
+  15:00     16.42M           30.9%                34.5%              34.6%
+  close      1.76M            8.2%                87.8%               3.9%
+  session   39.02M           32.7%                32.6%              34.6%
+```
+
+**Buyers were the aggressor all morning — about 12 points more than sellers — and SPY went nowhere,
+pinned in a $2 range until 14:00 ET. Then it fell $9.** That pattern is **absorption**: a large
+seller resting passively on the offer soaks up every buyer without letting price rise. When the buyers
+run out, there is nothing underneath.
+
+**How it could help us — ideas, none built, one day of data:**
+
+1. **Divergence warning.** Heavy buying *without* a price gain argues *against* buying calls, not for
+   it. This morning that reading would have been right.
+2. **Breakout confirmation.** A range break on mostly ask-side prints (buyers chasing) is real
+   participation; the same volume on bid-side prints is sellers unloading into a pop. This is the
+   upgrade C2 was scoped for: the volume gate knows *how much* traded, not *which way*.
+3. **Put-side confirmation.** The mirror: a break lower led by sellers hitting the bid, as in the
+   15:00 ET hour (34.5% vs 30.9%).
+4. **Ignore the closing auction.** 87.8% sell-side at the bell is the closing cross, not sentiment.
+
+**Caveats that stay attached:** a third of volume printed *between* bid and ask and can't be
+classified; 690 quotes arrived crossed; and it is **one day**. Measure across sessions before any gate
+reads it — same rule as every other candidate (G4).
+
+### 3. Spreads — trading costs are far lower than the cost budget assumed
+
+```
+  SPY itself                      $0.02
+  SPY 0DTE contracts, 10:00-14:00  $0.01   0.21%-0.45% of the price
+  same contracts, 15:00 hour       $0.01   2.20%   (a 1¢ spread on a ~$0.45 contract)
+```
+
+- **`max_bid_ask_spread: 0.20` (20%) is dead weight** — real spreads are 0.2-0.5%; it has rejected zero
+  contracts in every session recorded.
+- **The cost budget's 2.5% round-trip friction is several times too pessimistic**; real is ~0.4%, and
+  the fills agree. Its break-even margins were computed against 2.5%.
+- **Late-day spreads explode in percentage terms**, the same shape as decay — pointing where the 11:30
+  wall already points.
+
+### 4. The trailing stop gives back most of a small win — and dynamic exits
+
+**Why the +$9 winner was small:** the put ran to **$2.91 (+15.5%) at 10:27 ET** — just past the +15%
+arming line — then the trail's 10%-of-peak give-back sold it at $2.61. **It surrendered $0.30 of a
+$0.39 gain (77%).** Exit ≈ 0.9 × peak, so a trade must run +22% just to lock in +10%. The give-back is
+$0.45 of SPY = 6.0 bp against a 13.8 bp typical 10-minute move: **0.43 σ, deep in the noise**, the
+same disease as the 15% stop.
+
+Replay sweep across all sessions: give back 3% **+$118** · 5% −$13 · 7% −$31 · **10% (live) −$395** ·
+15% −$1,205. The only exit setting that ever turned the replay positive — but the best-looking row
+of a grid, so not a result.
+
+**New study doc: `docs/dynamic-exits-math.md`** (owner kept it, renamed from a temp note). §1-§6 are
+the math of static vs dynamic stops, targets and trails with the day's real numbers: a flat 15% stop
+had a **36%** chance of being hit by noise in the calm morning and **85%** in the afternoon selloff; a
+1σ dynamic stop holds **32%** all day but wants **$205** of stop on one contract in the afternoon — so
+dynamic stops only work alongside dynamic sizing. Chart: `data/backtest/dynamic_exits.html`
+(`scripts/chart_dynamic_exits.py`), five panels.
+
+**§7 replays all 28 real round trips** (`scripts/dynamic_exits_review.py`) under nine exit rules with
+the 15% stop held fixed. Like-for-like on the trades every rule could resolve:
+
+```
+                       winning days (12)   all days (19)
+  structure stop            +198               −45
+  live (current)            +175               −76
+  TP + trail                +160               −91
+  keep 70% of gain          +155               −80
+  keep 50% of gain           +50              −193
+  volatility trail           +32              −211
+  TP + break-even            +10              −266
+  dynamic TP alone           −12              −321
+  literal "lowest low"       −77              −123
+```
+
+- **Keep 70%** rescues small winners (+9 → +26, +14 → +32, +33 → +49) but cuts big runners (09-09
+  11:01: +$125 live → +$31). It moves money from runners to small winners and roughly breaks even.
+- **Dynamic TP alone** turned three winners into stop-outs; with the live trail underneath it the
+  losses go away, but it **caps runners** — no edge.
+- **The finding:** small gains and big runs want opposite treatment, and no single profit-side rule
+  does both. That is the case for E8's tiered trail — a hypothesis these same trades generated.
+
+### 5. ⚠️ A look-ahead bug — and the +$45 retracted
+
+For a few hours this session reported **"dynamic TP + trail beats the live rule by +$45."** It does not.
+`dynamic_exits_review.py` measured SPY's volatility with `h <= et`, **including the minute of the
+decision** — whose close is a price from *after* the entry, which the engine can never see. On 09-09
+at 11:01 that put the target at $4.60 (+$172); honestly it is $4.00 (+$112), *below* the live trail's
++$125. That one trade was the whole edge.
+
+**It was caught by shadow mode (§6) on its first run.** Fed all 28 real trades, the live module
+disagreed with the script on 6 of 128 rule/trade pairs — including exactly that trade. With `<` the two
+agree on **128 of 128**. The doc carries a correction notice; the script carries a do-not-revert note.
+
+**Lesson worth keeping: parity-check an offline replay against the code that will actually run.** Two
+independent implementations of the same rule disagreeing is the cheapest look-ahead detector there is.
+
+### 6. Shadow mode — watching alternative exits live, acting on none
+
+**`api/engine/exit_shadow.py`**, TODO **E14**. The owner is interested in eventually offering selectable
+exit modes ("flat / keep / dynamic") and chose to shadow first — each mode is another path through the
+exit logic that can fail to sell, so it is worth building only for rules that earn it, and shadow mode
+is how they earn it. It watches **six** rules on every open position — keep 70%, keep 50%, volatility
+trail, dynamic TP, dynamic TP + trail, structure stop — and records when each *would* have sold:
+a `SHADOW EXIT` INFO line when one first would, a `SHADOW SUMMARY` line on each real close, and a record
+in `logs/livetest-<date>/exit_shadow-*.jsonl`. Rules still holding at the real exit are `open`, never flat.
+
+**Hooks** in `strategy_executor.py`: `note_underlying()` beside `_update_history` on every tick (1-minute
+SPY highs/lows for the structure stop); `observe()` *before* the real exit decision, handed nothing
+about it; `on_exit()` only inside the two confirmed-close branches. State is module-level because
+executors are re-created in-process. `ENABLED = False` turns it off.
+
+**Safety, pinned by `api/tests/test_exit_shadow.py` (83 checks):** no order, preview, DB or network
+call in the module; every entry point swallows its own exceptions; `on_exit` is owned by a
+`success` branch (checked by indentation, after a character-window version of the test gave a false
+failure); nothing reads a return value. Parity with the offline replay: **128/128** for the first five
+rules, **26/26** for the structure stop fed SPY at the engine's once-a-second rate. Suite: 23 passed.
+Engine reloaded cleanly at 23:11 PT, zero errors, zero shadow warnings.
+
+### 7. The structure stop — the owner's idea, and the only rule ahead of live
+
+Owner's question: *use the lowest low since entry as the stop, never looser than 15%?*
+
+- **Taken literally it fails**: a stop *at* the lowest price seen sells on the first new low —
+  within seconds on nearly every trade (−$123 like-for-like, Sept 16's put −$4 instead of +$9).
+- **The workable form is a structure stop**, definitions fixed *before* any result: SPY 1-minute
+  swing points (a bar beyond the 2 on each side, confirmed once those close, formed at or after entry),
+  stop a quarter of the typical 10-minute move beyond it, moves only in the trade's favour, fires on a
+  1-minute **close** beyond it; 15% floor and live trail stay.
+
+**+$31 across all days — the first rule to beat live — by changing only three losing trades:**
+
+```
+  09-04 11:07 put    −$69 (15% stop at 12:05)  ->  −$46 (sold 11:15)   +$23
+  09-10 10:16 put    −$34                       ->  −$27                +$7
+  09-11 11:28 call   −$65                       ->  −$64                +$1
+```
+
+Every winner it could measure came out identical, including Sept 16's put that dipped 8% first.
+Walkthrough (chart panels 4-5): swing high at 11:08, confirmed 11:10, stop $769.89, 11:14 bar closed
+$769.94 → sold 11:15 for $4.11. **Not a switch to flip:** +$23 of the +$31 is one trade, whose trigger
+cleared the stop by **5¢**; three changed trades is tiny. It is in shadow mode instead.
+
+### 8. The open-interest floor is a hidden direction filter
+
+Owner's question: *we see more puts — is that normal?* The market fell (SPY $774.71 on 08-12 to $757.38
+on 09-15, 18 of 24 sessions closed below their open), so partly. But the logs show more:
+
+```
+  selected days; totals cover all 11 expiries in the logs
+  expiry   call signals  put signals  |  calls unarmed  puts unarmed   (open interest last blocker)
+  09-02        537          105       |        4            117
+  09-03        611            0       |        6            769
+  09-08          0          451       |      701             24
+  09-09          0          252       |      771              0
+  09-10          0          410       |      674              0
+  09-14          2            5       |      677              1
+  09-15          0          765       |      674              0
+  total      1,780        3,505       |    3,791          1,552
+```
+
+**The blocked side flips.** On 09-02/03 (after a rally) the *puts* couldn't arm; from 09-08 (after a
+decline) the *calls* sat unarmed all day. The zeros are not "no call setups" — a signal can only fire
+once a contract is armed, and the Sept 16 reconstruction found call setups at 10:59, 12:43 and 14:06 ET.
+
+**Mechanism:** open interest counts contracts still open from previous days, and people open them near
+wherever the price was. The strategy buys *in-the-money* contracts — calls a few strikes below SPY, puts
+a few above. After a fall, the strikes above today's price are where SPY used to trade (in-the-money
+puts have open interest); the strikes below are new territory (in-the-money calls don't). After a rally,
+the mirror. **So for days at a time the floor chooses the direction** — a lagging, accidental trend
+filter that nobody set, while the liquidity risk it exists for isn't showing up (1¢ spreads).
+
+**Checked against today's real chain (Sept 17 expiry, 02:45 ET, SPY $754.05 pre-market):**
+
+```
+  in the delta band (0.60-0.85)       open interest        floor
+  calls, strikes 745-752              33 - 238             3,000   -> none pass
+  puts,  strikes 756-760              1,104 - 1,832        3,000   -> none pass
+```
+
+Open interest lives mostly **out of the money** on both sides (760 call 4,826; 770 call 3,496; 750 put
+5,565; 745 put 4,910; 755 put 3,505; 752 put 3,465) — most traders buy cheap out-of-the-money
+contracts; this strategy buys the opposite. **Refinement of the hypothesis:** the imbalance matches
+direction (in-the-money calls ~10× further from the floor than puts), but the bigger fact is that
+**3,000 is out of reach for in-the-money same-day contracts on both sides.** Estimated for Sept 17:
+puts arm if SPY dips to about $753 (the 755 put enters the band); calls need about $762 (the 760 call).
+So expect puts-only or no trades, caused by the floor, not the gates.
+
+**Not built: the diagnostic line** (log strike, delta, open interest, volume and spread of the
+contracts the floor rejects, throttled to one line every few minutes per side). Zero behaviour change;
+it would turn one snapshot into every scan of every day. **Do not change the floor before that data
+exists** — lowering it in a falling market means trading calls against the recent trend, which the
+floor has been silently sparing us from.
+
+### 9. Sizing, margin, stops at the broker, a second instrument — answers, no changes
+
+- **The 2% rule is about the loss, not the spend:** 2% of $1,464 = $29. One SPY stop-out costs $38-75
+  (2.6-5.1%); with 0DTE the true worst case is the whole premium. **`risk_per_trade_pct: 50` and
+  `max_trade_percentage: 50` are an *allocation*, not a risk figure**: $732 ÷ (premium × 200), capped by
+  `max_contracts: 3` — so the engine buys **more contracts when they are cheaper**. Confirmed in the
+  trade history: 09-14 **3 contracts at $0.30 and $0.23**, 09-15 **2 at $1.35** and **3 at $1.11**. Suggested
+  `max_contracts: 1`; **undecided.** Risk-based sizing (TODO D6) deferred by the owner until the account
+  grows — at this size the formula rounds below one contract.
+- **Margin would not help:** long options are paid in full even on margin (Tradier's own example shows
+  option buying power at half of stock buying power); under $25,000 the day-trade rule allows 3 day
+  trades per 5 business days (the broker is already counting: a preview returned `day_trades: 13`);
+  opening margin needs $2,000. FINRA has been working on changes to the day-trade rule — status unverified.
+- **There is no stop at the broker.** Every exit is the engine watching the bid once a second and sending
+  a market sell. If the process, laptop or connection dies with a position open, nothing sells it.
+  **TODO H4** added: a broker-side "disaster stop" well below the engine's stop, with the hazard that
+  decides the design written first — a resting sell order may reserve the contracts and **block the
+  engine's own exit**.
+- **A second instrument:** daily expiries exist for SPY, QQQ and IWM; TSLA, NVDA and AMD are Mon/Wed/Fri.
+  **IWM** (~$280-300 a contract) is the only one where sizing to the 2% rule is realistic; QQQ is largely
+  the same bet as SPY; single names cost $450-$1,944 a contract. **Coupled to §8** — none of SPY, QQQ or
+  IWM had an in-band contract clearing the floor.
+
+### 10. Smaller changes, and corrections owed
+
+- **"Not chasing" is visible now** — promoted from DEBUG to INFO in `signal_generator.py`, throttled to one
+  line a minute per strategy with a count of blocks in between (unthrottled, a stretched hour is ~3,600
+  lines). Logging only; the block itself is unconditional.
+- **I told the owner to watch the log for "not chasing" before that change — wrong**; it was DEBUG and the
+  engine runs at INFO, so its absence meant nothing.
+- **"138 trades"** was clarified: that is the replay of signals the account couldn't afford, priced on
+  recorded quotes. **Real round trips: 28** over 10 sessions.
+- **The volatility trail on Sept 16 made +$24, not +$25** — a rounded exit level.
+
+### 11. Written or changed this session
+
+- `scripts/gate_review.py` — minute-by-minute gate reconstruction for any session
+- `scripts/dynamic_exits_review.py` — 28 real trades under nine exit rules (look-ahead fixed)
+- `scripts/chart_dynamic_exits.py` → `data/backtest/dynamic_exits.html` — five-panel chart
+- `docs/dynamic-exits-math.md` — the math, §7 real-trade results, corrections
+- `api/engine/exit_shadow.py` and `api/tests/test_exit_shadow.py` — shadow mode, 83 checks
+- `api/engine/strategy_executor.py` — three shadow hooks (observation only)
+- `api/engine/signal_generator.py` — "not chasing" at INFO, throttled
+- `TODO.md` — H4 (broker disaster stop), E7 (open interest measured), E14 (shadow mode)
+
+### 12. Open
+
+1. **Commit** — owner is holding everything uncommitted through the Thursday session.
+2. **Read the first `SHADOW SUMMARY` lines** after any trade — the first evidence not generated by the
+   28-trade sample.
+3. **Open-interest diagnostic line** — explained, not built. Needed before touching the floor.
+4. **`max_contracts: 3`** — buys more when cheap; decision pending.
+5. **Aggressor side across more sessions** before any idea in §2 becomes a gate.
+6. **TODO H4** — broker-side disaster stop, design pass first.
+7. **E8 tiered trail** — the one exit idea that might do both jobs; needs unseen trades.
+8. **A second instrument (IWM)** — blocked on §8's floor decision.

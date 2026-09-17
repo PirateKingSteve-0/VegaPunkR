@@ -3,6 +3,7 @@ Signal Generator - Technical indicators and entry/exit signal detection
 Aligned with Strategy.params_json structure from strategy_templates.py
 """
 import logging
+import time
 from typing import Dict, List, Optional, Tuple
 from datetime import datetime, timedelta, date
 import numpy as np
@@ -14,6 +15,43 @@ from utils.market_hours import HALT_MODE_FLATTEN, MarketHours, trading_halt_stat
 logger = logging.getLogger(__name__)
 
 _market_hours = MarketHours()
+
+# ---------------------------------------------------------------------------
+# THE TIME CONSTANTS AND WHAT EACH ONE BOUNDS
+#
+# Seven settings in this engine are measured in minutes or clock time, and they
+# do NOT all bound the same thing. Confusing which is which is how an entry rule
+# becomes an exit trigger, so:
+#
+#   LOWER bound on ENTRY (earliest we may open)
+#     params_json.entry_after_open_minutes   relative to 09:30 ET
+#     User.trading_window_start              absolute ET, account-wide
+#
+#   UPPER bound on ENTRY (latest we may open) — see entry_cutoff_time_et
+#     params_json.entry_before_et            absolute ET, the midday/theta wall
+#     ...plus the forced-exit time below, because we must never open a position
+#        we are already obliged to close
+#
+#   Bound on the EXIT (when an OPEN position must be closed) — forced_exit_time_et
+#     params_json.exit_before_close_minutes  relative to the close, backwards
+#     User.trading_window_end                absolute ET, account-wide
+#     FORCED_EOD_EXIT_FLOOR_MINUTES          the unconditional floor
+#
+#   NOT A CLOCK BOUND AT ALL
+#     _VWAP_WARMUP_MINUTES                   data sufficiency: how much session
+#       the VWAP accumulator must have behind it before its dispersion means
+#       anything. Measured in minutes, but it gates a NUMBER's trustworthiness,
+#       not a time of day. It is the one most likely to be mistaken for a clock
+#       rule, and it is also coupled to entry_after_open_minutes — see its own
+#       comment for why 30-vs-30 is closer than it looks.
+#
+# The asymmetry that matters: every ENTRY bound composes most-restrictive-wins
+# and may only narrow the window. An entry bound must NEVER be routed through
+# forced_exit_time_et, because everything there flattens open positions.
+# `User.trading_window_end` is the cautionary case — it is an account "window"
+# whose end genuinely does force closes, which is why `entry_before_et` is a
+# separate bound in a separate function rather than another branch beside it.
+# ---------------------------------------------------------------------------
 
 # Hard floor on the forced end-of-day exit, in minutes before the real close.
 # The engine only ever holds 0DTE contracts, so anything still open at the bell
@@ -93,8 +131,23 @@ def resolve_direction(params: Optional[Dict]) -> str:
 
 
 def _parse_hhmm(value: Optional[str]) -> Optional[Tuple[int, int]]:
-    """Parse "HH:MM" into (hour, minute), or return None if invalid/empty."""
-    if not value or ":" not in value:
+    """Parse "HH:MM" into (hour, minute), or return None if invalid/empty.
+
+    The isinstance guard is load-bearing, not defensive noise. `":" not in value`
+    raises TypeError on a non-string, and the try/except below starts one line too
+    late to catch it — so this function used to violate its own "return None if
+    invalid" contract for any non-string input. That was unreachable while the
+    only callers were `User.trading_window_start`/`_end`, which are String
+    columns, but `entry_before_et` arrives from `params_json`, which is JSON and
+    can hold `1130` as an int. A raise there propagates out of
+    check_entry_signal into the executor's error counter, and 20 of those stop
+    the strategy outright — a typo'd config value would have taken the strategy
+    down rather than being ignored.
+
+    None means "no bound", which for every caller is the same as the field being
+    unset. It cannot widen anything.
+    """
+    if not isinstance(value, str) or not value or ":" not in value:
         return None
     try:
         h_str, m_str = value.split(":", 1)
@@ -196,6 +249,192 @@ def forced_exit_due(params: Dict, user: Optional[User]) -> Optional[str]:
     return None
 
 
+_bad_entry_before_logged = set()
+
+
+def entry_cutoff_time_et(
+    params: Dict,
+    user: Optional[User],
+    current_et: datetime,
+) -> Tuple[Optional[datetime], Optional[str]]:
+    """The wall-clock ET time after which no NEW entry may be opened, and why.
+
+    Effective time is the earliest of:
+      - the forced-exit time (forced_exit_time_et) — never open a position we
+        are already obliged to close; the next tick would sell it.
+      - strategy: params['entry_before_et'], an absolute "HH:MM" ET wall.
+
+    ENTRY-ONLY, and that is the whole reason this function exists separately
+    from forced_exit_time_et rather than as another branch inside it. An entry
+    cutoff and a forced exit are different things: the cutoff must stop us
+    BUYING at 11:30 while leaving a position opened at 10:09 free to run to its
+    target at 11:04-or-whenever, governed only by stop loss, take profit, the
+    trail and the EOD clock. `User.trading_window_end` conflates the two — it
+    feeds forced_exit_time_et, so setting it to 11:30 would FLATTEN open
+    positions at 11:30, not merely stop new ones. Putting `entry_before_et`
+    anywhere near the exit path would repeat that mistake. Nothing here may pull
+    an exit earlier or later; exits are sacred.
+
+    Most-restrictive-bound wins: either input can pull the cutoff earlier,
+    neither can push it later, and this can only ever NARROW what
+    entry_after_open_minutes / user.trading_window_start already allow.
+
+    WHY A CLOCK WALL AT ALL. Measured over 6 recorded session log pairs / 9
+    trading days / 146 replayed round trips (scripts/replay_session.py --all
+    --sweep window): entries taken from 11:30 ET onward lost money on 7 of those
+    9 days, -$716 across 117 trades, while the 29 entries before 11:30 made
+    +$311. Two mechanisms drive it and both are independent of any indicator:
+    SPY volume troughs over lunch (median 97,052/min at 09:30 against 33,950 at
+    12:30), and theta over a 30-minute hold runs ~2% at 10:00 ET against ~28% at
+    15:30 — so a late entry is stopped out by the clock rather than by the
+    signal being wrong. On 2026-09-15 live this cost a real trade: a 12:30 ET
+    entry gave back $54 of the $192 the two morning entries had made.
+
+    The NUMBER is chosen on those mechanisms, NOT tuned on the sweep. 11:00 and
+    11:30 are inside each other's confidence intervals (the 11:30 row's is
+    -7.86% to +11.27%, which includes zero); what the data establishes is the
+    SHAPE — later is worse — not the minute. Do not retune it against the
+    sessions on disk; that is the discipline TODO.md G4b sets for
+    `vwap_max_stretch` and it applies here too.
+
+    Absolute ET rather than minutes-before-close on purpose: on a half day
+    (13:00 ET close) a "270 minutes before close" wall would land at 08:30 and
+    block the entire session, while 11:30 still sits correctly inside a
+    09:30-13:00 session. Half days need no special case — get_market_close_time_et
+    reads Tradier's clock, so the forced-exit bound compresses on its own and
+    the earliest-wins rule below handles the rest.
+    """
+    cutoff_et, reason = forced_exit_time_et(params, user, current_et)
+
+    raw_before = (params or {}).get('entry_before_et')
+    entry_before = _parse_hhmm(raw_before)
+    if raw_before not in (None, '') and entry_before is None:
+        # Present but unreadable -- "11.30", 1130, "11:60". The wall then does
+        # not exist, and the operator has no way to know: this is the only gate
+        # in the entry chain that fails OPEN. It stays that way on purpose
+        # (_parse_hhmm's "None == unset" contract is shared with
+        # forced_exit_time_et, and blocking every entry on a typo would stop the
+        # strategy outright), but it must not also be SILENT -- the failure mode
+        # is believing an afternoon cutoff is live while entries run all day.
+        # Contrast _coerce_max_stretch, which fails closed because its contract
+        # is not shared. Logged once per distinct bad value, so a
+        # corrected-then-re-broken config speaks again.
+        key = repr(raw_before)
+        if key not in _bad_entry_before_logged:
+            _bad_entry_before_logged.add(key)
+            logger.error(
+                f"entry_before_et={raw_before!r} is not \"HH:MM\" ET — NO entry "
+                f"cutoff is in effect; entries run until the forced-exit time "
+                f"until this is corrected"
+            )
+    if entry_before is not None:
+        wall_et = current_et.replace(
+            hour=entry_before[0], minute=entry_before[1], second=0, microsecond=0
+        )
+        if cutoff_et is None or wall_et < cutoff_et:
+            cutoff_et = wall_et
+            reason = (
+                f"No new entries after {wall_et.strftime('%H:%M')} ET "
+                f"(midday volume trough and theta decay); open positions "
+                f"continue to run"
+            )
+
+    return cutoff_et, reason
+
+
+def entry_cutoff_reached(params: Dict, user: Optional[User]) -> Optional[str]:
+    """Reason string if NEW entries are closed for the day right now, else None.
+
+    Sibling of forced_exit_due, and the same rationale: the executor needs this
+    answer to log ENTRY_BLOCKED_TIME_WINDOW without re-deriving the bound, so
+    the rule is written down exactly once. check_entry_signal enforces the gate
+    independently — this is for observability, never the only thing standing
+    between a late signal and an order.
+    """
+    current_et = _market_hours.get_current_et_time()
+    cutoff_et, reason = entry_cutoff_time_et(params, user, current_et)
+    if cutoff_et is not None and current_et >= cutoff_et:
+        return reason or "No new entries: entry window closed"
+    return None
+
+
+# Keys written into `indicators` purely so the value is RECORDED, which are
+# not themselves entry conditions.
+#
+# `indicators` has three consumers beyond storage. Two would misread a bare
+# observation:
+#   1. the `confirmation_required` gate counts len(indicators) < 2 as "not
+#      enough agreement" -- so logging an always-present value would let a
+#      strategy clear the gate on ONE real indicator instead of two. That is a
+#      gate WIDENING, which the engine rules forbid, and
+#      `confirmation_required: true` is live on both prod strategies today.
+#   2. the signal `reason` string joins these keys, so an observation would be
+#      reported to the trade record as a condition that was met.
+#
+# The third, _calculate_signal_confidence, matches exact keys ('ema', 'vwap',
+# 'volume_ratio', 'delta', 'tick', 'bid_ask_spread') and so ignores anything
+# listed here -- but it is the next thing to check when a key is added.
+#
+# Anything added here must be a value we only observe. A key that actually
+# gates an entry does NOT belong in this set.
+_OBSERVED_NOT_GATED = frozenset({'vwap_stretch'})
+
+
+# Minutes of session the VWAP tally must cover before the stretch gate will
+# act on it. Only consulted when `vwap_max_stretch` is set, so it is inert on a
+# strategy that has not opted in. See the warm-up note in check_entry_signal.
+#
+# COUPLED TO `entry_after_open_minutes`, WHICH IS ALSO 30 ON BOTH PROD
+# STRATEGIES. The coupling is accidental and the margin is milliseconds: the
+# accumulator's first in-hours print lands 22-328 ms AFTER 09:30:00 on all nine
+# recorded sessions, so at 10:00:00.000 -- the first instant the entry window is
+# open -- the age is 29.99 minutes and this gate blocks. It passes a second
+# later, so the cost today is one evaluation a day.
+#
+# The trap is the direction of travel: lower `entry_after_open_minutes` below 30
+# (or raise this above it) and the guard starts silently eating the beginning of
+# the entry window, which would look like a strategy that mysteriously stopped
+# taking early trades. If you change either number, check it against the other.
+_VWAP_WARMUP_MINUTES = 30
+
+
+_bad_max_stretch_logged = set()
+
+
+def _coerce_max_stretch(raw, symbol):
+    """Validate `vwap_max_stretch`, or block by returning a value that blocks.
+
+    The strategy form carries a field for it ("Don't Chase Past", number input,
+    submitted as a float or null), but params_json is also reachable by script,
+    by the API directly and by hand -- where a JSON string ("1.0") or a stray 0
+    is easy to produce. Left raw, a string raised TypeError out of the middle of
+    check_entry_signal on EVERY tick; the executor catches it, and twenty
+    consecutive errors auto-deactivate the strategy. The failure was real but
+    unreadable.
+
+    Most-restrictive-bound wins, so a value we cannot make sense of BLOCKS
+    rather than being ignored -- ignoring it would silently widen the entry
+    path back to un-gated. The error is logged once per symbol so the cause is
+    visible instead of arriving as a deactivation twenty ticks later.
+    """
+    if raw is None:
+        return None
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        value = None
+    # bool is an int subclass: `true` would otherwise silently mean 1.0.
+    if isinstance(raw, bool) or value is None or value <= 0 or value != value:
+        if symbol not in _bad_max_stretch_logged:
+            _bad_max_stretch_logged.add(symbol)
+            logger.error(
+                f"{symbol}: vwap_max_stretch={raw!r} is not a positive number — "
+                f"blocking entries until it is corrected"
+            )
+        return float('-inf')  # every stretch is >= this, so every entry blocks
+    return value
+
+
 class Signal:
     """Represents a trading signal"""
     def __init__(
@@ -236,7 +475,11 @@ class SignalGenerator:
         self.volume_history: Dict[str, deque] = {}
 
         # Intraday VWAP accumulators — reset each trading day
-        # { symbol: { 'date': date, 'sum_pv': float, 'sum_v': int } }
+        # { symbol: { 'date', 'sum_pv', 'sum_v', 'sum_p2v',
+        #             'first_ts', 'last_ts' } }
+        # sum_p2v (price**2 * volume) exists only to derive the volume-weighted
+        # standard deviation of price around VWAP -- the "wiggle". See
+        # _calculate_vwap_wiggle and TODO.md G4b.
         self._vwap_accumulators: Dict[str, dict] = {}
 
         # The in-progress 1-minute bar, flushed into the deques above when the
@@ -251,6 +494,11 @@ class SignalGenerator:
 
         # Configuration — these are BARS, and one bar is one minute.
         self.max_history_length = 100  # 100 one-minute bars
+
+        # Rate limit for the don't-chase INFO line: { (strategy_id, symbol):
+        # [monotonic time of last line, blocks suppressed since] }. See the
+        # stretch gate in check_entry_signal for why it is throttled.
+        self._not_chasing_log: Dict[tuple, list] = {}
 
     def check_entry_signal(
         self,
@@ -341,11 +589,17 @@ class SignalGenerator:
             )
             return None
 
-        entry_cutoff_et, cutoff_reason = forced_exit_time_et(params, user, current_et)
+        # entry_cutoff_time_et, not forced_exit_time_et: it returns the SAME
+        # forced-exit bound plus the optional `entry_before_et` wall, earliest
+        # wins. Going through one function keeps the two consumers of this answer
+        # — here, and the executor's ENTRY_BLOCKED_TIME_WINDOW event — from
+        # drifting apart. Exits still read forced_exit_time_et directly and are
+        # unaffected by the wall.
+        entry_cutoff_et, cutoff_reason = entry_cutoff_time_et(params, user, current_et)
         if entry_cutoff_et is not None and current_et >= entry_cutoff_et:
             logger.debug(
                 f"{symbol}: No new entries — current ET {current_et.strftime('%H:%M')} "
-                f">= forced-exit time {entry_cutoff_et.strftime('%H:%M')} ({cutoff_reason})"
+                f">= entry cutoff {entry_cutoff_et.strftime('%H:%M')} ({cutoff_reason})"
             )
             return None
 
@@ -388,22 +642,44 @@ class SignalGenerator:
 
         # 2. Check VWAP condition
         use_vwap = params.get('use_vwap', False)
-        if use_vwap:
+
+        # `vwap_max_stretch` is a SEPARATE opt-in from `use_vwap`: the side
+        # check and the distance check are different questions about the same
+        # line, and a strategy may want either, both, or neither.
+        #
+        # It is read OUTSIDE `if use_vwap` on purpose. Nesting it made a
+        # configured don't-chase gate SILENTLY INERT whenever use_vwap was
+        # false -- price five wiggles out still fired, with nothing logged at
+        # any level. That is the one direction this file must never fail in: a
+        # gate the operator configured has to either work or block, never
+        # quietly do nothing.
+        max_stretch = _coerce_max_stretch(params.get('vwap_max_stretch'), symbol)
+
+        if use_vwap or max_stretch is not None:
             vwap_value = self._calculate_vwap(symbol)
             # Default '' on purpose: with no entry_signal named, VWAP does
             # not gate the entry even when use_vwap is on. Unchanged.
             entry_signal = params.get('entry_signal', '')
-            vwap_gates = _names_a_bound(entry_signal, 'vwap')
+            # The side check belongs to use_vwap. A strategy that opted into
+            # the distance check alone does NOT acquire a side check it never
+            # asked for.
+            vwap_gates = _names_a_bound(entry_signal, 'vwap') if use_vwap else False
 
             # Same most-restrictive rule as the EMA above: if VWAP is supposed
             # to gate and has no value yet (no volume accumulated this session),
             # block rather than trade ungated.
             if vwap_value is None:
-                if vwap_gates:
+                if vwap_gates or max_stretch is not None:
                     logger.debug(f"{symbol}: VWAP not available yet — entry blocked")
                     return None
             else:
-                indicators['vwap'] = vwap_value
+                # Recorded only when use_vwap asked for it. Writing it whenever
+                # the STRETCH gate is on would add a key to `indicators` that
+                # the confirmation count treats as a second agreeing indicator
+                # -- i.e. enabling a blocking gate would make confirmation
+                # EASIER to clear. Tightening a gate must never loosen another.
+                if use_vwap:
+                    indicators['vwap'] = vwap_value
 
                 if vwap_gates:
                     if wants_upside and current_price <= vwap_value:
@@ -411,6 +687,201 @@ class SignalGenerator:
                         return None
                     if not wants_upside and current_price >= vwap_value:
                         logger.debug(f"{symbol}: Price ${current_price:.2f} not below VWAP ${vwap_value:.2f}")
+                        return None
+
+                # DON'T CHASE (TODO.md G4b).
+                #
+                # The side check above is a trend-following bet -- calls when
+                # price is above the line, puts when below -- and at moderate
+                # stretch the tape does the OPPOSITE. Over 20 sessions of SPY
+                # 1-minute bars, price sitting 1+ wiggles out drifts ~3.0 bp
+                # back TOWARD VWAP over the next 30 minutes (shuffle test
+                # p = 0.001, same sign in both 10-day halves). Our own trades
+                # agree: the 27 replayed entries made 1-2 wiggles past VWAP won
+                # 22% and lost $534 -- more than the whole strategy's $425.
+                #
+                # So "above VWAP" is not strength on its own. The side check is
+                # fine near the line; it goes wrong exactly when price has
+                # already run, which is when this gate declines to chase it.
+                #
+                # Measured in WIGGLES, never dollars -- see _calculate_vwap_wiggle.
+                #
+                # ENTRIES ONLY. No exit path reads this, so a position already
+                # open stays closeable by stop loss, take profit, trailing and
+                # the forced-exit clock exactly as before.
+                #
+                # ON THE REPLAY NUMBER, AND WHY IT IS NOT EVIDENCE FOR 1.0:
+                #
+                # TODO.md G4b reports "-$425 -> -$54" for a 1.0 block. That
+                # figure is reproducible only by POST-FILTERING the baseline
+                # trade list -- deleting the entries made >= 1.0 wiggles out and
+                # keeping the rest. Re-running the replay with the gate live
+                # INSIDE the strategy gives -$405 -> -$163 (n=146 -> 116),
+                # in SESSION_WIGGLE units,
+                # because blocking a chase leaves the strategy flat and a later
+                # signal takes the freed slot. ~3 net extra trades cost ~$71.
+                # That is the replacement effect TODO.md already predicted, and
+                # it roughly halves the apparent gain.
+                #
+                # Worse, the remaining benefit is not spread across the sample:
+                # +245 of the +242 total lands on 2026-09-10 and 2026-09-11
+                # alone; the other seven sessions net -$3 combined. Those two
+                # are exactly the sessions where the engine RESTARTED mid-day,
+                # and where this accumulator's wiggle diverges hardest from a
+                # full-session one (measured: 0.69 vs 1.24, and 0.58 vs 2.44).
+                # So the replay's apparent confirmation rests on a wiggle the
+                # live engine would not have computed on the only two days that
+                # carry the result. Whether the real engine would have done
+                # better or worse there is UNKNOWN -- it would have blocked more
+                # and taken a different trade set entirely.
+                #
+                # The independent evidence is the drift test, which does not
+                # depend on the replay: across 24 sessions, price 0.5-2 wiggles
+                # out drifts back toward VWAP over 30m, both halves agree in
+                # sign, shuffle p = 0.000, and the sample is 6 up / 18 down.
+                # That supports the IDEA. It does not calibrate the THRESHOLD.
+                #
+                # AND THE REPLAY FIGURE NEEDS CONVERTING BEFORE IT IS QUOTED.
+                # Because engine_wiggle runs ~0.962 of session_wiggle, this gate
+                # firing at 1.0 blocks at |price - vwap| >= 0.962 session_wiggle.
+                # The replay measures in session_wiggle, so modelling production
+                # means running it at 0.962, not at 1.0:
+                #
+                #     --max-stretch 1.000   116 trades   -$163   "does it work"
+                #     --max-stretch 0.962   115 trades   -$193   "what prod does"
+                #
+                # One trade and $30, in the unflattering direction -- the extra
+                # block took a winner. Small, but quote the right one: -$163
+                # answers whether the idea holds, -$193 answers what this code
+                # would have done. Being stricter than intended is the safe way
+                # to be miscalibrated; it is not the same as being better.
+                #
+                # 1.0 was fixed BEFORE any result was seen. Do not tune it
+                # against the sessions on disk, and do not cite -$54.
+                # RECORD THE STRETCH ON EVERY ENTRY, GATE ON OR OFF.
+                #
+                # BRAINSTORM.md asks for exactly this: "log the stretch even
+                # while the gate is off -- it costs nothing and makes every
+                # future session measurable without rebuilding VWAP from the
+                # tape". It was originally written inside the blocking branch,
+                # which meant the only way to collect evidence about the
+                # threshold was to already be enforcing one -- the measurement
+                # was gated behind the decision it was supposed to inform.
+                #
+                # Safe to record unconditionally only because `vwap_stretch` is
+                # in _OBSERVED_NOT_GATED: it cannot inflate the
+                # `confirmation_required` count or appear in the reason string.
+                # Anything else added here needs the same treatment.
+                #
+                # Note for whoever analyses these: this is engine_wiggle, the
+                # tick-accumulated one, which is NOT the session_wiggle every
+                # offline study uses. Measured 2026-09-15 over 72 snapshots on 9
+                # sessions (scripts/measure_engine_wiggle.py, which drives the
+                # real objects rather than a replica):
+                #
+                #     engine/session   median 0.962   mean 0.945
+                #                      sd 0.102   range 0.710-1.302
+                #
+                # So they are the same scale to within ~4%, and the residual is
+                # a day-to-day WOBBLE rather than a bias -- which is why these
+                # recorded values should not be read to two decimals.
+                wiggle = self._calculate_vwap_wiggle(symbol)
+                stretch = None
+                if wiggle is not None:
+                    stretch = abs(current_price - vwap_value) / wiggle
+                    indicators['vwap_stretch'] = round(stretch, 3)
+
+                if max_stretch is not None:
+                    # WARM-UP. A wiggle is only meaningful once it has seen
+                    # enough of the session to be a fair measure of the day.
+                    #
+                    # The accumulator is in memory, so a restart at 13:00 ET
+                    # leaves it measuring 13:00-onward while reporting itself as
+                    # "today". A tally built from a stub of the session
+                    # UNDERSTATES dispersion, which OVERSTATES the stretch, and
+                    # the gate then refuses ordinary entries because it believes
+                    # the day has been calm. Measured on the recorded tape: on
+                    # 2026-09-10 this accumulator's wiggle was 0.69 against a
+                    # full-session 1.24, and on 2026-09-11 at 15:00 ET it was
+                    # 0.58 against 2.44 -- four times too small.
+                    #
+                    # CORRECTION, and a caution about what this guard is for.
+                    # The 0.69/1.24 and 0.58/2.44 figures above compare a
+                    # session_wiggle rebuilt from OUR STREAM LOG against one
+                    # rebuilt from Tradier's minute bars. BOTH are minute-bar
+                    # constructions; neither is this tick accumulator. They do
+                    # not measure engine_wiggle, and they are not evidence about
+                    # restarts. Enumerated afterwards, those nine sessions
+                    # contain NO mid-session restarts at all -- the small stream
+                    # files that look like them hold two prints each at 00:17 to
+                    # 00:36 ET, hours before the open, and the real stream runs
+                    # unbroken. Modelled against the replay, this guard blocks
+                    # ZERO signals at 30 minutes on all nine.
+                    #
+                    # So the divergence those numbers show is real but UNDIAGNOSED,
+                    # and this guard is not its fix. What the guard does defend is
+                    # the mechanism above -- an in-memory tally genuinely does
+                    # restart with the process -- which simply did not occur in the
+                    # recorded sample. It is cheap insurance against a real hazard,
+                    # not a repair of a measured one. Do not cite it as the latter.
+                    #
+                    # So: too young, no entry. Same most-restrictive rule as the
+                    # EMA warm-up -- we do not trade on an indicator we cannot
+                    # yet compute honestly, and a number built from five minutes
+                    # of tape is not a measure of the day.
+                    #
+                    # 30 minutes matches the `entry_after_open_minutes: 30` both
+                    # prod strategies already run, so on a clean session this is
+                    # never the binding constraint -- it bites only after a
+                    # restart. Elapsed time rather than accumulated volume on
+                    # purpose: volume is what differs most between a quiet day
+                    # and a busy one, so a volume threshold would make the
+                    # gate's strictness track market activity, which is the very
+                    # coupling this guard exists to remove.
+                    #
+                    # ENTRIES ONLY. An open position is unaffected: every exit
+                    # path is reached before this function is ever called.
+                    age = self._vwap_accumulator_age_minutes(symbol)
+                    if age is None or age < _VWAP_WARMUP_MINUTES:
+                        logger.debug(
+                            f"{symbol}: VWAP tally covers only "
+                            f"{'no' if age is None else format(age, '.1f')} minutes of "
+                            f"session (need {_VWAP_WARMUP_MINUTES}) — entry blocked"
+                        )
+                        return None
+
+                    if wiggle is None:
+                        logger.debug(
+                            f"{symbol}: VWAP dispersion not available yet — entry blocked"
+                        )
+                        return None
+                    if stretch >= max_stretch:
+                        # INFO, not DEBUG, so the gate's work is visible in the
+                        # logs prod actually keeps (the engine runs at INFO; at
+                        # DEBUG this line was never written, so a session showed
+                        # no trace of how often the gate declined an entry).
+                        #
+                        # THROTTLED to one line a minute per strategy+symbol,
+                        # because this branch runs on every 1s evaluation for as
+                        # long as price stays stretched -- unthrottled, one
+                        # stretched hour is ~3,600 lines per strategy. The count
+                        # of blocks folded into each line keeps the volume
+                        # measurable. Logging only; the return below is
+                        # unconditional, so the throttle cannot change a decision.
+                        key = (getattr(strategy, 'id', None), symbol)
+                        slot = self._not_chasing_log.setdefault(key, [None, 0])
+                        now = time.monotonic()
+                        if slot[0] is None or now - slot[0] >= 60.0:
+                            extra = (f"; {slot[1]} more blocks in the last minute"
+                                     if slot[1] else "")
+                            logger.info(
+                                f"{symbol}: Not chasing — ${current_price:.2f} is "
+                                f"{stretch:.2f} wiggles from VWAP ${vwap_value:.2f} "
+                                f"(wiggle ${wiggle:.2f}, max {max_stretch}){extra}"
+                            )
+                            slot[0], slot[1] = now, 0
+                        else:
+                            slot[1] += 1
                         return None
 
         # 3. Check volume spike condition
@@ -509,9 +980,12 @@ class SignalGenerator:
         # 7. Confirmation required check
         confirmation_required = params.get('confirmation_required', False)
         if confirmation_required:
-            # Require at least 2 indicators to align
-            if len(indicators) < 2:
-                logger.debug(f"{symbol}: Confirmation required but only {len(indicators)} indicators available")
+            # Require at least 2 indicators to align. Counts GATING indicators
+            # only: see _OBSERVED_NOT_GATED. Recording a new observation must
+            # never make this gate easier to clear.
+            gating = set(indicators) - _OBSERVED_NOT_GATED
+            if len(gating) < 2:
+                logger.debug(f"{symbol}: Confirmation required but only {len(gating)} indicators available")
                 return None
 
         # All conditions passed - generate entry signal
@@ -532,6 +1006,15 @@ class SignalGenerator:
         action = 'buy'
         indicators['direction'] = direction
 
+        # Built outside the f-string below: a multi-line expression INSIDE an
+        # f-string is PEP 701, which needs Python >= 3.12. On an older box that
+        # is a SyntaxError at import, so the engine would not start at all
+        # rather than degrade -- not worth risking for a line break.
+        _conditions_met = ', '.join(
+            k for k in indicators
+            if k != 'direction' and k not in _OBSERVED_NOT_GATED
+        )
+
         signal = Signal(
             signal_type='entry',
             action=action,
@@ -539,7 +1022,7 @@ class SignalGenerator:
             confidence=confidence,
             reason=(
                 f"Entry conditions met ({direction}): "
-                f"{', '.join(k for k in indicators if k != 'direction')}"
+                f"{_conditions_met}"
             ),
             price=current_price,
             indicators=indicators
@@ -811,11 +1294,22 @@ class SignalGenerator:
         today = date.today()
         acc = self._vwap_accumulators.get(symbol)
         if acc is None or acc["date"] != today:
-            self._vwap_accumulators[symbol] = {"date": today, "sum_pv": 0.0, "sum_v": 0}
+            self._vwap_accumulators[symbol] = {
+                "date": today, "sum_pv": 0.0, "sum_v": 0, "sum_p2v": 0.0,
+                # How much of the session this tally actually covers. Taken
+                # from the tick clock, not wall time, so a replay or a test
+                # measures the same age the live engine would.
+                "first_ts": None, "last_ts": None,
+            }
             acc = self._vwap_accumulators[symbol]
         if volume > 0:
             acc["sum_pv"] += price * volume
             acc["sum_v"] += volume
+            acc["sum_p2v"] += price * price * volume
+            stamp = ts or datetime.utcnow()
+            if acc["first_ts"] is None:
+                acc["first_ts"] = stamp
+            acc["last_ts"] = stamp
 
     def _last_bar_volume(self, symbol: str) -> Optional[int]:
         """Volume of the most recently COMPLETED minute, or None.
@@ -853,6 +1347,59 @@ class SignalGenerator:
         if acc is None or acc["sum_v"] == 0:
             return None
         return acc["sum_pv"] / acc["sum_v"]
+
+    def _calculate_vwap_wiggle(self, symbol: str) -> Optional[float]:
+        """Volume-weighted standard deviation of price around today's VWAP.
+
+        The usual VWAP-band half-width: how far price has typically sat from
+        VWAP so far today. It grows with the square root of time since the open
+        (median $0.41 at 10:00 ET, $0.62 at 10:30, $0.93 at 12:00, $1.05 at
+        15:00), which is the entire point -- a fixed-DOLLAR distance from VWAP
+        is strict in the morning and meaningless in the afternoon. Expressing
+        the distance in these units makes one threshold mean the same thing all
+        day. See TODO.md G4b.
+
+        Returns None when it cannot be computed, and the caller treats that as a
+        block (most-restrictive-bound, same rule as the EMA and VWAP above).
+
+        NOTE: like VWAP itself this accumulates in memory from the first tick
+        the worker sees, so after a mid-session restart it covers only the time
+        since the restart. A short window understates the wiggle, which
+        OVER-states the stretch and over-blocks -- conservative, but wrong. It
+        is the same gap as VWAP's and belongs with G3 warm-up seeding.
+        """
+        acc = self._vwap_accumulators.get(symbol)
+        if acc is None or acc["sum_v"] == 0:
+            return None
+        # .get: an accumulator built before this field existed (hot reload
+        # mid-session) has no sum_p2v. Block rather than report a wrong wiggle.
+        sum_p2v = acc.get("sum_p2v")
+        if sum_p2v is None:
+            return None
+        vwap = acc["sum_pv"] / acc["sum_v"]
+        # E[p^2] - E[p]^2. Checked for float cancellation at SPY-sized prices
+        # (760^2 = 577,600 against a variance near 0.9): relative error 4e-9
+        # over a full 23,400-tick session, so the shortcut is safe here.
+        variance = sum_p2v / acc["sum_v"] - vwap * vwap
+        if variance <= 0:
+            return None  # a single price so far, or float noise at the open
+        return variance ** 0.5
+
+    def _vwap_accumulator_age_minutes(self, symbol: str) -> Optional[float]:
+        """How many minutes of the session this VWAP tally actually covers.
+
+        NOT "minutes since the open" -- minutes since the FIRST TICK THIS
+        PROCESS SAW. The accumulator lives in memory, so after a mid-session
+        restart it covers only the time since the restart, and that is exactly
+        what this has to report. Returns None when nothing has accumulated.
+        """
+        acc = self._vwap_accumulators.get(symbol)
+        if acc is None:
+            return None
+        first, last = acc.get("first_ts"), acc.get("last_ts")
+        if first is None or last is None:
+            return None
+        return (last - first).total_seconds() / 60.0
 
     def _calculate_avg_volume(self, symbol: str, period: int = 20) -> Optional[float]:
         """Average volume over the last `period` COMPLETED bars (minutes).
