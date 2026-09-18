@@ -1662,9 +1662,20 @@ Two things the spec did not anticipate, both load-bearing:
       value. Contrast `_coerce_max_stretch`, which fails CLOSED because its contract is not shared.
       The asymmetry is deliberate; both are now loud.
 
+**IWM — the gate runs on SPY's evidence, unconfirmed (2026-09-18).** IWM strategies 5/6 (created
+2026-09-18, settings identical to SPY 3/4) carry `vwap_max_stretch: 1.0`. `distance_test.py --symbol
+IWM` on 14 sessions (08-28..09-17): **no clear snap-back** — 0.5-1 wiggles −0.14 bp, 1-2 wiggles **+1.01 bp**
+(kept going 56.6%), shuffle p = 0.12 at +30m. SPY on the **same 14 days** still snaps back (−1.92 / −2.49 bp,
+p = 0.032), so it is the symbol, not the dates. IWM is unproven either way. Owner decision: keep the gate
+on, re-test with more data.
+- [ ] **Re-test around 2026-09-25** (~20 IWM sessions): `./venv/bin/python scripts/fetch_1min_bars.py
+      --symbol IWM --write`, then `./venv/bin/python scripts/distance_test.py --symbol IWM`. If IWM still
+      shows no pullback, decide whether IWM should keep `vwap_max_stretch`.
+
 **Keep the sample growing.** `scripts/fetch_1min_bars.py` tops up
-`data/backtest/underlying/SPY_1min.json` (24 sessions, 2026-08-12..09-15 as of 2026-09-16) and `data/`
-is untracked. Tradier keeps 1-min history for only ~20 days, so run it weekly or those days are gone
+`data/backtest/underlying/SPY_1min.json` (26 sessions, 2026-08-12..09-17 as of 2026-09-18) and
+`IWM_1min.json` (14 sessions, 08-28..09-17; `--symbol IWM`). `data/` is untracked, and SPY's first 12
+days (08-12..08-27) are **no longer fetchable** — this file is the only copy. Tradier keeps 1-min history for only ~20 days, so run it weekly or those days are gone
 — same perishability argument as C1 Phase 0.
 
 Verified while scoping: the VWAP accumulator only receives ticks while the market is open
@@ -1702,6 +1713,140 @@ E11's thresholds govern as they govern everything else, and the tape tests share
 sample — they are not independent confirmations of each other.
 
 ---
+
+### G5. A stale delta let the engine buy an out-of-band contract *(found 2026-09-17 — guard BUILT, running in SHADOW since 2026-09-18)*
+
+> **STATUS 2026-09-18 — long-shot guard built, in shadow.** Owner decisions (step-through, 2026-09-18):
+> guard **only the floor** (long shots), compute delta **from live prices**, check **at the moment of
+> buying**, roll out **shadow first, then switch on**.
+>
+> - `api/engine/live_greeks.py` — pure math: OCC parse, Black-Scholes, implied delta by bisection from
+>   the live mid, and `is_long_shot()` (below `delta_min`; deep in the money never; no computable delta →
+>   moneyness; nothing known → long shot).
+> - `signal_generator.check_entry_signal` step **4b**, after the broker-delta check (it only ever adds a
+>   rejection). Setting `params_json.live_delta_guard`: **`shadow`** (default — logs
+>   `WOULD BLOCK long shot (shadow)`, throttled, blocks nothing) · **`enforce`** · **`off`**; anything else
+>   behaves as shadow and logs an error once. Applies only where `delta_min` > 0. Records
+>   `indicators.delta_live` / `delta_live_source` on every trade — both in `_OBSERVED_NOT_GATED`, so
+>   `confirmation_required` is not loosened (negative control in the test).
+> - `api/tests/test_live_delta_guard.py` — 47 checks, incl. the three 09-17 cases recomputed from recorded
+>   prices, and that no exit path reads it. Suite: 24 passed.
+> - **Parity:** the calculator reproduces the 31-trade audit **31/31** and flags exactly the 5 long shots
+>   (09-14 ×2, 09-15 12:30, 09-16, 09-17), none of the 11 deep ones.
+>
+> - **Quote-age rule (2026-09-18):** an option quote older than 30 s (`live_greeks.MAX_QUOTE_AGE_S`,
+>   mirrors the executor's `MAX_QUOTE_AGE_SECONDS`) is not used to solve delta; recorded as `stale_quote`
+>   and judged on moneyness instead. Shadow only, like the rest.
+> - **Refresh logging (2026-09-18):** the 30-second drift check logs `Greeks for … updated_at … (first
+>   seen)` and `Greeks REFRESHED for … old -> new` whenever the broker's greeks timestamp changes — to
+>   PROVE the refresh cadence rather than infer "hourly at ~:15" from re-arm times. Our side is ruled
+>   out: no caching in `tradier_integration/client.py`, the live (not sandbox) market host, and every
+>   selection/drift check is a fresh request; bid/ask in the same replies are live — only the greeks lag.
+>
+> **To switch on:** after a few sessions of shadow lines look right, set `live_delta_guard: "enforce"`
+> on strategies 3 and 4. **Still open:** the deep side (11 of 31 entries really above 0.85 carried +$453 of
+> +$453) — study before any cap; contract *selection* and the hourly drift check still use the broker
+> delta; the long shots were mostly ×3 buys, so `max_contracts` stays relevant.
+
+**What happened — PROVEN from recorded prices (2026-09-17).** SPY closed 09-16 at $757.39, traded around
+$754 overnight, and **gapped up to $763.16 at the open**. The broker's greeks at the open were still
+**last night's, computed near $754**. Recomputing delta from the recorded SPY and option prices
+(Black-Scholes, implied vol solved from the live mid):
+
+```
+  ET        event                               SPY      broker delta   REAL delta
+  09:30:42  put 758 armed (chain scan)          762.68      0.727          0.128
+  10:04:30  put BOUGHT, 3 contracts at $0.49    760.63      0.727          0.233
+  10:08:43  put re-armed (fresh chain scan)     760.21      0.727          0.269
+  10:16:53  drift check disarms it              761.24      0.208          0.174
+  09:30:43  call 751 armed                      762.73      0.656          0.945
+  10:17:10  drift check disarms it              761.38      0.970          0.981
+```
+
+**The put was already out of the money when it was armed**, and the broker returned *exactly* 0.727 again
+38 minutes later from a fresh request in a moving market — the value was not being recalculated. It
+refreshed somewhere between 10:08:43 and 10:16:53. The **call** was wrong in the other direction: shown
+at 0.656, really 0.945 — too deep, outside the 0.85 cap. So the delta band was effectively off for both
+sides for the first ~45 minutes. The put closed +$30, but the mechanism is wrong: the strategy is built
+to buy in-the-money contracts, and it bought a cheap out-of-the-money one — three of them.
+
+**Not related to the 10:04:44 ET USB controller crash on the host PC** (checked): the stale value was
+already there at 09:30:42, the Wi-Fi adapter sits on the other controller and logged no reset, the
+engine logged no connection errors, and SPY prints kept arriving (longest gap 5.2 s, at the opening
+auction).
+
+**Why (likely, not yet confirmed).** Two places read delta, and neither computes it:
+- the entry gate (`check_entry_signal`, step 4) reads `market_data['delta']`, which is
+  `StrategyMarketState.delta` — the value from arming, refreshed only by the drift check;
+- the drift check (`stream_driven_worker`, `_DRIFT_CHECK_INTERVAL` = 30 s) calls the quotes endpoint with
+  greeks and trusts the `delta` it returns.
+
+The greeks are ORATS-calculated and carry their own `updated_at` (a chain read at 02:45 ET showed
+`2026-09-16 20:00:06`). They refresh far less often than every 30 s — at the open they were still the
+previous evening's — so the check re-reads the same number and cannot see a gap or a fast move. What
+is still unmeasured is the **refresh cadence** during the day.
+
+**Why it matters more than one +$30 trade.**
+- **The delta band is not enforced in a fast market** — exactly when it matters most.
+- **It compounds with sizing.** An out-of-the-money contract is cheap, and `max_contracts: 3` /
+  the 50% allocation buy *more* contracts when they are cheap — so the worst contract gets the biggest
+  size (D6, and the 2026-09-16/17 journal §9).
+- **The trade record is wrong.** `notes.indicators.delta` says 0.727 for a ~0.2 contract, so any later
+  analysis by delta is poisoned for fast-move entries.
+
+**Fix options — for a design pass, not built. Engine entry path: needs sign-off.**
+1. **Moneyness sanity check from live prices** (cheapest, no greeks): for a call require
+   `spot − strike > 0`, for a put `strike − spot > 0` (in the money), using the streamed underlying.
+   The 758 put fails instantly at arming (spot $762.68) and again at the buy ($760.63). Also cross-check
+   premium ≥ intrinsic value.
+2. **Treat stale greeks as unknown → block** (most-restrictive): read `greeks.updated_at`; if older than N
+   minutes, refuse the entry rather than trust the delta.
+3. **Compute delta locally** from the live option mid and underlying (the IV solver in
+   `docs/greeks-and-iv.md` / `scripts/cost_budget.py` already does Black-Scholes by bisection).
+
+**The cause is confirmed** (table above). What is still worth logging for a session is
+`greeks.updated_at` alongside each drift check, to learn the refresh cadence.
+**Cadence measured 2026-09-18** (refresh logging, a full session): `updated_at` is UTC; at the open it is
+the previous close (20:00 UTC = 16:00 ET); refreshes land hourly at **~:59 past (09:59, 10:59 … ET)**;
+the drift check runs ~:15 past, so it sees each one 15-18 min late. Idea, not decided: align the check to
+~:00-:01. `WOULD BLOCK long shot` on 09-18: 0. Composition check for any fix: it must only ever *narrow* the entry
+path, and exits must not read it.
+
+### G6. A second instrument: IWM strategies 5/6 live since 2026-09-18 *(watch, don't tune yet)*
+
+**What was done.** Owner chose IWM (step-through, 2026-09-18) over QQQ (mostly the same bet as SPY) and
+single names (Mon/Wed/Fri expiries, $450-$1,900 contracts). Created in PROD through the API's own
+validation (`StrategyCreate`) and field sync (`_reconcile_risk_fields`) — **settings identical to SPY
+3/4, verified key by key, zero differences**; only `instruments` is `["IWM"]`. Created inactive, switched
+on by the owner in the UI (the toggle starts the task), engine restarted 22:37 PT with `--log`.
+Owner choices: trade from Friday 2026-09-18, **max_contracts 3** (same as SPY — **lowered to 1 on
+2026-09-18** after the first day, see Watch), OI floor 3,000.
+
+**What is proven for IWM: nothing yet.** Everything in the SPY setup that was *researched* was
+researched on SPY only:
+- self-scaling, should transfer: don't-chase in wiggles, volume ratio, 9-minute EMA, VWAP, delta band
+- SPY-only evidence: the VWAP snap-back (G4b — **IWM did not confirm it on 14 sessions**, re-test
+  ~2026-09-25), the 11:30 cutoff, the 15% stop / trail, the entry signal itself, the 3,000 OI floor
+  (a fixed number; IWM normally carries less open interest)
+
+**Watch:**
+- [ ] **Open interest on ordinary days.** 09-18 is a quarterly expiration (IWM put armed with OI 23,865);
+      on normal days IWM may sit unarmed under 3,000. Record how often before touching the floor (E7).
+- [ ] **Cash contention.** Four strategies now share ~3 fundable entries a day of settled cash;
+      whichever signals first gets it. Check whether SPY entries go unfunded because of IWM.
+      *09-18: first instance, but via the **daily loss cap**, not cash — IWM's −$93 tripped the 5% cap at
+      10:41:12 ET, 30 s before SPY's first eligible put (which then fell ~30%, so the cap likely helped).*
+- [x] **×3 sizing.** *(2026-09-18)* The ~$2.80 premium assumption was wrong — IWM in-band contracts ran
+      ~$1.15, so ordinary entries were bought ×3. First day: two puts stopped out in 2-3 min, **−$93**
+      (×1 would have been −$31). Owner set **`max_contracts` 3 -> 1 on strategies 5/6** (PROD, read back;
+      SPY 3/4 still 3). JOURNAL 2026-09-18.
+- [ ] **IWM stop distance.** 15% of a ~$1.15 premium at delta ~0.77 is a ~23c IWM move vs a ~52c wiggle;
+      the 3-4c spread takes ~3% on entry. Room in wiggles: IWM ~0.35 vs SPY ~0.55. Trade 2 was stopped by
+      a 6-second spike. Owner to decide: wider stop for IWM, or pause IWM until the ~09-25 re-test.
+- [ ] **Re-entry after a stop.** 09-18 re-bought the same contract 17 min after it was stopped out.
+      A per-contract wait after a stop exit? (narrows entries only; exits untouched)
+- [ ] **Treat IWM as an out-of-sample test** of the SPY-derived rules. Keep `IWM_1min.json` topped up
+      weekly (`fetch_1min_bars.py --symbol IWM --write`) — Tradier keeps ~20 days.
 
 ## H. Recovery-path hardening (from the 2026-08-26 put-support guard passes)
 

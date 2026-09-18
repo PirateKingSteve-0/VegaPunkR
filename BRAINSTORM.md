@@ -8,6 +8,37 @@ once something becomes work, it moves to `TODO.md` and this keeps only the decis
 
 ---
 
+## Deeper than the band made the money? *(2026-09-18 — hypothesis, from TODO G5's audit)*
+
+**Decision: do not cap the deep side of the delta band until this is understood.** Found while proving
+the broker's delta is stale (TODO G5). Related: the cost budget section below, TODO D6, E14.
+
+Recomputing each real entry's delta from live prices (31 round trips, 2026-09-02..09-17):
+
+```
+  real delta at the buy     trades   total P&L
+  below 0.60 (long shots)      5        -$6
+  0.60-0.85 (the band)        15        +$6
+  above 0.85 (deep ITM)       11      +$453
+```
+
+**Two readings, and they predict different things:**
+
+1. **Deeper contracts are genuinely better here.** The cost budget already said so: with most of the
+   premium intrinsic, a 15% stop sits further from SPY's noise (65% vs 93% noise-stop odds at 0.85 vs
+   0.60). If this is the cause, *arming* deeper should help too.
+2. **It is momentum, not the contract.** A contract armed at ~0.74 is really 0.85+ at the buy *because SPY
+   already moved the trade's way* between arming and entry. Then depth is a symptom, and arming deeper
+   would not reproduce it.
+
+**How to tell them apart without new data:** in the replay, compare trades whose contract was *armed*
+deep against trades that *drifted* deep before the buy. Reading 1 predicts both do well; reading 2
+predicts only the drifted ones do. Needs the live delta at arming as well as at entry — which the G5 guard
+now records going forward (`delta_live`). Cost: deeper contracts cost more (~$7.57 vs ~$3.89 per SPY
+contract at 10:00 ET), so this collides with D6 and the cash ceiling either way.
+
+---
+
 ## Who is pushing, and does price move with them? *(2026-09-17 — bookmarked, not measured)*
 
 **Decision: nothing built. Keep recording `timesale` and measure this once ~2 weeks of sessions exist.
@@ -77,11 +108,26 @@ best-looking one.
 
 ### Caveats to carry
 
-- **One day of data** so far (09-16); every session from here adds one automatically.
+- **Two days of data** so far (09-16, 09-17; see below); every session from here adds one automatically.
 - **~35% of volume prints between bid and ask** and can't be classified either way.
 - **690 quotes arrived crossed** on 09-16 (bid above ask) — normalise, and check the rate per day.
 - **The closing auction** (87.8% bid-side on 09-16) must be excluded, or it dominates the last window.
 - `LIVE_TEST_LOGGING=1` is what records `timesale` — without it the data silently isn't kept (C2).
+
+### Day two, 2026-09-17 (still not a test — two days)
+
+```
+  hour ET   push    SPY that hour   reading
+  09:30     +0.02      -1.89        weak push, price slid after the gap-up: small air pocket down
+  11:00     +0.17      +1.76        real buying
+  14:00     +0.21      -0.18        absorption
+  15:00     +0.32      +0.11        strong absorption
+```
+
+**The afternoon repeated Wednesday morning's shape** — heavy buying, flat price. Wednesday's was followed
+by a $9 drop; whether Thursday's means anything is Friday's open, which is quarterly expiration and so a
+poor clean test. **Data hygiene learned:** filter trade prints to `size > 0` — SPY's pre-open "price" of
+$754.05 was a repeated size-0 print, and reading it as the open invented a +$7.20 move.
 
 ---
 

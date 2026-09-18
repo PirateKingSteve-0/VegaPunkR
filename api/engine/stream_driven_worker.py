@@ -1515,6 +1515,16 @@ class StreamDrivenWorker:
 
         greeks = quotes[0].get("greeks") or {}
         raw_delta = greeks.get("delta")
+        # Observation only (TODO.md G5): log when the broker's greeks timestamp
+        # first appears or changes, to measure how often the provider actually
+        # recalculates them. Changes nothing below; never raises into the check.
+        try:
+            from engine.live_greeks import note_greeks_refresh
+            refresh_line = note_greeks_refresh(sym, greeks.get("updated_at"), raw_delta)
+            if refresh_line:
+                logger.info(refresh_line)
+        except Exception:
+            pass
         if raw_delta is None:
             # No greeks back — hold the contract rather than disarming. Treating a
             # missing value as a failed check would churn strikes on a data hiccup.

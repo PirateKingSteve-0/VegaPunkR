@@ -11582,6 +11582,28 @@ direction (in-the-money calls ~10× further from the floor than puts), but the b
 puts arm if SPY dips to about $753 (the 755 put enters the band); calls need about $762 (the 760 call).
 So expect puts-only or no trades, caused by the floor, not the gates.
 
+> **CORRECTED 2026-09-17 — the chain numbers above were STALE, and the predictions built on them were
+> wrong.** Open interest had *not* yet refreshed at 02:45 ET; those were the previous day's figures. By
+> the open the refresh had landed, and **both sides armed at 09:30 ET**:
+>
+> ```
+>   contract     02:45 ET (above)   engine at 09:30 ET
+>   751 call            48              3,360
+>   758 put          1,355              3,063
+>   759 call         1,317              5,808
+> ```
+>
+> So "neither side passes" and "puts arm at about $753" were based on old data. Two things changed
+> overnight, and both mattered: open interest refreshed (above), **and SPY gapped up to $763.16 at the
+> open** — the $754.05 seen pre-market was a size-0 repeated print, not a real trade. (The "calls need
+> about $762" estimate happened to be met by the gap.) **Rule: any open
+> interest read before the open is yesterday's.** The broader pattern in this section — the floor
+> choosing a direction across days — still stands on the logs; today shows one overnight refresh can
+> switch a side on. The 2026-09-17 session also surfaced TODO **G5**: the broker's greeks at the open were
+> still the previous evening's (computed near $754), so the engine armed and then bought a put it
+> believed was delta 0.727 but was really 0.13-0.27 — proven by recomputing delta from recorded prices.
+> Unrelated to that morning's USB controller crash on the host PC.
+
 **Not built: the diagnostic line** (log strike, delta, open interest, volume and spread of the
 contracts the floor rejects, throttled to one line every few minutes per side). Zero behaviour change;
 it would turn one snapshot into every scan of every day. **Do not change the floor before that data
@@ -11644,3 +11666,281 @@ floor has been silently sparing us from.
 6. **TODO H4** — broker-side disaster stop, design pass first.
 7. **E8 tiered trail** — the one exit idea that might do both jobs; needs unseen trades.
 8. **A second instrument (IWM)** — blocked on §8's floor decision.
+
+---
+
+## Session Date: September 17-18, 2026 — The broker's delta was hours old, a second instrument, and a dead USB controller
+
+The Thursday session, then an evening that ran past midnight into Friday. **One real engine defect
+found and proven** (stale greeks), a guard built for it **in shadow**, and a second instrument (IWM)
+put live. Engine changes tonight are observation-only; nothing that decides or places a trade
+changed. The stale-delta work is **uncommitted on purpose** — owner is holding it until the Friday
+shadow logs look right.
+
+### 1. The Thursday 2026-09-17 session: three trades, +$22
+
+**SPY gapped UP to $763.16 at the open** (previous close $757.39), dipped to $759.97 in the first hour
+and closed at $762.55. *(An earlier recap said "opened at $754.05 and rallied" — wrong: $754.05 was a
+size-0 repeated overnight print, not a trade. Filter prints with size > 0 before reading an open.)*
+
+```
+  10:04 -> 10:08 ET  put  SPY260917P00758000 x3 @ $0.49   +$30  trailing stop
+  10:30 -> 10:47 ET  call SPY260917C00759000 x1 @ $3.09   -$48  15% stop
+  11:29 -> 11:57 ET  call SPY260917C00759000 x1 @ $2.86   +$40  trailing stop
+```
+
+- **The don't-chase gate was busy**, blocking put entries every minute 10:57-11:10 ET (1.0-1.7 wiggles);
+  the 10:04 put slipped through at **0.99**. Both 11:30 cutoff events fired.
+- **First live shadow data (E14):**
+
+```
+  rule            put +30   call -48   call +40
+  live (actual)     +30       -48        +40
+  structure stop    +27       -31        +38     <- cut the loser again
+  keep 70%          +33       -48        +52
+  volatility trail  open      -48        +57
+```
+
+  The structure stop cut the loser early (−$48 → −$31) — now 4 of 4 trades it changed were losers exited
+  sooner, the first on a trade the backtest never saw. Three trades is not a verdict.
+- `scripts/gate_review.py` reconstructed **1** trade where the engine made **3**, so its what-if numbers were
+  not trusted for this day.
+
+### 2. ⚠️ The broker's delta is not live — proven (TODO G5)
+
+The 10:04 put was bought at **$0.49 ×3** with the trade record showing **delta 0.7273**. A $0.49 put with
+SPY around $760 is not a 0.73-delta contract. Recomputing delta from recorded prices (Black-Scholes, implied
+vol solved from the live mid):
+
+```
+  ET        event                           SPY      broker   REAL
+  09:30:42  put 758 armed (chain scan)      762.68   0.727    0.128
+  10:04:30  put BOUGHT x3 @ $0.49           760.63   0.727    0.233
+  10:08:43  put re-armed (fresh chain scan) 760.21   0.727    0.269
+  10:16:53  drift check disarms             761.24   0.208    0.174
+  09:30:43  call 751 armed                  762.73   0.656    0.945
+```
+
+**The broker returned exactly 0.727 at 09:30 and again 38 minutes later from a fresh request.** Tradier's
+greeks come "courtesy of ORATS" with an `updated_at` timestamp; at the open they were still the previous
+evening's, computed near $754. **Our side was ruled out:** no caching in the client, the live (not the
+15-minute-delayed sandbox) market host, and every selection/drift check is a fresh request — the bid/ask
+in the same replies are live; only the greeks lag. **Unrelated to the USB crash (§5)** — the stale value was
+already there at 09:30:42, the Wi-Fi sits on the other controller, and SPY prints never stopped.
+
+**Audit of all 31 real round trips** — the broker's delta always said "in band"; reality:
+
+```
+  real delta at the buy     trades   total P&L
+  below 0.60 (long shots)      5        -$6     four of them bought x3 because they were cheap
+  0.60-0.85 (as designed)     15        +$6
+  above 0.85 (deep ITM)       11      +$453
+```
+
+**Cadence evidence:** contracts get re-armed at about **:15 past the hour** on almost every recorded day —
+the moment a refreshed greek appears — which points to hourly snapshots. Not yet proven; §3 logs it.
+
+**The deep-ITM row is the surprise:** nearly all profit came from contracts really *deeper* than the band
+allows. Small sample, and likely confounded (a contract gets deeper because SPY already moved the trade's
+way), but it matches the cost budget's claim that deeper contracts survive noise better. **It decided the
+fix: do not cap the deep side until it is studied.**
+
+### 3. The long-shot guard — built, in shadow
+
+Owner decisions (step-through form): guard **only the floor**, compute delta **from live prices**, check
+**at the moment of buying**, **shadow first**.
+
+- `api/engine/live_greeks.py` — pure math: OCC parse, Black-Scholes, implied delta by bisection, and
+  `is_long_shot()`. **Parity: reproduces the 31-trade audit 31/31**, flags exactly the 5 long shots and
+  none of the 11 deep ones.
+- `check_entry_signal` step **4b** — `params_json.live_delta_guard`: `shadow` (default: logs `WOULD BLOCK
+  long shot (shadow)`, records `delta_live` / `delta_live_source` on the trade, blocks nothing) ·
+  `enforce` · `off`; unreadable values behave as shadow. Only narrows; applies only where `delta_min` > 0.
+  The new indicator keys are in `_OBSERVED_NOT_GATED` (negative control proves `confirmation_required` is
+  not loosened). No exit path reads it.
+- **Quote-age rule:** an option quote older than 30 s is not used to solve delta (`stale_quote` →
+  moneyness fallback). The executor's own 30 s check runs only after the entry decision, for sizing.
+- **Refresh logging:** the 30-second drift check logs `Greeks for … (first seen)` / `Greeks REFRESHED …
+  old -> new` whenever the broker's `updated_at` changes — to PROVE the cadence rather than infer it.
+- `api/tests/test_live_delta_guard.py` — all checks pass; suite 24 passed.
+
+**What it would have done on past trades:** real 31 → blocks 5 (3 winners −$63, 2 losers +$69), **net +$6**;
+replay 150 → blocks 12 (6/6), **net −$3**. **A risk fix, not a profit fix**: it keeps the strategy buying
+what it was designed to buy, stops the ×3 lottery buys, and keeps the trade records honest.
+
+### 4. Aggressor side, day two (BRAINSTORM "Who is pushing")
+
+```
+  hour ET   push*   SPY that hour   reading
+  09:30     +0.02       -1.89       weak push, price slid: a small downward air pocket after the gap
+  10:00     +0.14       -0.41       mild absorption
+  11:00     +0.17       +1.76       real buying (confirmed)
+  14:00     +0.21       -0.18       absorption
+  15:00     +0.32       +0.11       strong absorption — heavy buying, flat price
+  * push = (buy − sell) ÷ (buy + sell), from timesale
+```
+
+**Thursday afternoon had the same shape as Wednesday morning** (heavy buying, flat price) — and Wednesday's
+was followed by a $9 drop. Friday's open is the first test. *(An earlier reading called 09:30 an upward air
+pocket of +$7.20 — that was the fake $754.05 print again.)* Friday is quarterly expiration, which muddies it.
+
+### 5. Host PC: a USB controller died mid-session
+
+At **10:04:44 ET** the xHCI controller `0000:02:00.0` logged `host controller not responding, assume dead` —
+keyboard (Higround), mouse dongle (Endgame Gear XM2w, **4 kHz polling, behind a hub**), USB sound card and
+others dropped. The other controller (Wi-Fi, Bluetooth, webcam) kept running, so **the engine never lost its
+connection**. Likely trigger: a "not enough bandwidth" error right before the crash, with a high-polling-rate
+mouse sharing a hub. Owner restarted the PC through remote control after the day's trades closed (no
+positions, entry window shut); engine back at 13:24 ET. **Recording gap: 12:23-13:24 ET.** Also after hours:
+Tradier's stream dropped twice with HTTP 502 and reconnected within ~10 s.
+
+**Event-timestamp quirk found on the way:** `system_events.created_at` uses Postgres `now()`, which is the
+**transaction start**, so an event written by an idle strategy session can carry a time from much earlier
+(an 11:30 cutoff event stamped 10:08). Position open times were checked and are correct. Display only.
+
+### 6. IWM added as a second instrument (TODO G6)
+
+Owner chose IWM (daily expiries, ~$280-300 contracts, less tied to SPY than QQQ) and to trade it from Friday
+with SPY's settings exactly (max_contracts 3, OI floor 3,000). Strategies **5 (calls) and 6 (puts)** were
+created through the API's own validation and field sync — **zero setting differences from SPY 3/4** — then
+switched on in the UI. At the 22:37 PT restart the IWM put armed a contract with OI 23,865 (quarterly expiry).
+
+**Is the SPY research valid for IWM? Mostly unknown.** The self-scaling pieces should transfer; the researched
+pieces were researched on SPY only. The one that could be checked quickly was:
+
+```
+  VWAP stretch, +30m, same 14 sessions   SPY                  IWM
+  0.5-1 wiggles                          -1.92 bp (snaps back) -0.14 bp
+  1-2 wiggles                            -2.49 bp (snaps back) +1.01 bp (kept going 56.6%)
+  shuffle test                           p = 0.032             p = 0.12
+```
+
+SPY still snaps back on these same days, so it is the symbol, not the dates. **IWM is unproven either way.**
+Owner decision: keep the don't-chase gate on IWM and **re-test around 2026-09-25** (G4b checkbox).
+
+**Data:** `IWM_1min.json` created (14 sessions, 08-28..09-17); `SPY_1min.json` topped up to 26 sessions
+(through 09-17). SPY's first 12 days (08-12..08-27) are no longer fetchable — that file is the only copy.
+`fetch_1min_bars.py` crashed on a brand-new symbol (it backed up a file that did not exist, after the
+download) — fixed. `distance_test.py` gained `--symbol`.
+
+### 7. Committed earlier, and what is still uncommitted
+
+**`d74fe92`** (Thursday, before the reboot, owner-approved, not pushed): entry gates, exit shadow mode,
+stream feeds, UI fields, four test files, research scripts, docs and journal. `data/` deliberately excluded.
+
+**Uncommitted, held until after Friday:** `api/engine/live_greeks.py`, the guard in `signal_generator.py`,
+the refresh logging in `stream_driven_worker.py`, `api/tests/test_live_delta_guard.py`, the two script
+fixes, and these TODO/JOURNAL/BRAINSTORM updates.
+
+### 8. For Friday 2026-09-18
+
+Four strategies live (SPY + IWM, calls + puts), `--log` on. Search the engine log for:
+
+- `Greeks for` / `Greeks REFRESHED` — when the broker's delta actually updates; is the first morning
+  timestamp from the night before?
+- `WOULD BLOCK long shot` — a buy the guard would have stopped
+- `SHADOW SUMMARY` — six exit rules against each real exit
+- `Not chasing` — the don't-chase gate at work
+
+Quarterly expiration: heavy volume, huge open interest, unusual flows near the close.
+
+### 9. Corrections owed this session
+
+- "SPY opened at $754.05 and rallied" and "a +$7.20 air pocket" — both from a size-0 print; SPY gapped up.
+- The 02:45 ET open-interest read was **yesterday's** numbers (correction note in the previous entry);
+  both sides armed at 09:30.
+- "Not chasing" was at DEBUG before Wednesday's change — its absence meant nothing (fixed then, noted again).
+
+### 10. Open
+
+1. Read Friday's `Greeks REFRESHED` lines → confirm the cadence; then decide on switching the guard to enforce.
+2. The deep-ITM question (11 of 31 trades carried +$453) — study before any cap.
+3. Contract *selection* and the hourly drift check still use the broker's delta.
+4. `max_contracts: 3` — four of five long shots were ×3 buys; still open.
+5. IWM: gate re-test ~09-25; open-interest behaviour on ordinary days; cash contention with SPY.
+6. Architecture diagram: the pre-commit hook flagged six sections as stale after `d74fe92`.
+7. Host PC: plug the mouse dongle directly into the PC (not the hub), or lower its polling rate.
+
+## Session Date: September 18, 2026 — Friday: −$93 on IWM's first day, SPY held out, the broker's greeks clock
+
+Quarterly expiration. Four strategies live (SPY 3/4, IWM 5/6). All times ET unless marked.
+
+### 1. Two IWM put trades, both stopped out in minutes: −$93
+
+```
+  #  bought                 sold             held   IWM moved              P&L
+  1  10:17  3 x $1.18       10:19  $1.01     3 min  +20c  283.00 -> 283.20   -$51
+  2  10:37  3 x $1.15       10:39  $1.01     2 min  +29c spike in ~2 s       -$42
+```
+
+Both from strategy 6 (IWM puts), same contract `IWM260918P00284000`. Deltas were genuinely in band
+(broker 0.778, live-computed 0.766 / 0.756) — **not long shots; the G5 guard was not a factor.**
+Don't-chase stretch 0.989 and 0.80 (it had blocked IWM 10:12-10:16, then let trade 1 in just under 1.0).
+
+**Why it lost:**
+
+- **Bought ×3, not ×1.** IWM premiums were ~$1.15, not the ~$2.80 G6 assumed. Sizing (50% allocation,
+  2× options safety factor) hit the `max_contracts: 3` cap; SPY at ~$2.15 buys 1. At ×1 today = **−$31**.
+- **The 15% stop is tight for IWM.** 15% of $1.18 at delta ~0.77 is an IWM move of ~23c, against a
+  normal wiggle of ~52c. The 3-4c bid/ask gap (~3% of the premium, and fills came at or above the ask)
+  eats part of that before the price moves. Room left, in wiggles: **IWM ~0.35, SPY ~0.55.**
+- **Trade 2 was a 6-second spike.** 10:39:12 IWM 283.03 -> 283.32 in ~2 s, back to 283.12. The option
+  went $1.11 -> $0.93 -> $1.05; real prints at $0.94 (not a size-0 artifact). The stop read $0.93; the
+  fill was $1.01.
+- **Re-bought the same contract 17 minutes after a stop.** Nothing prevents that today.
+
+**Exit shadow:** all six rules would have sold at the same instant and done worse (−$57, −$66) — they
+price at the trigger quote, the real fills were better. The problem was size and stop distance, not
+the exit rule.
+
+### 2. Why SPY did not trade
+
+```
+  09:30-10:00  entry window not open (entry_after_open_minutes 30)
+  10:00-10:41  "Not chasing" — SPY slid 761 -> 759, 1.0-2.6 wiggles below VWAP, ~50 blocks/minute
+  10:41        back inside 1.0 wiggle, engine wanted the 761 put at $2.15 —
+               daily loss cap had tripped 30 s earlier (10:41:12, −$93 vs limit ~−$70, 5%)
+  10:41-11:30  every entry refused by the cap (280 rejections); exits stayed open
+```
+
+SPY stayed below VWAP all morning, so calls never qualified. Separately, from 10:17 to 11:17 no call
+contract passed selection (stale hourly delta + the 3,000 OI floor — E7 again); it cost nothing today.
+
+**The refused SPY put would probably have lost too:** $2.36 two minutes later, then **$1.50 by 11:29**
+(−30%). The 15% stop sits near $1.83; unless the trail had locked the early rise, ~−$32 at ×1. Not
+replayed — an estimate. The cap likely saved money today.
+
+**Cash / budget contention (G6 watch item) — first instance:** it was not settled cash that crowded SPY
+out, it was IWM's losses using up the shared daily loss budget.
+
+### 3. The broker's greeks clock — measured (G5)
+
+The new `Greeks for` / `Greeks REFRESHED` lines, all day. `updated_at` is **UTC** (13:58:49 was seen at
+10:14 ET, so it cannot be ET):
+
+```
+  first seen at open   2026-09-17 20:00 UTC  = yesterday 16:00 ET (the close)
+  refreshes            13:59, 14:59, 15:59, 16:59, 17:59, 18:59 UTC
+                       = 09:59, 10:59, 11:59 ... ET — hourly, just before the hour
+  engine drift check   ~:14-:17 past — sees each refresh 15-18 minutes late
+```
+
+So **from 09:30 to ~09:59 the broker delta is last night's close**, then it is up to an hour old.
+Entries start at 10:00, so the first half hour is covered by the window, but every contract armed
+before 09:59 was chosen on yesterday's delta. `WOULD BLOCK long shot`: **0** today.
+
+### 4. Changed today
+
+- **IWM `max_contracts` 3 -> 1** on strategies 5 and 6 (owner decision, written to PROD through the
+  API's merge + `_reconcile_risk_fields`, read back; SPY 3/4 unchanged at 3). The worker re-reads the
+  row; effective Monday.
+
+### 5. Open
+
+1. IWM stop: wider for IWM, or pause IWM until the ~09-25 re-test? (owner to decide)
+2. A wait before re-buying the same contract after a stop?
+3. Drift check at ~:15 past vs a refresh at ~:59 — worth aligning to ~:00-:01? (idea only)
+4. Guard to enforce: 0 would-blocks today; still no long-shot sample to judge from.
+5. Carried: deep-ITM study, SPY `max_contracts: 3`, OI floor as a direction filter (E7), H4, the
+   architecture diagram, and the held uncommitted batch (`live_greeks.py` + guard + tests + script fixes
+   + docs).

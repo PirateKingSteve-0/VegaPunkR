@@ -44,7 +44,12 @@ import statistics
 from collections import defaultdict
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DATA = os.path.join(REPO, "data", "backtest", "underlying", "SPY_1min.json")
+def data_path(symbol):
+    return os.path.join(REPO, "data", "backtest", "underlying", "%s_1min.json" % symbol.upper())
+
+
+# Kept for callers that import it (distance_trades.py reads it as the SPY reference).
+DATA = data_path("SPY")
 
 ENTRY_START, ENTRY_END = "10:00", "15:45"       # live strategy window, ET
 HORIZONS = (15, 30)                              # minutes ahead
@@ -246,9 +251,12 @@ def main():
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument("--perms", type=int, default=2000)
     p.add_argument("--seed", type=int, default=20260914)
+    p.add_argument("--symbol", default="SPY",
+                   help="reads data/backtest/underlying/<SYMBOL>_1min.json (fetch_1min_bars.py)")
     a = p.parse_args()
+    sym = a.symbol.upper()
 
-    data = json.load(open(DATA))
+    data = json.load(open(data_path(sym)))
     rows = build_minutes(data)
     days = sorted(data)
     first, second = set(days[: len(days) // 2]), set(days[len(days) // 2:])
@@ -256,12 +264,13 @@ def main():
     rng = random.Random(a.seed)
 
     print("=" * 92)
-    print("DISTANCE TEST — SPY 1-minute bars, %d sessions %s .. %s (%d up, %d down, open->close)"
-          % (len(days), days[0], days[-1], up, len(days) - up))
+    print("DISTANCE TEST — %s 1-minute bars, %d sessions %s .. %s (%d up, %d down, open->close)"
+          % (sym, len(days), days[0], days[-1], up, len(days) - up))
     print("  minutes %s-%s ET | %d usable minutes | cutoffs fixed in code: 0.5 / 1 / 2 wiggles"
           % (ENTRY_START, ENTRY_END, len(rows)))
     print("  'avg bp with stretch': + = kept moving away from the line, - = came back toward it")
-    print("  1 bp = 0.01% of price, about 7.6 cents on SPY at 762")
+    last = data[days[-1]][-1]["close"]
+    print("  1 bp = 0.01%% of price, about %.1f cents on %s at %.0f" % (last / 100, sym, last))
     print("=" * 92)
 
     for line in ("VWAP", "EMA"):
@@ -287,7 +296,7 @@ def main():
     print("=" * 92)
     print("ONLY MINUTES THE CURRENT RULE WOULD BUY  (price vs 9m EMA and VWAP agree, volume >= %.1fx)"
           % VOL_MULT)
-    print("  sign here = the TRADE's direction: + means SPY moved the way the call/put wanted")
+    print("  sign here = the TRADE's direction: + means %s moved the way the call/put wanted" % sym)
     fired = [r for r in rows if r["rule"] is not None]
     print("  %d rule minutes (%d call, %d put)" % (
         len(fired), sum(1 for r in fired if r["rule"] > 0), sum(1 for r in fired if r["rule"] < 0)))

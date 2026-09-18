@@ -136,14 +136,20 @@ def main():
         print("\nNothing returned; file untouched.")
         return
 
-    backup = f"{path}.bak-{datetime.now():%Y%m%d-%H%M%S}"
-    shutil.copy2(path, backup)
+    # Back up only a file that exists. A first run for a new symbol (IWM,
+    # 2026-09-18) has nothing to back up, and copy2 on a missing path raised
+    # AFTER the fetch -- so the download was thrown away and nothing was saved.
+    backup = None
+    if os.path.exists(path):
+        backup = f"{path}.bak-{datetime.now():%Y%m%d-%H%M%S}"
+        shutil.copy2(path, backup)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
     merged = dict(existing)
     merged.update(fetched)          # only ever ADDS days; never rewrites one
     with open(path, "w") as fh:
         json.dump(merged, fh, separators=(",", ":"))
 
-    print(f"\nbackup  {os.path.relpath(backup, REPO)}")
+    print(f"\nbackup  {os.path.relpath(backup, REPO) if backup else 'none (new file)'}")
     print(f"merged  {len(existing)} -> {len(merged)} days "
           f"({min(merged)} .. {max(merged)})")
 

@@ -11,6 +11,7 @@ from collections import deque
 
 from models import Strategy, User
 from utils.market_hours import HALT_MODE_FLATTEN, MarketHours, trading_halt_state
+from engine import live_greeks
 
 logger = logging.getLogger(__name__)
 
@@ -377,7 +378,7 @@ def entry_cutoff_reached(params: Dict, user: Optional[User]) -> Optional[str]:
 #
 # Anything added here must be a value we only observe. A key that actually
 # gates an entry does NOT belong in this set.
-_OBSERVED_NOT_GATED = frozenset({'vwap_stretch'})
+_OBSERVED_NOT_GATED = frozenset({'vwap_stretch', 'delta_live', 'delta_live_source'})
 
 
 # Minutes of session the VWAP tally must cover before the stretch gate will
@@ -499,6 +500,11 @@ class SignalGenerator:
         # [monotonic time of last line, blocks suppressed since] }. See the
         # stretch gate in check_entry_signal for why it is throttled.
         self._not_chasing_log: Dict[tuple, list] = {}
+
+        # Same throttle for the long-shot guard's log line (step 4b), and a
+        # once-per-strategy flag for an unreadable live_delta_guard value.
+        self._long_shot_log: Dict[tuple, list] = {}
+        self._bad_guard_mode_logged: set = set()
 
     def check_entry_signal(
         self,
@@ -932,6 +938,69 @@ class SignalGenerator:
             if not (delta_min <= delta <= delta_max):
                 logger.debug(f"{symbol}: Delta {delta:.2f} outside range [{delta_min}, {delta_max}]")
                 return None
+
+        # 4b. Long-shot guard: the REAL delta, from live prices (TODO.md G5).
+        #
+        # The delta above is the broker's (ORATS) greek, which refreshes about
+        # hourly and at the open is still the previous evening's. Proven
+        # 2026-09-17: after a gap the broker said 0.727 for a put whose real delta
+        # was 0.13-0.27, and the engine bought three. An audit of 31 real round
+        # trips found 5 bought below the floor in reality, four of them x3.
+        #
+        # Guards ONLY the floor (delta_min), by owner decision: the deep side
+        # (real delta above delta_max) carried nearly all the profit in that
+        # sample and needs study, not a block. It can only ever NARROW the entry
+        # path — it never lets through anything the checks above rejected — and
+        # it applies only where a floor is configured. Exits never read it.
+        #
+        # live_delta_guard: "shadow" (default) logs what it WOULD block and
+        # records the real delta on the trade, blocking nothing; "enforce"
+        # blocks; "off" skips it. Anything else is treated as "shadow" — an
+        # unreadable setting must neither silently disable it nor silently
+        # start blocking trades.
+        delta_floor = params.get('delta_min', 0.0) or 0.0
+        guard_mode = params.get('live_delta_guard', 'shadow')
+        if guard_mode not in ('off', 'shadow', 'enforce'):
+            if strategy.id not in self._bad_guard_mode_logged:
+                self._bad_guard_mode_logged.add(strategy.id)
+                logger.error(
+                    f"live_delta_guard={guard_mode!r} is not off/shadow/enforce — "
+                    f"treating as 'shadow' (logs only, blocks nothing)"
+                )
+            guard_mode = 'shadow'
+        option_symbol = (additional_data or {}).get('option_symbol')
+        if guard_mode != 'off' and option_symbol and delta_floor > 0:
+            ld = live_greeks.live_delta(
+                option_symbol, current_price,
+                additional_data.get('bid'), additional_data.get('ask'),
+                _market_hours.get_current_et_time(),
+                _market_hours.get_market_close_time_et(),
+                quote_age_s=additional_data.get('quote_age_s'),
+            )
+            if ld.delta is not None:
+                indicators['delta_live'] = round(ld.delta, 4)
+            indicators['delta_live_source'] = ld.source
+            long_shot, why = live_greeks.is_long_shot(ld, float(delta_floor))
+            if long_shot:
+                # Throttled like the not-chasing line: this can repeat every 1s
+                # evaluation while the stale contract stays armed.
+                key = (strategy.id, option_symbol)
+                slot = self._long_shot_log.setdefault(key, [None, 0])
+                now = time.monotonic()
+                if slot[0] is None or now - slot[0] >= 60.0:
+                    extra = f"; {slot[1]} more in the last minute" if slot[1] else ""
+                    broker = additional_data.get('delta')
+                    broker_txt = f"{abs(broker):.3f}" if broker is not None else "n/a"
+                    verb = "Long shot BLOCKED" if guard_mode == 'enforce' else "WOULD BLOCK long shot (shadow)"
+                    logger.info(
+                        f"{symbol}: {verb} — {option_symbol} {why}; broker delta "
+                        f"{broker_txt}, SPY ${current_price:.2f}{extra}"
+                    )
+                    slot[0], slot[1] = now, 0
+                else:
+                    slot[1] += 1
+                if guard_mode == 'enforce':
+                    return None
 
         # 5. Check liquidity filters for options
         if additional_data:
