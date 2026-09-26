@@ -11898,17 +11898,48 @@ the exit rule.
 ```
   09:30-10:00  entry window not open (entry_after_open_minutes 30)
   10:00-10:41  "Not chasing" — SPY slid 761 -> 759, 1.0-2.6 wiggles below VWAP, ~50 blocks/minute
-  10:41        back inside 1.0 wiggle, engine wanted the 761 put at $2.15 —
-               daily loss cap had tripped 30 s earlier (10:41:12, −$93 vs limit ~−$70, 5%)
+  10:39:14     IWM trade 2 closes — realized −$93, past the 5% account cap (−$74.69 at the time)
+  10:41:11     back inside 1.0 wiggle, engine wanted the 761 put at ~$2.10 — the FIRST entry refused
   10:41-11:30  every entry refused by the cap (280 rejections); exits stayed open
 ```
+
+*Correction (2026-09-19): first written as "the cap tripped 30 s before SPY's put". The cap was reached
+at 10:39:14 when IWM closed; 10:41:12 is only when the first refusal was logged.*
 
 SPY stayed below VWAP all morning, so calls never qualified. Separately, from 10:17 to 11:17 no call
 contract passed selection (stale hourly delta + the 3,000 OI floor — E7 again); it cost nothing today.
 
-**The refused SPY put would probably have lost too:** $2.36 two minutes later, then **$1.50 by 11:29**
-(−30%). The 15% stop sits near $1.83; unless the trail had locked the early rise, ~−$32 at ×1. Not
-replayed — an estimate. The cap likely saved money today.
+~~The refused SPY put would probably have lost too … the cap likely saved money today.~~ *Wrong — an
+unreplayed estimate. The replay below shows it rose to $2.47 first and the trail would have sold at
+$2.22, +$11.*
+
+### 2b. Replay: what the refused entries would have done (2026-09-19)
+
+Every refused entry signal, through the recorded option quotes, with the engine's own exit rules
+(stop −15% on the bid; trail arms at +15% peak, sells 10% under the peak; TP 25% never fires first).
+Buy at the ask at the signal second; next entry = first logged signal after the exit; one position per
+strategy. Script: scratchpad `blocked_replay.py` (not committed).
+
+```
+  ET     trade                        per contract   how it ended
+  10:41  SPY 761 put  buy $2.11       +$11           peak $2.47, trail sold $2.22
+  11:00  IWM 284 put  buy $1.04       +$16           peak $1.34, trail sold $1.20
+  11:17  SPY 761 put  buy $1.91       −$29           stop $1.62
+  11:17  IWM 284 put  buy $1.28       −$20           stop $1.08
+  11:24  SPY 761 put  buy $1.72       +$34           peak $2.29, trail sold $2.06
+```
+
+**Cash decides how many were possible.** Settled cash at the open $1,493.59 (broker balances); the two
+real IWM buys used $693, and sale proceeds do not settle until the next day, so ~$800 was left.
+
+- As configured (IWM ×3): the first three fit — **+$30** → day ≈ **−$63**
+- IWM ×1 all day: morning −$31, then four fit — **−$22** → day ≈ **−$53** (≈ +$12 if the 11:24 SPY had
+  fit; it was ~$5 short)
+
+**Verdict:** the rest of the morning was a sideways chop (SPY boxed $759-760 for an hour) — wins and
+losses roughly cancel. The cap neither saved nor cost much. No calls signalled at all.
+
+**Week:** Mon +$141, Tue +$138, Wed +$9, Thu +$22, Fri −$93 = **+$217**.
 
 **Cash / budget contention (G6 watch item) — first instance:** it was not settled cash that crowded SPY
 out, it was IWM's losses using up the shared daily loss budget.
@@ -11944,3 +11975,324 @@ before 09:59 was chosen on yesterday's delta. `WOULD BLOCK long shot`: **0** tod
 5. Carried: deep-ITM study, SPY `max_contracts: 3`, OI floor as a direction filter (E7), H4, the
    architecture diagram, and the held uncommitted batch (`live_greeks.py` + guard + tests + script fixes
    + docs).
+
+---
+
+## Session Date: September 21-23, 2026 — The don't-chase gate came off SPY, and the chart got its own data
+
+Three sessions of results, the evidence that moved the gate, and the trade-review chart built on our
+own recordings. All times ET unless marked.
+
+### 1. Results
+
+```
+  Mon 09-21   +$3     1 trade    IWM 285 call 0.77 -> 0.80, trailing stop, 3 min
+  Tue 09-22   +$8     3 trades   SPY: call -$54 (stop), two puts +$24 / +$38 (both trailing)
+  Wed 09-23   +$96    3 trades   SPY: 775 put +$72, 769 call -$27 (stop), 772 put +$51
+                                 week to date +$107
+```
+
+Wednesday is the **first session with `vwap_max_stretch` off on SPY** (§3): zero `Not chasing` lines
+for SPY all day, 38 for IWM, which still has the gate at 1.0. Both winners exited on the trailing
+stop at +12.7% and +20.7% — the 25% target never fired.
+
+**IWM has not traded since Monday, and the reason is structural, not the OI floor.** Tuesday and
+Wednesday: `88 puts scanned: 88 wrong delta (need 0.6-0.85)`, closest 0.859, with 0-2 rejected for
+open interest. IWM strikes are $1 apart on a ~$285 underlying, so delta steps from strike to strike
+are coarse enough to skip the band entirely. Different problem from the one G6 was watching for.
+
+### 2. What the two live gates have actually done
+
+`scripts/replay_session.py --all`, exits held at the live rules, entries as recorded (11 session logs):
+
+```
+  configuration                    trades   win%   $/contract
+  no gates (pre-09-15)              158     47.5%     -369
+  11:30 cutoff only                  41     56.1%     +347
+  don't-chase gate only             120     48.3%     -192
+  both gates (what ran until 09-22)  22     45.5%     +124
+```
+
+**The 11:30 cutoff carries the edge** — it is the difference between -$369 and +$347. The chase gate
+*subtracts* when layered on top of it (+$347 -> +$124), removing ~19 net-positive trades.
+
+Second, independent measurement — pricing every entry the live gate actually blocked since it
+shipped, from the recorded contract quotes (scratchpad script, not committed):
+
+```
+  09-17  +$39   09-18  -$25   09-21  +$200   09-22  -$57      46 trades, +$157 per contract
+```
+
+So the gate has cost roughly $157 per contract over four sessions, most of it one trend day.
+
+### 3. Why the threshold was not raised, and what the tape says
+
+Buckets of every minute 10:00-11:30 over 30 SPY sessions, 30-minute forward move, folded so
+positive = price kept running away from VWAP:
+
+```
+  stretch            kept running    avg
+  0.5-1 (allowed)        35%        -4.4 bp     <- the zone the gate LETS THROUGH reverts hardest
+  1-1.5                  38%        -3.9 bp
+  1.5-2                  45%        -2.8 bp
+  2-3                    54%        +0.5 bp
+  3+ (22 min, 4 days)    64%        +6.8 bp
+```
+
+Owner's instinct was to block the middle and allow the extremes. **Split-half killed it:** SPY's 2+
+bucket is -3.4 bp in the first 13 sessions and +4.4 bp in the last 13, and IWM's 2-3 bucket is
+-10.4 bp. A band rule would have been fitted to one half of one instrument.
+
+The reconciliation between "the tape says the gate is justified" and "the replay says it costs money":
+**3-4 bp is about the whole breakeven margin** on one of these trades (BRAINSTORM cost budget, ~4 bp
+round trip). A drift that small is visible on a chart and invisible after the spread and the exits.
+
+**Changed (owner decision, 2026-09-23):** `vwap_max_stretch` -> `null` on strategies **3 and 4**
+(SPY); IWM 5/6 stay at 1.0. Written to PROD, read back, `_coerce_max_stretch(None)` verified to
+return None (a `0` would have blocked every entry), `test_vwap_stretch.py` passes. Stretch is still
+recorded on every entry because `use_vwap` stays on, so Friday's re-test loses nothing.
+
+### 4. The stop is set in the wrong unit
+
+Every real round trip, measured as how far the UNDERLYING moved to produce the exit:
+
+```
+  SPY  stops fire on 4.2-8.9 bp of stock movement   ~1.1-1.2 wiggles
+  IWM  stops fire on 6.7 bp                          ~0.4 wiggles     <- inside ordinary noise
+  09-14 SPY x3 @ $0.30: stopped 20 s later on a 3-cent move (0.4 bp)
+```
+
+A percentage-of-premium stop converts into a different stock-move tolerance for every contract. By
+entry premium, replayed: `$1-2` is the consistently worst bucket (-5.9%/trade on 9, -3.6% on 65),
+`$2-3` the best. Spread by premium level explains the floor: under $1 the spread is 2.2-3.5% and the
+15% stop is only 4-7 spreads wide; over $1 it is 0.3-0.6% and 26-57 spreads. **Practical threshold
+~$1.50-2.00 per contract on SPY — which is exactly where IWM's in-band contracts do not reach.**
+Not changed. Candidates: per-instrument stops, a minimum premium, or the structure stop (E14).
+
+### 5. Calls are the losing side — noted, not acted on
+
+```
+  SPY calls  12 trades  33% win  -$75        IWM calls  1  +$3
+  SPY puts   25 trades  72% win  +$632       IWM puts   2  -$93
+  by week, calls: +70 / -65 / +1 / -78       puts: +96 / +42 / +216 / +185
+```
+
+Ruled out: market direction (SPY rose in 8 of the last 15 entry windows, mean +$0.18) and
+down-moves-are-faster (falling mornings moved 5% SLOWER per minute). Shuffling wins between the two
+strategies produces a gap this large 3.5% of the time — suggestive, but n=37 and we ran many
+comparisons this week. Calls die faster: mean hold 4.5 min against 9.0 for puts. **Revisit at E11's
+~62 closed trips (~Oct 2); do not turn calls off on 12 trades.**
+
+### 6. Trade review chart — plan plus phases 1-3 built
+
+`docs/trade-review-chart-plan.md`. The position chart dialog is unreadable for a 0DTE option because
+Tradier serves **daily** bars for a contract (one candle for its whole life) and no intraday at all,
+while underlying mode fits 390 bars and labels the option's price on a $770 axis. Switching chart
+libraries fixes nothing — lightweight-charts **is** TradingView's library; the missing thing is data.
+We already record it: every quote tick of the armed contract, in `stream-*.jsonl`.
+
+- **`scripts/build_trade_replays.py`** (new, read-only) → `data/trade_replays/position-<id>.json`.
+  26 positions, 37 s, ~90 KB each.
+- **`GET /api/v1/trades/replay?symbol=&opened_at=`** (new) — registered BEFORE `/{trade_id}` or the
+  int path parameter swallows it. Own-data only. 404 when a session was not recorded, which the UI
+  falls back from silently.
+- **`TradeReviewDialogComponent`** — contract bid per second and the underlying's 1-minute candles in
+  linked panes (**linked by time, not bar index**: one is per-second, the other per-minute), stop /
+  trail-arm / target lines, bid-vs-mid and trade-vs-session toggles, full-window expand, plus the
+  engine-context and trade-facts panels. Falls back to the old dialog on 404.
+
+**Two bugs the validation caught, both mine:**
+
+1. VWAP/wiggle rebuilt "correctly" did not match the engine. The engine samples once a second and
+   weights by `tick_volume` — the size of the most recent single print
+   (`stream_driven_worker.SymbolState.apply`) — not volume since the last tick. Cumulative-volume
+   weighting ran **38% wide** on the wiggle, minute HL2 bars 14% wide. Mirroring the sampling brought
+   it to **$0.036 on VWAP and 0.04 wiggles on stretch** against 38 of the engine's own logged lines.
+2. The recomputed volume ratio read the **in-progress** minute, reporting 0.35 for an entry the 1.5x
+   gate had just passed. `_last_bar_volume` reads the last COMPLETED minute. Fixed; every extracted
+   entry now shows 1.6x-2.3x.
+
+### 7. Also this session
+
+- **`docs/starting-the-app.md`** — every way to start both apps, after confirming the `--env` /
+  `--log` / `--no-reload` / `--port` flags. README's daily section now points at it (it still said to
+  start three Docker databases; dev and prod are on RDS). The July runbook is marked superseded.
+- **1-minute files topped up**: SPY 26 -> 30 sessions, IWM 14 -> 18, both through 09-23. Tradier now
+  serves only from 09-03, so 16 SPY sessions on disk are the only copy in existence.
+- **`data/` added to `.gitignore`** — it was untracked but never ignored.
+- **Logging gap found:** `orders-*.jsonl` records buys only; no sell has been written since at least
+  09-14. The sells themselves are fine (broker-confirmed, `trades.exit_price` correct). Affects the
+  replay builder, which reads fills from the database instead.
+- The app has been running since 09-20 22:30 PT **without `--no-reload`**; editing `routers/trades.py`
+  hot-reloaded it at 22:52 PT with nothing open. It came back with all four strategies loaded.
+
+### 8. Open
+
+1. Look at the new chart on the PC (owner, Thursday morning).
+2. Friday 09-25 re-test with the topped-up files: IWM's gate at 1.0, SPY's gate off, stretch sweep.
+3. IWM's delta band vs $1 strike spacing — the reason it has not traded since Monday.
+4. Stop unit: per-instrument, minimum premium, or structure stop.
+5. Calls vs puts at ~62 trades (~Oct 2). Fees (I6) first, or that read runs on inflated P&L.
+6. Carried: H4 broker-side stop, deep-ITM study, SPY `max_contracts: 3`, E7, architecture diagram.
+
+---
+
+## Session Date: September 24, 2026 — Thursday: four SPY puts for +$47, and a Position row that holds three trades
+
+First full session with `vwap_max_stretch` off on SPY. All times ET.
+
+### 1. +$47 on four round trips, all strategy 4 (SPY puts)
+
+```
+  10:43  SPY 767 put  2.08 -> 2.13   +$5   trailing stop, 3 min
+  10:51  SPY 767 put  2.20 -> 2.66  +$46   trailing stop, 11 min
+  11:06  SPY 767 put  2.97 -> 3.31  +$34   trailing stop, 10 min
+  11:17  SPY 766 put  2.43 -> 2.05  -$38   stop loss, 7 min
+```
+
+**Four trades is the most in one session so far**, and the gate change is visible: **zero** `Not chasing`
+lines for SPY all day against 57 for IWM, which still runs the gate at 1.0. Three of the four were
+re-entries into the same 767 put after the previous one closed. Calls never fired — SPY fell all
+morning. Week: Mon +$3, Tue +$8, Wed +$96, Thu +$47 = **+$154**.
+
+Recomputed stretch at entry: 0.01, 0.24, 1.61, 1.54. **Two of the four would have been blocked** by
+the old 1.0 gate — they made +$34 and -$38 between them, so on the day the change was roughly a wash.
+
+### 2. Shadow exits favoured letting winners run — first live evidence either way
+
+```
+  day total    real +$47 | keep70 +$69 | keep50 +$41 | vol_trail +$64 | dyn_tp_trail +$68
+```
+
+Three of the four alternatives beat the live rule today (keep50 did not, +$41), mostly on trades 1 and 3 where the trail sold early
+($5 against $21, $34 against $65). Against `docs/dynamic-exits-math.md` §7, where **no** profit-side
+rule beat live across the 28-trade replay, this is one day pointing the other way — which is exactly
+the evidence E14 was set up to collect. Not a reason to change anything yet.
+
+### 3. IWM: fourth session without a tradable contract
+
+`88 calls scanned: 87 wrong delta (need 0.6-0.85)`. Unchanged since 09-21, and consistent with
+yesterday's finding: $1 strikes on a $285 underlying step delta straight over the band.
+
+### 4. A Position row is REUSED across re-entries — found while building the replays
+
+Position 27 holds **three** round trips on SPY260924P00767000 (trades 81-86). Its `opened_at` is
+15:06 UTC, the *last* of the three, and its `peak_price` / `trough_price` (3.90 / 2.81) span all
+three trades rather than any one of them.
+
+Consequences, and what was changed:
+
+- `scripts/build_trade_replays.py` keyed files by position id, so it wrote **one** replay for the
+  three trades and labelled it with the first buy. Now it pairs each buy with the next sell on the
+  same position and writes `trade-<buy id>.json` per round trip. 44 replays across 09-02..09-24.
+- MFE/MAE now come from the **sell trade row**, which is per round trip. The position's peak/trough
+  are deliberately unused for that reason.
+- `GET /trades/replay` resolves the BUY TRADE nearest `opened_at`, not the position. Verified: the
+  three 767-put entries resolve to trades 81 / 83 / 85 with entries $2.08 / $2.20 / $2.97.
+
+**Worth knowing beyond this feature:** any analysis that treats `Position` as one round trip is
+wrong whenever the engine re-entered the same contract, and `peak_price` / `trough_price` on that row
+are not per-trade figures. Nothing in the engine reads them for exits (`check_exit_signal` takes
+`current_high`/`current_low` from the executor's own tracking), so this is a reporting hazard, not a
+trading one — but `scripts/` and any future dashboard need to know.
+
+### 5. Housekeeping
+
+- 1-minute files topped up through 09-24: SPY 31 sessions, **IWM 19** (20 after Friday — the number
+  the G4b re-test wants).
+- Trade replays rebuilt; today's four trades included.
+- The app still runs without `--no-reload`; editing `routers/trades.py` hot-reloaded it again, after
+  the close, with nothing open.
+
+### 6. Open
+
+1. Owner to look at the trade review chart (Friday morning).
+2. Friday 09-25: the re-test — stretch sweep on both instruments, IWM entry rule at 20 sessions.
+3. IWM decision after that: recalibrate as a package (stop ~30-35% + wider delta band) or drop it.
+4. Still uncommitted: everything from 09-20 onward.
+
+---
+
+## Session Date: September 24-25, 2026 (evening) — The chart, finally seen, and the mobile scroll trap
+
+UI and tooling only. **No engine changes: `git status api/engine/` is empty.** Settings untouched,
+strategies untouched, exits untouched.
+
+### 1. Browser tooling — worth the detour, and here is why it failed
+
+Claude Code can drive Chrome, which means UI work can be *looked at* rather than reasoned about.
+Getting there took four wrong turns, all worth recording:
+
+1. Zen is Firefox-based, so the Chrome extension cannot be installed in it. Chrome installed
+   alongside; Zen stays the daily browser.
+2. Restarting the terminal session is not enough — Claude Code must be launched as `claude --chrome`.
+3. On Linux, `~/.config/google-chrome/NativeMessagingHosts/com.anthropic.claude_code_browser_extension.json`
+   is written when `--chrome` first runs, and **Chrome only reads it at startup**. Timestamps told
+   the story: Chrome up at 22:17, extension at 22:19, host file at 22:25.
+4. The actual blocker was **site access**. Chrome defaults extensions to "on click", so JavaScript
+   execution worked while every injection-based tool (screenshot, read_page, find) timed out on
+   *every* site including example.com. Granting site access fixed it immediately.
+
+Diagnosis order that would have been faster: test a second site first. It separates "our app" from
+"the tooling" in one call.
+
+### 2. The trade review chart works — and three bugs only a render could show
+
+Opened Performance, clicked the 2026-09-23 772 put, and read the dialog back: contract pane, SPY
+pane, engine-context panel, trade panel, all populated. Levels checked by hand against the entry:
+stop $2.13, trail arms $2.89, target $3.14 on a $2.51 entry. Correct.
+
+- **The zoom was clamped and the entry marker fell off the left edge.** Not the two-way sync, which
+  was the first guess. A runtime probe printed `asked 10:53-12:03, got 11:19-11:43` against data
+  spanning 10:53-11:43. Cause: lightweight-charts enforces a **minimum bar spacing** of 0.5px, and
+  1,330 quote points in a 501px pane need 0.38px each, so it refused to zoom out and kept the last
+  ~1,000 points. `minBarSpacing: 0.02` fixes it; the measurement is in the comment.
+- **Markers could land between data points.** Entry and exit times come from the fill, not the tape.
+  They now snap to the nearest recorded quote.
+- **The exit marker was invisible**: a profit-green arrow drawn on a profit-green line. It is now the
+  foreground colour at double size, with no label — the exit is the last point on the series, so any
+  text is centred on the right edge and clipped (whitespace padding does not help; `setVisibleRange`
+  pins the window to the last *valued* point, and `rightOffset` is ignored once it does). The exit
+  reads in the pane header instead: `CONTRACT · BID  buy $2.51 → sell $3.02 at 11:43:29 ET`.
+
+### 3. The iPhone scroll trap — the owner's description was the diagnosis
+
+"The left side menu scrolls, the details on the right get stuck." That is two scrollers: the drawer,
+and `mat-sidenav-content` holding 3,287px inside a fixed-height shell. **An inner scroller inside a
+fixed-height ancestor is what stalls on iOS** — the drawer keeps working, the content stops part-way
+and will not come back.
+
+First pass fixed real problems but not that one:
+
+- `.header-actions` (shared) and `.calendar-nav` measured 395px and 339px inside a 282px column, so
+  the page scrolled **sideways as well as down** — and a two-axis scroller makes touch lock to the
+  wrong axis. Both wrap now; the container's scroll width equals its client width, measured.
+- The closed-trades table (1,237px wide, `min-width: 1000px`) carries `touch-action: pan-x` so a
+  near-vertical drag over it belongs to the page, plus `overscroll-behavior-x: contain`.
+- `height: 100vh` on the shell is the **large** viewport on iOS — the height the page would have with
+  the address bar hidden — so the shell ran under Safari's chrome. Now `100dvh`, `vh` kept as
+  fallback. Same fix on the settings drawer.
+
+The fix that actually addresses it: **below 900px the drawer overlays and the document scrolls.**
+Drawer `mode="over"`, closed by default, opens on the hamburger, closes on navigation; the shell
+drops its fixed height so there is no inner scroller at all. Measured at 430px: document scrolls
+(4,426px in 713px), inner scroller gone, content width 490px instead of 282px. Desktop unchanged —
+`side` mode, drawer open, content scroller as before.
+
+**Not verified on the device.** Chrome does not reproduce iOS's viewport behaviour; the owner
+retests on the phone.
+
+### 4. State for Friday
+
+- Engine untouched. SPY 3/4: chase gate off, ×3, 11:30 cutoff. IWM 5/6: gate 1.0, ×1.
+- App up since 09-20 22:30 PT, **still without `--no-reload`** — it has hot-reloaded on every `.py`
+  edit this week, each time after the close with nothing open.
+- Memory: 4.9 GB of 15 GB used, 10 GB available; engine worker 166 MB. Disk 157 GB free, `logs/`
+  1.9 GB, `data/` 22 MB. Two stream reconnects today, self-healing, no other errors.
+
+### 5. Open
+
+1. Retest scrolling on the iPhone.
+2. Friday 09-25: the re-test, with IWM at 20 sessions once the files are topped up after the close.
+3. Restart with `--no-reload` before the open — also gives Friday its own log folder.
+4. Still uncommitted: everything since 09-20.

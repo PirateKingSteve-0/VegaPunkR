@@ -1,5 +1,10 @@
 # Monday Live Test — Runbook (2026-07-13)
 
+> **Superseded for day-to-day startup (2026-09-20):** see [`starting-the-app.md`](starting-the-app.md).
+> `api/app.py` now takes `--env` / `--log` / `--no-reload` / `--port`. The env-var commands below
+> still work (`APP_ENV=prod LIVE_TEST_LOGGING=1` = `--env prod --log`). Kept as the record of the
+> July live test.
+
 Living doc — edit freely. Goal: one controlled live SPY round-trip (tiny size, heavy logging) to
 settle which P&L number is real and prove the order→fill→ledger path works live.
 

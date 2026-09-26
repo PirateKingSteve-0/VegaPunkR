@@ -8,6 +8,40 @@ once something becomes work, it moves to `TODO.md` and this keeps only the decis
 
 ---
 
+## Where to host it — home server or AWS? *(2026-09-24 — leaning, not decided)*
+
+**Leaning: a small EC2 instance in us-west-1, under systemd, logs backed up to S3.** Not decided;
+nothing scheduled. Related: TODO J1 (auto-restart), J2 (tick storage), H4 (broker-side stop), F2
+(mode switch needs a restart), F3 (DB latency).
+
+The first win is getting off the laptop, wherever it goes: it sleeps, and it had a USB-controller
+crash during a live session.
+
+| | Always-on box at home | EC2, us-west-1 |
+|---|---|---|
+| Cost | ~$150–300 mini PC + ~$60 UPS, one-time | ~$10–20/month |
+| Outages | home power and ISP | rare |
+| DB round trip | over the internet to RDS | same region as RDS |
+| Remote UI access | Tailscale (no router ports opened) | Tailscale, or a locked-down public URL |
+| Tick recordings | local disk | EBS + S3 |
+
+**What tips it to AWS: the database already lives there.** F3 measured the per-tick `Position` read
+at ~23 ms, all of it network round trip to us-west-1. A home box keeps paying that; an instance in
+the same region mostly doesn't.
+
+**The trade-review charts need no redesign to move.** `/trades/replay` serves pre-built JSON from
+`data/trade_replays/`, and `scripts/build_trade_replays.py` builds it offline from
+`logs/livetest-*/stream-*.jsonl`. On a server, the engine writes logs to the server's disk, and the
+build script runs there as a nightly job. Nothing is recomputed per request.
+
+**Must happen before the move, not after:**
+- F2: the "restart the engine" banner assumes the browser and engine share a machine.
+- J1: a service manager, not a terminal.
+- H4: a hosted engine can still die. Only a stop resting at the broker protects an open position
+  while it's down.
+
+---
+
 ## Deeper than the band made the money? *(2026-09-18 — hypothesis, from TODO G5's audit)*
 
 **Decision: do not cap the deep side of the delta band until this is understood.** Found while proving

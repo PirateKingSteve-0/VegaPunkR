@@ -6,7 +6,7 @@ Items are grouped into work-streams so related changes can be tackled together. 
 
 | Section | What it holds |
 |---|---|
-| **A–I** | Open work only. A struck-through heading here means the item is *mostly* done and the remaining part is named in the heading. |
+| **A–J** | Open work only. A struck-through heading here means the item is *mostly* done and the remaining part is named in the heading. |
 | **FUTURE CONSIDERATIONS** | Not scheduled. Things to promote into A–I when a trigger fires. |
 | **RESOLVED** | Fixed items whose write-up carries an argument worth keeping — the reasoning behind a change, and in several places a "this was measured, do not undo it" note. Item numbers are unchanged, so `E1`, `D3` etc. still resolve. |
 | **DONE** | One-line summaries of everything else that shipped. |
@@ -1834,8 +1834,9 @@ researched on SPY only:
       on normal days IWM may sit unarmed under 3,000. Record how often before touching the floor (E7).
 - [ ] **Cash contention.** Four strategies now share ~3 fundable entries a day of settled cash;
       whichever signals first gets it. Check whether SPY entries go unfunded because of IWM.
-      *09-18: first instance, but via the **daily loss cap**, not cash — IWM's −$93 tripped the 5% cap at
-      10:41:12 ET, 30 s before SPY's first eligible put (which then fell ~30%, so the cap likely helped).*
+      *09-18: first instance, but via the **daily loss cap**, not cash — IWM's −$93 passed the 5% cap at
+      10:39:14 ET; SPY's first eligible put (10:41:11) was the first entry refused. Replay of all refused
+      entries: roughly break-even (JOURNAL 2026-09-18 §2b) — the cap neither saved nor cost much.*
 - [x] **×3 sizing.** *(2026-09-18)* The ~$2.80 premium assumption was wrong — IWM in-band contracts ran
       ~$1.15, so ordinary entries were bought ×3. First day: two puts stopped out in 2-3 min, **−$93**
       (×1 would have been −$31). Owner set **`max_contracts` 3 -> 1 on strategies 5/6** (PROD, read back;
@@ -1911,6 +1912,9 @@ has gone silent. Tradier supports `stop` / `stop_limit` on option orders
 **Cheaper alternative worth weighing first:** a watchdog outside the engine process that alerts (or
 flattens via the normal exit path) when heartbeats stop while a `Position` row is open. It does not
 help if the whole machine is down, which is the case the broker-side stop exists for.
+
+Auto-restart (J1, 2026-09-24) shortens an outage but does not replace this — it cannot help when
+the machine itself is down or the process is hung.
 
 Not started. Engine change — needs sign-off and a design pass before any code.
 
@@ -2108,6 +2112,66 @@ change on the fill path.
 
 ---
 
+## J. Operations & hosting *(2026-09-24)*
+
+How the process is kept alive and where its recordings live. Hosting itself is still a decision,
+not work — see `BRAINSTORM.md`, "Where to host it". Nothing here touches `api/engine/`.
+
+### J1. Auto-restart the backend on crash (systemd unit)
+
+Today the backend is started by hand in a terminal (`api/app.py --env prod --log --no-reload`,
+`docs/starting-the-app.md`). If it exits, it stays down until someone notices. A systemd service
+restarts it automatically and starts it at boot:
+
+```ini
+[Service]
+WorkingDirectory=/home/gorillapops/Github/VegaPunkR
+ExecStart=/home/gorillapops/Github/VegaPunkR/venv/bin/python api/app.py --env prod --log --no-reload
+Restart=always
+RestartSec=5
+```
+
+Plus `StartLimitBurst` / `StartLimitIntervalSec` so a crash loop stops instead of spinning, and an
+email on restart (`OnFailure=` unit, or a startup notice from the app). `--no-reload` is mandatory
+under systemd — reload hot-swaps engine code under an open position.
+
+**What it does NOT cover** — the reason H4 stays the top live risk:
+- the laptop sleeping, losing power or network, or the USB-controller crash seen on a live day;
+- a *hung* process — alive, so systemd sees nothing wrong, but the stream is wedged. Needs a
+  heartbeat (systemd `WatchdogSec=` with `sd_notify`, or the external watchdog H4 describes).
+
+**Verify before relying on it:**
+1. After a restart with a `Position` row open, the worker re-arms that strategy and exit checks
+   (SL/TP/trailing/time exit) resume on the open contract. Startup reloads active strategies
+   (`app.py` lifespan → `worker.start()`); resumption of *exit management* is not yet confirmed.
+2. `_pending_buy_reservations` is in-memory and is empty after a restart — the reconciliation
+   sketch in FUTURE CONSIDERATIONS (restart-safe reservation ledger) is the fix if that matters.
+
+Small, no engine code. Do it before, and independent of, the hosting move.
+
+### J2. Tick recordings grow ~400 MB per trading day — compress and back up
+
+Measured 2026-09-24: `logs/` is 1.9 GB; `livetest-*` dirs run 230–400 MB per session (09-21:
+408 MB), almost all of it `stream-*.jsonl`. It scales roughly linearly with the number of symbols
+subscribed (G6 added IWM). 157 GB free on the laptop → ~1.5 years at today's rate, less with more
+symbols. **This is disk, not RAM** (11 GB of 15 GB available on the same date).
+
+The files compress ~16× (a 50 MB slice of the 09-23 stream gzipped to 3.2 MB): ~25 MB/day,
+~6 GB/yr.
+
+1. **Nightly compress finished sessions** — `stream-*.jsonl` → `.jsonl.gz`, never today's
+   directory (the engine is appending to it). Readers must accept `.gz`:
+   `scripts/build_trade_replays.py`, `replay_session.py`, `distance_trades.py`,
+   `dynamic_exits_review.py`, `measure_engine_wiggle.py`, `chart_dynamic_exits.py` (hard-coded
+   path). Update readers first, then compress.
+2. **Off-machine backup.** The laptop is the only copy of every session since 2026-09-02, and C1
+   calls this data perishable. S3 in us-west-1 (same region as RDS) is under $1/month at 6 GB/yr.
+   An external SSD works as a second copy but is not needed for space.
+3. **Later, only if we want to query it:** convert each day to Parquet and query with DuckDB — SQL
+   over files, no server. **Not** raw ticks in Postgres/RDS: it grows fast and RDS bills by the GB.
+
+---
+
 # FUTURE CONSIDERATIONS
 
 - **THERE ARE NO BROKER-SIDE STOPS. If the engine dies holding a position, nothing protects it.** Every exit — stop loss, take profit, trailing stop, time exit — is *simulated in-engine* and issued as a market sell when our own logic decides to fire (`order_manager.py:425`, market orders hardcoded). **Nothing rests at Tradier.** If the process crashes, the host reboots, the WebSocket wedges, or the eval loop stalls while a 0DTE position is open, that position simply sits there unmanaged until someone notices. The `stop_loss_pct` you configure is a number the engine checks — not an order the broker holds.
@@ -2117,6 +2181,7 @@ change on the fill path.
     - **Do this before any meaningful live capital.** Everything else on this list is money-losing-slowly; this one is money-gone-in-one-event.
 
 - **Configurable server port + first-class multi-instance (per-environment) runs.** `api/app.py` hardcodes `uvicorn.run(..., port=8000)`, so a dev (`APP_ENV=dev`) and a live (`APP_ENV=prod`) instance can't run at the same time — they collide on port 8000. Make the port env-driven (`PORT`, default 8000) so both can run side by side (e.g. dev on 8000, live on 8001), each with its own engine worker / Tradier stream / email scheduler and each pinned to its launch `APP_ENV`. This is the safe model — trading is pinned to the process env, not the UI toggle (the toggle only reroutes *reads*; see JOURNAL.md 2026-07-10/11 and `docs/monday-runbook.md`). Follow-ups: the Angular `apiUrl` is fixed per build, so driving two backends means pointing the UI at the target instance's port (or running two UIs / adding an instance picker); optionally add a `scripts/` launcher ("start-dev", "start-live"). Low risk — two lines in `app.py`.
+  *2026-09-20: half done. `api/app.py --port` exists (JOURNAL 2026-09-05 §2), so two backends can run side by side. Still open: the UI builds its API URL as `<page host>:8000` (`ui/src/environments/environment.ts`), so only the backend on 8000 is reachable from the UI. See `docs/starting-the-app.md` §3.*
 
 - **~~Daily-profit cutoff (positive-P&L halt for the day).~~ PROMOTED — this is now D2.** The sketch that lived here (mirror `_check_user_daily_loss_limit` on the upside, block `side='buy'` only, `_check_user_daily_profit_target`, a `User.daily_profit_limit_pct` column + migration, a `PROFIT_HALTED` session status, and the open equity-vs-risked-capital threshold question) is carried in full by **D2**, which now also has live data to size it against and a stated reason for sitting behind G2. Kept as a pointer so the cross-reference from older notes still lands somewhere.
 
