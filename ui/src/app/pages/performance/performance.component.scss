@@ -140,6 +140,8 @@
     .calendar-nav {
       display: flex;
       align-items: center;
+      flex-wrap: wrap;
+      row-gap: var(--sp-1);
       gap: var(--sp-1);
 
       .calendar-month-label {
@@ -395,4 +397,15 @@
       color: var(--color-loss);
     }
   }
+}
+
+
+// The closed-trades table is 1,237px wide (min-width: 1000px) and over 2,000px
+// tall, so on a phone a finger almost always lands inside it. `pan-x` tells the
+// browser this box only handles sideways drags — vertical ones belong to the
+// page — which is what stops a near-vertical swipe being swallowed. Without it,
+// iOS claims the gesture for the horizontal scroller and the page sits still.
+.mat-mdc-card-content {
+  overscroll-behavior-x: contain;
+  touch-action: pan-x;
 }

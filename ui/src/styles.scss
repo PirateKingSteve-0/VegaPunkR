@@ -551,6 +551,12 @@ h3 {
     display: flex;
     align-items: center;
     gap: var(--sp-2);
+    // Wrap rather than widen the page. At 414px this row measured 395px inside a
+    // 282px column, which made the whole page scroll horizontally — and a page
+    // that scrolls both ways makes touch gestures lock to the wrong axis, which
+    // is what "scrolling gets stuck" on a phone actually is.
+    flex-wrap: wrap;
+    row-gap: var(--sp-2);
   }
 }
 
@@ -923,7 +929,9 @@ button:focus-visible,
 // Right-edge drawer styling for ProfileDialog opened via MatDialog.
 .settings-drawer-panel {
   height: 100vh !important;
+  height: 100dvh !important;
   max-height: 100vh !important;
+  max-height: 100dvh !important;
 
   .mat-mdc-dialog-container,
   .mdc-dialog__surface,

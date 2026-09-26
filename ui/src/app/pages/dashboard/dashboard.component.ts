@@ -57,6 +57,14 @@ export class DashboardComponent implements OnInit {
   currentUser$ = this.authService.currentUser$;
   isSidenavOpen = signal(true);
 
+  /** Phone-sized viewport. Drives BOTH the drawer mode and which element scrolls.
+   *  `side` mode keeps the drawer in the layout, which on a 414px screen leaves
+   *  ~214px for content and forces a second, nested scroller — and a nested
+   *  scroller inside a fixed-height shell is what stalls on iOS. */
+  isMobile = signal(
+    typeof window !== 'undefined' && window.matchMedia('(max-width: 900px)').matches,
+  );
+
   // Environment and trading mode settings
   environmentSettings = signal<EnvironmentSettings | null>(null);
   loading = signal(false);
@@ -90,6 +98,17 @@ export class DashboardComponent implements OnInit {
   }
 
   ngOnInit() {
+    if (typeof window !== 'undefined') {
+      const mq = window.matchMedia('(max-width: 900px)');
+      const apply = (matches: boolean) => {
+        this.isMobile.set(matches);
+        // The rail is permanent on a wide screen; on a phone opening it is a
+        // deliberate tap, and it closes again on navigation.
+        this.isSidenavOpen.set(!matches);
+      };
+      apply(mq.matches);
+      mq.addEventListener('change', (e) => apply(e.matches));
+    }
     this.loadEnvironmentSettings();
     // Seed the shared halt signal once for the whole shell — the toolbar
     // control needs it on every page, not just after Overview has loaded.

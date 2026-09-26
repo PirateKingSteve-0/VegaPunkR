@@ -62,12 +62,14 @@
     <!-- Sidenav -->
     <mat-sidenav
       #sidenav
-      mode="side"
+      [mode]="isMobile() ? 'over' : 'side'"
       [opened]="isSidenavOpen()"
+      (closedStart)="isSidenavOpen.set(false)"
       class="dashboard-sidenav">
       <mat-nav-list>
         @for (item of menuItems; track item.route) {
-          <a mat-list-item [routerLink]="item.route" routerLinkActive="active-link">
+          <a mat-list-item [routerLink]="item.route" routerLinkActive="active-link"
+             (click)="isMobile() && isSidenavOpen.set(false)">
             <mat-icon matListItemIcon>{{ item.icon }}</mat-icon>
             <span matListItemTitle>{{ item.label }}</span>
           </a>

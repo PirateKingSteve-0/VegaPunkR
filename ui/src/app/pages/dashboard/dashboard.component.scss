@@ -2,7 +2,13 @@
 // is the only thing competing for attention.
 
 .dashboard-container {
+  // 100vh on iOS Safari is the LARGE viewport — the height the page would have
+  // if the address bar were hidden — so the shell runs under the browser chrome
+  // and the inner scroller's top becomes unreachable once you have scrolled
+  // down. 100dvh tracks the visible height. The vh line stays first as the
+  // fallback for anything without dvh support.
   height: 100vh;
+  height: 100dvh;
   display: flex;
   flex-direction: column;
 }
@@ -279,6 +285,13 @@
 
 .dashboard-content {
   background-color: var(--surface-alt);
+
+  // This element, not the document, is what scrolls — the page body never grows
+  // past the viewport. Anything inside it that overflows sideways therefore makes
+  // the SCROLLER scroll both ways, and a two-axis scroller is where touch drags
+  // get captured by the wrong axis. Wide content (the trades table) carries its
+  // own horizontal scroller, so clipping here costs nothing.
+  overflow-x: hidden;
 }
 
 .content-wrapper {
@@ -398,4 +411,38 @@
    tooltip still carry the meaning. */
 @media (max-width: 800px) {
   .halt-toolbar-button .halt-toolbar-label { display: none; }
+}
+
+
+// -----------------------------------------------------------------------------
+// Phones: the document scrolls, not a box inside it
+// -----------------------------------------------------------------------------
+//
+// With the drawer overlaid rather than beside the content, the shell no longer
+// needs a fixed height — and it should not have one. A fixed-height shell forces
+// `mat-sidenav-content` to be the scroller, and an inner scroller inside a
+// fixed-height ancestor is what stalls on iOS: the drawer (its own scroller)
+// keeps working while the content stops responding part-way down. Letting the
+// document scroll hands the gesture back to Safari, which also gets the address
+// bar hiding and rubber-banding right for free.
+@media (max-width: 900px) {
+  .dashboard-container {
+    height: auto;
+    min-height: 100dvh;
+  }
+
+  .dashboard-sidenav-container {
+    height: auto;
+    min-height: calc(100dvh - 56px);
+    overflow: visible;
+  }
+
+  ::ng-deep .mat-drawer-content.mat-sidenav-content {
+    overflow: visible !important;
+    height: auto !important;
+  }
+
+  .content-wrapper {
+    padding: var(--sp-4) var(--sp-3);
+  }
 }
