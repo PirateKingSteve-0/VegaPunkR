@@ -18,6 +18,8 @@ import { MatProgressSpinnerModule } from '@angular/material/progress-spinner';
 import { MatDialog, MatDialogModule } from '@angular/material/dialog';
 import { MatTooltipModule } from '@angular/material/tooltip';
 import { PositionChartDialogComponent } from '../positions/position-chart-dialog/position-chart-dialog.component';
+import { TradeReviewDialogComponent } from '../positions/trade-review-dialog/trade-review-dialog.component';
+import { TradeReplayService } from '../../services/trade-replay.service';
 import { Subscription, forkJoin, of } from 'rxjs';
 import { catchError, distinctUntilChanged, skip } from 'rxjs/operators';
 import { BaseChartDirective } from 'ng2-charts';
@@ -107,6 +109,7 @@ export class PerformanceComponent implements OnInit, OnDestroy {
   private systemService = inject(SystemService);
   private dialog = inject(MatDialog);
   private themeService = inject(ThemeService);
+  private replays = inject(TradeReplayService);
   private settingsSub?: Subscription;
 
   @ViewChild(MatSort) sort?: MatSort;
@@ -660,19 +663,32 @@ export class PerformanceComponent implements OnInit, OnDestroy {
     open_time?: string,
     close_time?: string,
   ): void {
-    this.dialog.open(PositionChartDialogComponent, {
-      data: {
-        symbol: row.symbol,
-        avg_entry_price: entryPerShare,
-        date_acquired: row.open_date,
-        qty: row.quantity,
-        close_date: row.close_date,
-        exit_price: exitPerShare,
-        open_time,
-        close_time,
-      },
-      panelClass: 'position-chart-panel',
-      autoFocus: false,
+    // The recorded trade review first — see openChart in the positions page for
+    // why the fallback exists rather than an error.
+    this.replays.get(row.symbol, open_time || row.open_date).subscribe({
+      next: (replay) =>
+        this.dialog.open(TradeReviewDialogComponent, {
+          data: replay,
+          width: '1100px',
+          maxWidth: '96vw',
+          panelClass: 'trade-review-panel',
+          autoFocus: false,
+        }),
+      error: () =>
+        this.dialog.open(PositionChartDialogComponent, {
+          data: {
+            symbol: row.symbol,
+            avg_entry_price: entryPerShare,
+            date_acquired: row.open_date,
+            qty: row.quantity,
+            close_date: row.close_date,
+            exit_price: exitPerShare,
+            open_time,
+            close_time,
+          },
+          panelClass: 'position-chart-panel',
+          autoFocus: false,
+        }),
     });
   }
 

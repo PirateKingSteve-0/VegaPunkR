@@ -1,0 +1,166 @@
+<div class="trade-review" [class.expanded]="expanded()">
+  <div class="dialog-header">
+    <div class="title-row">
+      <h2 class="mono">{{ replay.contract.symbol }}</h2>
+      <span class="meta">
+        {{ etDate(replay.entry.t) }} · {{ replay.facts.strategy_name || 'strategy ' + replay.facts.strategy_id }}
+        · {{ replay.entry.qty }} contract{{ replay.entry.qty === 1 ? '' : 's' }}
+        @if (replay.partial) { · <span class="live-tag">still open</span> }
+      </span>
+    </div>
+
+    <div class="header-actions">
+      @if (replay.exit) {
+        <span class="pill" [class.pill-profit]="replay.exit.pnl >= 0" [class.pill-loss]="replay.exit.pnl < 0">
+          {{ replay.exit.pnl >= 0 ? '+' : '' }}{{ replay.exit.pnl | number:'1.2-2' }}
+          <span class="pill-sub">{{ contractPnlPct! >= 0 ? '+' : '' }}{{ contractPnlPct | number:'1.1-1' }}%</span>
+        </span>
+      }
+      <button mat-icon-button (click)="toggleExpanded()"
+              [matTooltip]="expanded() ? 'Back to window' : 'Expand to full window'"
+              [attr.aria-label]="expanded() ? 'Collapse' : 'Expand'">
+        <mat-icon>{{ expanded() ? 'close_fullscreen' : 'open_in_full' }}</mat-icon>
+      </button>
+      <button mat-icon-button (click)="dialogRef.close()" aria-label="Close">
+        <mat-icon>close</mat-icon>
+      </button>
+    </div>
+  </div>
+
+  <div class="controls">
+    <mat-button-toggle-group [value]="zoom()" (change)="setZoom($event.value)">
+      <mat-button-toggle value="trade" matTooltip="Twenty minutes either side of the trade">The trade</mat-button-toggle>
+      <mat-button-toggle value="session" matTooltip="09:30-16:00 ET">Whole session</mat-button-toggle>
+    </mat-button-toggle-group>
+
+    <mat-button-toggle-group [value]="series()" (change)="setSeries($event.value)">
+      <mat-button-toggle value="bid"
+        matTooltip="What a buyer will pay you — the price every exit rule reads">Bid</mat-button-toggle>
+      <mat-button-toggle value="mid"
+        matTooltip="Midpoint of bid and ask: smoother, but not a price anyone trades at">Mid</mat-button-toggle>
+    </mat-button-toggle-group>
+
+    <span class="source-note">
+      Recorded by the engine, {{ replay.contract.points.length | number }} quotes
+    </span>
+  </div>
+
+  <div class="quadrant">
+    <section class="panel chart-panel">
+      <div class="eyebrow">
+        contract · {{ series() }}
+        @if (replay.exit) {
+          <span class="pane-note">
+            buy ${{ replay.entry.price | number:'1.2-2' }} → sell ${{ replay.exit.price | number:'1.2-2' }}
+            at {{ etTime(replay.exit.t) }} ET
+          </span>
+        }
+      </div>
+      <div #contractPane class="pane"></div>
+    </section>
+
+    <section class="panel chart-panel">
+      <div class="eyebrow">{{ replay.underlying.symbol }} · 1-minute · vwap dotted</div>
+      <div #underlyingPane class="pane"></div>
+    </section>
+
+    <section class="panel info-panel">
+      <div class="eyebrow">what the engine saw at entry</div>
+      <dl>
+        <div class="row">
+          <dt>gates passed</dt>
+          <dd class="gates">
+            @for (g of replay.entry.gates; track g) { <span class="chip">{{ g }}</span> }
+            @if (!replay.entry.gates.length) { <span class="muted">not recorded</span> }
+          </dd>
+        </div>
+        <div class="row">
+          <dt>stretch from vwap</dt>
+          <dd>
+            @if (replay.entry.context.stretch != null) {
+              <span class="mono">{{ replay.entry.context.stretch | number:'1.2-2' }}</span> wiggles
+              <span class="muted">({{ replay.entry.context.above_vwap ? 'above' : 'below' }} vwap
+                {{ replay.entry.context.vwap | number:'1.2-2' }}, wiggle ${{ replay.entry.context.wiggle | number:'1.2-2' }})</span>
+            } @else { <span class="muted">—</span> }
+          </dd>
+        </div>
+        <div class="row">
+          <dt>volume ratio</dt>
+          <dd>
+            @if (replay.entry.context.volume_ratio != null) {
+              <span class="mono">{{ replay.entry.context.volume_ratio | number:'1.2-2' }}×</span>
+              <span class="muted">the prior 20 minutes</span>
+            } @else { <span class="muted">—</span> }
+          </dd>
+        </div>
+        <div class="row">
+          <dt>broker delta</dt>
+          <dd>
+            @if (replay.entry.context.broker_delta != null) {
+              <span class="mono">{{ replay.entry.context.broker_delta | number:'1.3-3' }}</span>
+              @if (replay.entry.context.broker_delta_age_min != null) {
+                <span class="muted">{{ replay.entry.context.broker_delta_age_min | number:'1.0-0' }} min old at entry</span>
+              }
+            } @else { <span class="muted">—</span> }
+          </dd>
+        </div>
+      </dl>
+      <p class="footnote">
+        Stretch and volume ratio are recomputed from the recorded ticks — the engine logs which gates
+        passed, not their values. They track the live numbers to about 0.04 wiggles.
+      </p>
+    </section>
+
+    <section class="panel info-panel">
+      <div class="eyebrow">trade</div>
+      <dl>
+        <div class="row">
+          <dt>entry</dt>
+          <dd>
+            <span class="mono">${{ replay.entry.price | number:'1.2-2' }}</span>
+            <span class="muted">{{ etTime(replay.entry.t) }} ET</span>
+          </dd>
+        </div>
+        <div class="row">
+          <dt>exit</dt>
+          <dd>
+            @if (replay.exit) {
+              <span class="mono">${{ replay.exit.price | number:'1.2-2' }}</span>
+              <span class="muted">{{ etTime(replay.exit.t) }} ET · held {{ holdLabel }}</span>
+            } @else { <span class="muted">still open</span> }
+          </dd>
+        </div>
+        <div class="row">
+          <dt>exit reason</dt>
+          <dd>{{ replay.exit?.reason || '—' }}</dd>
+        </div>
+        <div class="row">
+          <dt>best while held</dt>
+          <dd>
+            @if (replay.facts.mfe_price != null) {
+              <span class="mono">${{ replay.facts.mfe_price | number:'1.2-2' }}</span>
+              <span class="profit">{{ pctOf(replay.facts.mfe_price)! >= 0 ? '+' : '' }}{{ pctOf(replay.facts.mfe_price) | number:'1.1-1' }}%</span>
+            } @else { <span class="muted">—</span> }
+          </dd>
+        </div>
+        <div class="row">
+          <dt>worst while held</dt>
+          <dd>
+            @if (replay.facts.mae_price != null) {
+              <span class="mono">${{ replay.facts.mae_price | number:'1.2-2' }}</span>
+              <span class="loss">{{ pctOf(replay.facts.mae_price) | number:'1.1-1' }}%</span>
+            } @else { <span class="muted">—</span> }
+          </dd>
+        </div>
+        <div class="row">
+          <dt>levels</dt>
+          <dd class="levels">
+            @if (replay.contract.levels.stop != null) { <span class="chip loss-chip">stop ${{ replay.contract.levels.stop | number:'1.2-2' }}</span> }
+            @if (replay.contract.levels.trail_arms_at != null) { <span class="chip">trail arms ${{ replay.contract.levels.trail_arms_at | number:'1.2-2' }}</span> }
+            @if (replay.contract.levels.target != null) { <span class="chip profit-chip">target ${{ replay.contract.levels.target | number:'1.2-2' }}</span> }
+          </dd>
+        </div>
+      </dl>
+    </section>
+  </div>
+</div>

@@ -13,6 +13,8 @@ import { MatTooltipModule } from '@angular/material/tooltip';
 import { Subscription } from 'rxjs';
 import { environment } from '../../../environments/environment';
 import { PositionChartDialogComponent } from './position-chart-dialog/position-chart-dialog.component';
+import { TradeReviewDialogComponent } from './trade-review-dialog/trade-review-dialog.component';
+import { TradeReplayService } from '../../services/trade-replay.service';
 
 export interface DbPosition {
   symbol: string;
@@ -57,9 +59,33 @@ export class PositionsComponent implements OnInit, OnDestroy {
     private http: HttpClient,
     private dialog: MatDialog,
     private cdr: ChangeDetectorRef,
+    private replays: TradeReplayService,
   ) {}
 
+  /**
+   * Prefer the recorded trade review; fall back to the Tradier-backed chart.
+   *
+   * Tradier serves no intraday history for an option contract, so for a 0DTE
+   * position the old dialog can only draw a single daily candle. The review
+   * dialog uses the engine's own recording instead — but that exists only for
+   * sessions logged with --log and extracted by scripts/build_trade_replays.py,
+   * so a 404 is an ordinary outcome, not an error worth showing.
+   */
   openChart(p: DbPosition): void {
+    this.replays.get(p.symbol, p.date_acquired).subscribe({
+      next: (replay) =>
+        this.dialog.open(TradeReviewDialogComponent, {
+          data: replay,
+          width: '1100px',
+          maxWidth: '96vw',
+          panelClass: 'trade-review-panel',
+          autoFocus: false,
+        }),
+      error: () => this.openBasicChart(p),
+    });
+  }
+
+  private openBasicChart(p: DbPosition): void {
     this.dialog.open(PositionChartDialogComponent, {
       data: {
         symbol: p.symbol,

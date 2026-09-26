@@ -64,6 +64,86 @@ def get_trades(
     return trades
 
 
+@router.get("/replay")
+def get_trade_replay(
+    symbol: str = Query(..., description="Contract symbol (OCC) or underlying, as shown on the row"),
+    opened_at: Optional[datetime] = Query(None, description="When the position was opened; disambiguates repeats of the same strike"),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """One position's recorded price path, for the trade review chart.
+
+    REGISTERED BEFORE `/{trade_id}` ON PURPOSE. FastAPI matches routes in
+    declaration order, so a `/replay` declared after it would be swallowed by the
+    int path parameter and answered with a 422.
+
+    The rows the UI holds when the chart opens are broker-shaped — symbol, dates,
+    prices, no database id (`ClosedPosition` on the performance page, `DbPosition`
+    on the positions page) — so the lookup is by contract symbol plus, optionally,
+    the open time. `opened_at` matters when the same strike was traded twice in a
+    day, which has happened.
+
+    The payload itself is built offline by `scripts/build_trade_replays.py` from
+    the session recordings, because Tradier serves no intraday history for an
+    option contract. Missing file means that session was not recorded (before
+    2026-09-02, or the app ran without `--log`), which is a 404 the UI falls back
+    from rather than an error.
+
+    Read-only, own data only: no admin cross-user path, matching the rest of this
+    router.
+    """
+    import json
+    import os
+
+    symbol = (symbol or "").upper()
+
+    # Keyed on the BUY TRADE, not the position. A Position row is REUSED when the
+    # engine re-enters the same contract: position 27 on 2026-09-24 carried three
+    # round trips on SPY260924P00767000 (trades 81-86), and its opened_at names
+    # only the last of them. A position lookup would collapse the three into one
+    # and report the wrong entry price for two of them.
+    query = (
+        db.query(Trade)
+        .join(Position, Trade.position_id == Position.id)
+        .filter(
+            Trade.user_id == current_user.id,
+            Trade.side == "buy",
+            Trade.status == "executed",
+        )
+    )
+    if is_option_symbol(symbol):
+        query = query.filter(Position.option_symbol == symbol)
+    else:
+        query = query.filter(Position.symbol == symbol)
+
+    candidates = query.order_by(Trade.timestamp.desc()).all()
+    if not candidates:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"No trade found for {symbol}",
+        )
+
+    if opened_at is not None and len(candidates) > 1:
+        target = opened_at.replace(tzinfo=None)
+        buy = min(candidates, key=lambda t: abs((t.timestamp - target).total_seconds()))
+    else:
+        buy = candidates[0]
+
+    repo_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    path = os.path.join(repo_root, "data", "trade_replays", f"trade-{buy.id}.json")
+    if not os.path.exists(path):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=(
+                f"No recording for trade {buy.id}. Sessions are recorded only when the "
+                f"app runs with --log; run scripts/build_trade_replays.py to extract them."
+            ),
+        )
+
+    with open(path) as fh:
+        return json.load(fh)
+
+
 @router.get("/{trade_id}", response_model=TradeResponse)
 def get_trade(
     trade_id: int,
