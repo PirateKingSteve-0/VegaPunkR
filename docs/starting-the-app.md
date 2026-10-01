@@ -20,6 +20,14 @@ cd ui && npm start                  # → http://localhost:4200
 Before 10:00 ET (06:30 PT, when entries open), check the banner the backend prints says
 `DB environment : prod   <-- REAL MONEY DB`.
 
+**Don't trade paper and live on the same ET day** (since 2026-09-29). Sizing and the loss caps use
+the account's start-of-day value, which subtracts today's P&L, and trades don't record which mode
+they were made in. Paper P&L would skew the live figures. See TODO D6.
+
+**If buys are refused with `Insufficient cash left` and the broker shows plenty of settled cash**,
+the engine's cash count is wrong (it only ever goes down during a day). Restarting the backend
+re-reads it from Tradier.
+
 ---
 
 ## 1. Backend — `api/app.py`

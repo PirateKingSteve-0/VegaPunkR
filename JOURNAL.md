@@ -12296,3 +12296,138 @@ retests on the phone.
 2. Friday 09-25: the re-test, with IWM at 20 sessions once the files are topped up after the close.
 3. Restart with `--no-reload` before the open — also gives Friday its own log folder.
 4. Still uncommitted: everything since 09-20.
+
+---
+
+## Session Date: September 25-29, 2026 — Two sessions, a weekend of "no edge found", and sizing that no longer reads the dashboard
+
+One long conversation across Friday → Tuesday 02:46 ET. All times ET. P&L recomputed from `Trade`
+fills (sell `exit_price` − buy `price`) and matched to the `pnl` column to the cent.
+
+### 1. Results
+
+```
+  Fri 09-25   −$81   4 trades   SPY put −$61 (stop) · SPY put +$49 (trail) · SPY put −$81 (stop) · IWM put +$12
+                                account daily loss cap tripped 11:02, blocked ~150 signals to 11:25
+  Mon 09-28   +$85   3 trades   SPY 770P $2.87→$5.34 +$247 (+5.7R, trail after peaking $6.07 = +111%)
+                                SPY 770P $6.30→$5.28 −$102 (re-bought 6 min later at 2.2× the price)
+                                SPY 766P ×2 $1.79→$1.49 −$60 (sized on a stale $1,757.84, see §6)
+  to date (48 round trips 09-02..09-25): +$433, 58% wins, avg win +1.10R / avg loss −1.05R, total +9.8R
+```
+
+Monday trade 1 is the best trade yet. Trades 2 and 3 were both bought after the move had happened,
+the same shape as Friday 10:06 (put bought 35¢ above a −$3.70 ten-minute flush).
+
+### 2. The weekend's research: every entry filter tested lands on noise
+
+All read-only, scripts in the session scratchpad (not committed). **Rules declared before looking;
+split-half + clustering by day.**
+
+| Question | Result |
+|---|---|
+| Are Fridays bad? | −$177 / 12 trades, but 38% chance by shuffle; Fridays not choppier (median morning efficiency 0.10, Mon/Tue 0.04–0.05). **Chance.** |
+| Risk/reward | ~6–7 bp of SPY (≈50¢) ≈ 1R either way; 5 winners with 14+ bp moves = +11.8R, more than the whole book. Big trend moves carry it. |
+| Breakeven stop after +5–12% | Flips between halves (+$164 / −$74). **Noise.** Corrects my earlier "~−7R recoverable" claim, which ignored winners that dip and recover. |
+| Exit shadow (20 trades) | Best rule keep70 +$52 vs real. **Noise.** |
+| SPY calls: higher delta? don't-chase? | Both point the wrong way on 12 trades; stale-delta (G5) contaminates logged delta. |
+| Calls vs puts on the tape (31 sessions, 10:00–11:30) | Both signals coin flips (−2.4 / −5.4 bp at +30m, ±4); no asymmetry. |
+| Order flow (8 sessions of timesale) | Confirmation / absorption / air pocket predict nothing. Buyers out-trade sellers every day (34–42% vs 28–37%), so push must be measured against the day's running average. "Diverging" passed 2 of 32 cells, added post hoc: untrusted. |
+| Don't-chase on Fridays | Would block −$15, allow −$162. All days: blocked trades **+$412** vs allowed +$21. Re-confirms removing it (09-23). |
+| Late entries: near the day's extreme (F2) | 2–3 bp worse, same sign both halves, **inside noise**; opposite on live trades (+0.61R). Watch. |
+| Late entries: big prior 10-min move (exhaustion) | **Backwards**: continued, 63% right. Rejected. |
+| Opening-range breakout re-test (31 sessions, one break per side per day) | 30-min range: +0.21 / +0.42 bp vs 3.2–4.1 bp break-even (4–6% chance it clears); 15-min range negative. **Rejected.** The early +3.69 bp came from 4 days and counting every minute beyond the range. |
+
+**The reframe:** on SPY at 15–30 min holds, signals are worth ~0–1 bp and a round trip costs
+~3–4 bp. The lever may be cost (limit orders, spread vs decay split) and selectivity (trend days:
+smoother half of 16 days +9.3R vs choppier +1.4R, correlation 0.13), not another entry gate. The
+sample (E11) is the bottleneck. Next pre-declared tests: failed breakout (S8), double bottom as
+context (F9), "last 10 min moved the other way" (F3, Friday 10:28).
+
+### 3. New files for continuity
+
+- **`HANDOFF.md`**: newest-first resume point for any chat or machine (last 5 entries, written on
+  "checkpoint"). CLAUDE.md (gitignored, laptop only) now says to read it at session start.
+- **`STRATEGIES.md`**: one line per live strategy, idea, filter and rejected idea (X1–X8), with
+  status words. CLAUDE.md says new ideas go there.
+- **TODO J** (auto-restart via systemd; tick recordings ~400 MB/day compress ~16× → compress + back
+  up) and **TODO K1** (chart-shape overlay + confirm/reject buttons for labelling).
+- **BRAINSTORM "Where to host it"**: leaning EC2 us-west-1 beside RDS (F3's 23 ms per tick read).
+- Pushed on 09-25: trade review chart, phone scrolling, docs (`cc435cc`, `ca1f8ca`, `b0173e6`),
+  then `5ce9e22` (HANDOFF) and `e4b9fae` (STRATEGIES).
+
+### 4. Log folders: 41 files held other days' data
+
+`live_test/logging_setup.py` chose `livetest-<ET-date>/` when a file was **opened** and appended
+forever, so any run across midnight wrote later sessions into the first day's folder (09-15 in
+`09-14/`, 09-22 in `09-21/`, Monday 09-28 in the Sunday `09-27/`, while orders/exit_shadow went to
+`09-28/`). **No data lost, no result wrong**: `build_trade_replays.py` and every analysis already go
+by `ts_et`; the daily email reads the DB. **Fixed:** every file rolls to the new day's folder at ET
+midnight (UTC midnight doesn't count), same file name so engine/stream still pair. Test
+`test_live_test_log_rollover.py`. `scripts/gate_review.py` gained `--date` and finds the most recent
+full session by content, not folder. Existing files left in place on purpose.
+
+### 5. Hygiene found along the way
+
+- The app ran all weekend as `python app.py --env prod --log` (no `--no-reload`), started Saturday
+  night; stopped by the owner before Tuesday.
+- Monday 23:29 / 23:40: two Tradier 502 stream drops, reconnected in ~11 s.
+- `max_positions: 0` → 1 or 3, `max_contracts: 0` → 1, `max_position_size_usd: 0` → no cap. Only
+  `max_position_size_usd: 1` really sizes to zero (record-only strategies idea, not built).
+- IWM chain returned only 0/1 deltas after ~11:00 on 09-25 (unexplained).
+
+### 6. Sizing on start-of-day value, capped by cash left (engine change)
+
+**Found:** Monday trade 3 sized 2 contracts ($358) on `user.account_size_usd = $1,757.84`, a figure
+only the dashboard writes (`routers/trading.py:40`), saved at 10:49 while a $576 put was open. Settled
+cash was $551 ($1,468 at the open, $1,062 unsettled from the morning's sells). **No GFV, no
+overspend**: the post-preview settled-cash gate did its job. The same stale field set every loss and
+drawdown cap, which is the likely cause of Friday's two "account-wide" caps ($73.76 / $77.53 in one
+second).
+
+**Owner's design, built tonight** (`docs/sizing-basis-design-2026-09-29.md`, mode B):
+- `engine/account_state.py`: per (user, **trading mode**), per ET day, **cash left** (settled cash at
+  the first read minus buy fills, never plus sells) and **start-of-day equity** (equity − today's
+  P&L). One broker call per account per day. The account stream carries no balances, so fill-driven
+  updates hook where the engine records a buy fill (stream or REST poll).
+- Sizing percentage and all six uses in `risk_manager` read start-of-day equity; the old field is
+  the fallback. `order_manager` caps a buy at what cash left pays for ($0.65/contract fee
+  allowance), before the preview. Sells never touched.
+- Monday under mode B: 1 / 1 / 2 contracts, unchanged. The gain is correctness, not size. Limits on
+  Monday would have been **16.5% tighter** ($1,468 vs $1,758 base).
+- **Mode A** (percentage of cash left: 1 / skipped / 1) kept as a future setting, TODO D6.
+
+**Four engine-guard passes, each found something real**, all fixed and tested:
+1. H1 paper/sandbox figures carried into live after a mid-day switch → keyed by mode. M1 cash
+   double-count / sticky-low → owner's "careful update" (adopt a lower broker figure only with no buy
+   in flight; > $5 drops need a second read). M2 start-of-day sanity band (±50% of equity, ≥ cash).
+   Fee allowance, price never from the underlying, warnings not debug.
+2. N1 a glitchy first read pinned all day → double-checked. N2/N3 account, client and `placed_at`
+   captured before `place_order` (the old unconfirmed meta stamped `placed_at` at the timeout, not
+   placement). N4 documented: **don't trade paper and live on the same ET day**.
+3. F1 the first-read re-check refused to rise after a gate-approved buy → a clean broker read now
+   replaces the count; F2 fill-during-read guard on every adoption.
+4. **Safe to run live.**
+
+Tests: `test_sizing_cash_left.py` 56 checks (Monday replay, sells untouched, reservations, mode
+switch, glitch/confirm paths, a real `execute_signal` against in-memory SQLite), suite 26 passed.
+**First live run is Tuesday.** Watch `Account state refreshed … cash left ~$1,550`. There is no
+on/off switch; if it misbehaves, stop and set the files aside. Owner call: modest net positive for
+safety and correctness, neutral for P&L.
+
+### 7. Working with the owner
+
+- Asked for a separate git worktree without being asked; removed. Memory: never create
+  worktrees or branches unasked.
+- Dialog-style choices (one question per decision, with a recommendation) worked well again.
+
+### 8. Open
+
+1. **Tuesday: first live run of mode B sizing.** Check the refresh line; watch for `Entry size
+   capped` / `Insufficient cash left`.
+2. Uncommitted: sizing change, logging fix + test, `gate_review.py`, TODO/STRATEGIES/startup-guide
+   notes, design doc, this entry. Owner said not yet.
+3. Research queue, all pre-declared: failed breakout, double-bottom context, "last 10 min the other
+   way", the spread-vs-decay cost split, and the order-flow re-run at ~20 sessions.
+4. Unexplained: IWM 0/1 deltas.
+5. Scratch analysis scripts live only in the session scratchpad; save to `scripts/` if they're
+   worth keeping.

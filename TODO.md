@@ -6,7 +6,7 @@ Items are grouped into work-streams so related changes can be tackled together. 
 
 | Section | What it holds |
 |---|---|
-| **A–J** | Open work only. A struck-through heading here means the item is *mostly* done and the remaining part is named in the heading. |
+| **A–K** | Open work only. A struck-through heading here means the item is *mostly* done and the remaining part is named in the heading. |
 | **FUTURE CONSIDERATIONS** | Not scheduled. Things to promote into A–I when a trigger fires. |
 | **RESOLVED** | Fixed items whose write-up carries an argument worth keeping — the reasoning behind a change, and in several places a "this was measured, do not undo it" note. Item numbers are unchanged, so `E1`, `D3` etc. still resolve. |
 | **DONE** | One-line summaries of everything else that shipped. |
@@ -509,6 +509,27 @@ buy 2 contracts today" would mean reconstructing a historical balance.
 is $61 today and $5,000 at $100k), whether `max_positions` should rise above 1, and whether bands
 apply per strategy or across the account — two strategies at 10% each is 20% deployed and nothing
 currently checks the total.
+
+**Found 2026-09-28 — sizing reads a stale, inflated account figure.** `calculate_position_size` sizes
+on `user.account_size_usd`, which is total equity (open positions included) written only when the UI
+calls `routers/trading.py:40`, never before a trade. Trade 101 (11:18 ET, SPY 766 put) sized on
+**$1,757.84** (snapshot taken at 10:49 while a put worth ~$576 was open; real equity at 11:18 was
+$1,613) × 50% → **2 contracts, $358**, when settled cash was **$551** (it started the day at $1,468;
+$1,062 was unsettled from the morning's two sells). Sized on settled cash it would have been **1**.
+**No GFV and no overspend:** the separate buy gate (`order_manager`, settled cash − reservations) did
+its job, and $358 < $551. The defect is that size does not shrink as the day spends settled cash, and
+depends on when the dashboard was last opened. Candidate fix (engine behaviour change, needs sign-off):
+size on `min(equity, settled cash − reservations)`, fetched at signal time. Decide alongside the bands.
+*2026-09-29: designed and approved (mode B): `docs/sizing-basis-design-2026-09-29.md`. Built the same
+night (`engine/account_state.py`), two engine-guard passes.*
+**Known limit (review N4, owner: note it, don't fix yet): don't trade paper and live on the same ET
+day.** `Trade` / `Position` carry no trading-mode column, so today's P&L can't be split by account.
+After a mid-day paper→live switch the live start-of-day value subtracts the paper P&L too (a paper
+loss of $800 would make a $2,000 live account size and cap as if it were $2,800). The proper fix is
+a `trading_mode` column on both tables: a migration on dev AND prod before `models.py` changes.
+**Future setting: sizing mode A.** Risk % of *cash left* instead of the start-of-day value, so sizes
+shrink as the day spends cash (Monday: 1 / skipped / 1 instead of 1 / 1 / 2). Owner wants it as an
+option one day: `sizing_basis: "day_start" | "cash_left"`, default `day_start`. Design doc §8.
 
 ---
 
@@ -2169,6 +2190,45 @@ The files compress ~16× (a 50 MB slice of the 09-23 stream gzipped to 3.2 MB): 
    An external SSD works as a second copy but is not needed for space.
 3. **Later, only if we want to query it:** convert each day to Parquet and query with DuckDB — SQL
    over files, no server. **Not** raw ticks in Postgres/RDS: it grows fast and RDS bills by the GB.
+
+---
+
+## K. Trade review & labelling *(2026-09-27)*
+
+Research tooling built on the trade review chart. Nothing here touches `api/engine/`.
+
+### K1. Chart-shape overlay on the trade review chart, with a "shape was real" confirm button
+
+**Why.** Every entry filter tested so far lands near a coin flip on 31-48 examples (`STRATEGIES.md`
+rejected list). Chart shapes are the next candidate (STRATEGIES F9: skip a put after a double bottom
+held). Friday 2026-09-25 is the motivating case: SPY hit 766.59 at 10:05 ET and 766.57 at 10:18 ET,
+held twice, and the engine bought a put at 10:28 ET for −$81. But an automatic shape detector will
+be wrong often, and nobody can tell how often without a human checking its calls. Confirmations turn
+into a labelled set: detector precision, and a clean sample of real shapes to test F9 on.
+
+**Shape of it:**
+1. **Detect offline, not live.** `scripts/build_trade_replays.py` adds swing highs/lows and candidate
+   shapes (double bottom/top within ~10¢, higher-lows / lower-highs runs) to each replay JSON.
+   Reuse the swing-point definition from `exit_shadow.py`'s structure stop (2 bars each side, pivot
+   confirmed once they close) so the chart and the shadow rule agree. No engine change.
+2. **Draw them** on the underlying panel of `trade-review-dialog`: marker at each swing, a band
+   linking a double bottom's two lows, a toggle to show or hide shapes. Theme tokens only (CLAUDE.md
+   UI Theming); pull colors from `ThemeService.chartColors()`.
+3. **Confirm / reject / unsure** buttons per detected shape, optional note. Store the label keyed by
+   (trade id, shape id, user id).
+
+**Decisions before building:**
+- **Storage:** a new table needs a migration on DEV *and* PROD before `models.py` changes (memory:
+  migrate before editing models; `reload=True` hits the shared DB instantly). A JSON file under
+  `data/` avoids that but is per-machine and gitignored.
+- **RBAC:** the label endpoint writes, so `Depends(require_can_write_own)`; hide the buttons for
+  `viewer` / `auditor` (`authService.currentUserValue?.role`). Labels are own-data only.
+- **Scope:** shapes on the underlying only (option prices are too noisy at 1 s), and only for the
+  window around each trade, not the whole session.
+
+**Payoff check:** once ~50 shapes are labelled, report detector precision (confirmed ÷ detected) and
+re-run F9 on confirmed shapes only. If precision is low, fix the detector before trusting any test
+built on it.
 
 ---
 

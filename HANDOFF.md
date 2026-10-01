@@ -18,6 +18,20 @@ Next:    <the one thing to start with>
 
 ---
 
+## 2026-09-29 Tue 02:57 ET · Lulusia (laptop) · dev
+State:   DIRTY, not committed (owner: "not yet"). App RUNNING since Mon 22:49 PT as `python app.py --env prod --log`,
+         **without --no-reload**: every .py save restarts the live engine. Last reload 02:45 ET, running the final
+         reviewed code. No open positions. Log folder now livetest-2026-09-29/ (rollover fix working).
+Open:    - Restart with `--no-reload` before 09:30 ET? (rec: yes; until then, nobody saves a .py under api/)
+         - Commit + push: sizing (account_state + order/risk/executor + test + design doc), logging fix + gate_review,
+           docs (TODO/STRATEGIES/startup guide/JOURNAL/HANDOFF). (rec: 3 commits, after Tuesday looks sane)
+Settled: - Sizing mode B built: size on start-of-day equity, cap buys at cash left; 4 engine-guard passes, last
+           "safe to run live"; 56 checks + suite green. Design: docs/sizing-basis-design-2026-09-29.md. Mode A = future setting.
+         - Don't trade paper and live the same ET day (no mode column on trades; TODO D6).
+         - Weekend research all noise, incl. ORB re-test (STRATEGIES X1–X8); see JOURNAL 09-25..29.
+Next:    Tuesday's first live run of mode B: check `Account state refreshed … cash left ~$1,550` in the engine log,
+         watch for `Entry size capped` / `Insufficient cash left`. If anything's off, stop and set the files aside.
+
 ## 2026-09-27 Sun 11:54 ET · Lulusia (laptop) · dev
 State:   clean, pushed at b0173e6. Engine not running. `data/trade_replays/` rebuilt through 09-25 (gitignored).
 Open:    - Write the 09-26/27 analyses (below) into JOURNAL + TODO? Not yet written anywhere but this chat. (rec: yes)

@@ -31,13 +31,13 @@ profit so far comes from the 11:30 cutoff, the exit geometry and luck. Sample: 4
 
 | # | Idea | What it is, plainly | Status | Where |
 |---|---|---|---|---|
-| S1 | Opening-range breakout | Mark the first 15/30 min high and low; trade the first break of it, once per side per day | tape-tested on **only 4 sessions**: 105 breaks, 59% right at +30 min, avg +3.69 bp. That's **under half the ~9.7 bp a trade needs** to beat its stop and costs, so not cleared for building. Worth re-running on the 31 sessions now recorded | TODO G4c, BRAINSTORM "Candidate entry signals" + "cost budget" |
 | S2 | Pullback continuation | After a push, enter when price turns back off the 9-min average, not merely while it's above it | idea | BRAINSTORM "Entry is a state, not an event" |
 | S3 | VWAP reclaim | Trade the moment price *crosses* VWAP, not the whole time it sits on one side | idea | same |
 | S4 | Prior-day levels | Yesterday's high/low/close and the pre-market range as places price stalls or breaks | idea (data already recorded) | TODO G4c |
 | S5 | Fade the flush | After a big fast drop (or rise), bet on the snap-back instead of the continuation | rejected for now: snap-backs of 13–23¢ vs a stop needing ~74¢. Re-check only for flushes over 2 typical moves | BRAINSTORM "VWAP distance" |
 | S6 | Expiration-day pinning | Near the close on big expiration Fridays, price drifts toward strikes with huge open interest | idea; needs the option-chain collector | TODO C1 |
 | S7 | Single-stock same-day options (TSLA etc.) | Same momentum rules on a stock with Mon/Wed/Fri expirations, same-day contracts only | idea. Record-only first (`max_position_size_usd: 1`); contracts may be too expensive for the account | chat 2026-09-25 (not yet in TODO) |
+| S8 | Failed breakout | Price breaks out of the opening range, then closes back inside within 5 min; trade toward the other side | **idea, rule declared 2026-09-27 before looking.** Hint: 15-min-range breakouts kept going only 42% at +30 min | X8 re-test, 2026-09-27 |
 
 ---
 
@@ -52,6 +52,7 @@ profit so far comes from the 11:30 cutoff, the exit geometry and luck. Sample: 4
 | F5 | SPY, QQQ and IWM agree | Trust a move more when all three move together | idea | chat 2026-09-26 |
 | F6 | Candle shape | Where the minute closed within its range, body size, rejection wick near VWAP | idea | chat 2026-09-25 |
 | F7 | `$TICK` breadth | Is the whole market pushing, or just SPY? Setting exists but nothing feeds it data | half-built | TODO G4 note |
+| F9 | Chart shapes as context (double bottom/top) | **Skip a put if the day's low was tested twice and held (within ~10¢) in the last 30 min**; mirror for calls. Shapes describe the day, not buy triggers. Friday 09-25 10:28 put was bought after exactly this. Swing points already detected by exit shadow's structure stop | **idea, rule declared 2026-09-27 before looking.** Test after the cost breakdown | chat 2026-09-27; TODO K1 (labelling UI) |
 | F8 | Order-flow divergence | Buyers push but price falls (or the reverse), so expect a snap back toward the push | 2 of 32 checks passed, category added after looking, **untrusted**. Re-run at ~20 sessions | 2026-09-26 |
 
 ---
@@ -67,3 +68,4 @@ profit so far comes from the 11:30 cutoff, the exit geometry and luck. Sample: 4
 | X5 | Exhaustion (skip after a big 10-min move) | Backwards: big moves continued slightly (63% right) | 2026-09-27 |
 | X6 | Breakeven stop after +5–12% | Flips between halves of the sample; noise | 2026-09-26 |
 | X7 | Block the middle, allow extreme stretch | Held in one half of one instrument only | 2026-09-23 |
+| X8 | Opening-range breakout (S1) | 31 days, each breakout counted once: kept going 53–58%, avg +0.2 to +0.4 bp vs 3.2–4.1 bp break-even (4–6% chance it clears it); 15-min range negative. The early +3.69 bp came from 4 days and from counting every minute beyond the range | 2026-09-27 |
