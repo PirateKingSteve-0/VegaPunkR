@@ -1,8 +1,15 @@
 #!/usr/bin/env python3
 """What did last night's two entry gates actually do today?
 
-    ./venv/bin/python scripts/gate_review.py                  # newest session
+    ./venv/bin/python scripts/gate_review.py                  # most recent full session
+    ./venv/bin/python scripts/gate_review.py --date 2026-09-22
     ./venv/bin/python scripts/gate_review.py --session logs/livetest-2026-09-16
+
+PICK BY --date, NOT BY FOLDER. Until 2026-09-29 a log file stayed in the folder of
+the day it was opened, so a run across midnight wrote the next session into the
+previous day's folder (09-22 lives in livetest-2026-09-21/, 09-28 in
+livetest-2026-09-27/). --date finds the files whose records cover that ET date,
+wherever they sit. --session still works and names every session it holds.
 
 WHY A RECONSTRUCTION RATHER THAN A REPLAY
 -----------------------------------------
@@ -44,6 +51,7 @@ from datetime import datetime, timedelta
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import replay_session as rs  # noqa: E402
+from build_trade_replays import _first_last_dates  # noqa: E402
 
 REPO = rs.REPO
 SELECT_RE = re.compile(
@@ -61,8 +69,8 @@ EXIT_CFG = dict(stop=15.0, target=25.0, trail_arm=15.0, trail_distance=10.0,
                 trail=True, exit_by_t=rs.parse_hhmm(ENTRY_END))
 
 
-def load_arming(engine_log):
-    """[(ts_et, symbol)] — what the worker armed, in order."""
+def load_arming(engine_log, day=None):
+    """[(ts_et, symbol)] — what the worker armed, in order (only on `day`, if given)."""
     out = []
     with open(engine_log, errors="ignore") as fh:
         for line in fh:
@@ -70,7 +78,9 @@ def load_arming(engine_log):
             if m:
                 # engine logs in host local (PT); ET is what every rule speaks.
                 ts = datetime.strptime(m.group(1), "%Y-%m-%d %H:%M:%S")
-                out.append((ts + rs.PT_TO_UTC + rs.ET_OFFSET, m.group("opt")))
+                ts_et = ts + rs.PT_TO_UTC + rs.ET_OFFSET
+                if day is None or ts_et.date().isoformat() == day:
+                    out.append((ts_et, m.group("opt")))
     return out
 
 
@@ -100,15 +110,48 @@ def ema_series(closes, period):
     return out
 
 
-def build(session_dir):
-    pairs = rs.find_pairs(session_dir)
-    if not pairs:
-        raise SystemExit("no engine/stream log pair in %s" % session_dir)
-    engine_log, stream = max(pairs, key=lambda p: os.path.getsize(p[1]))
-    bars_by_day = rs.spy_bars(stream)
-    day = max(bars_by_day, key=lambda d: len(bars_by_day[d]))
-    bars = bars_by_day[day]
-    return day, bars, rs.vwap_track(bars), rs.load_quotes(stream), load_arming(engine_log), engine_log
+FULL_SESSION_BARS = 300   # of 390; fewer means a partial recording, not a session
+
+
+def all_pairs():
+    """Every engine/stream pair in every folder, with the ET dates its stream spans."""
+    out = []
+    for d in sorted(glob.glob(os.path.join(REPO, "logs", "livetest-*"))):
+        for engine_log, stream in rs.find_pairs(d):
+            lo, hi = _first_last_dates(stream)
+            if lo and hi:
+                out.append((engine_log, stream, lo.isoformat(), hi.isoformat()))
+    return out
+
+
+def build(session_dir=None, date=None):
+    if session_dir:
+        pairs = [(e, s) for e, s in rs.find_pairs(session_dir)]
+        if not pairs:
+            raise SystemExit("no engine/stream log pair in %s" % session_dir)
+    else:
+        spans = all_pairs()
+        if date:
+            spans = [p for p in spans if p[2] <= date <= p[3]]
+        else:  # most recent first, stop at the first one holding a full session
+            spans.sort(key=lambda p: p[3], reverse=True)
+        pairs = [(e, s) for e, s, _, _ in spans]
+        if not pairs:
+            raise SystemExit("no recorded stream covers %s" % (date or "any date"))
+    if session_dir or date:  # several candidates: the biggest recording is the real session
+        pairs.sort(key=lambda p: os.path.getsize(p[1]), reverse=True)
+    for engine_log, stream in pairs:  # default: already most recent first
+        bars_by_day = rs.spy_bars(stream)
+        full = sorted(d for d, b in bars_by_day.items() if len(b) >= FULL_SESSION_BARS)
+        if session_dir and len(full) > 1 and not date:
+            print("NOTE: %s holds %d sessions (%s). Reviewing %s; pass --date for another."
+                  % (os.path.relpath(session_dir, REPO), len(full), ", ".join(full), full[-1]))
+        day = date or (full[-1] if full else None)
+        if day and day in bars_by_day:
+            bars = bars_by_day[day]
+            return (day, bars, rs.vwap_track(bars), rs.load_quotes(stream),
+                    load_arming(engine_log, day), engine_log)
+    raise SystemExit("no SPY session found for %s" % (date or session_dir or "the recent logs"))
 
 
 def minutes(day, bars, track):
@@ -218,10 +261,10 @@ def show(label, trades, blocked):
 
 def main():
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    p.add_argument("--session", help="logs/livetest-YYYY-MM-DD (default: newest)")
+    p.add_argument("--date", help="ET session date YYYY-MM-DD (default: most recent full session)")
+    p.add_argument("--session", help="a logs/livetest-* folder; may hold several sessions")
     a = p.parse_args()
-    d = a.session or max(glob.glob(os.path.join(REPO, "logs", "livetest-*")))
-    day, bars, track, quotes, arming, engine_log = build(d)
+    day, bars, track, quotes, arming, engine_log = build(a.session, a.date)
     rows = minutes(day, bars, track)
 
     print("=" * 100)
