@@ -9,6 +9,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy import func
 
 from models import User, Strategy, Position, Trade, RiskEvent
+from engine import account_state
 from config import TradingMode
 from notifications.discord import (
     notify_strategy_blocked,
@@ -234,6 +235,21 @@ class RiskManager:
 
         return {"blocked": False, "code": None, "reason": None}
 
+    @staticmethod
+    def _account_base(user: User) -> float:
+        """The account value that sizing and every loss / drawdown cap are a
+        percentage of: the START-OF-DAY value from engine/account_state, one
+        figure for every worker all day (docs/sizing-basis-design-2026-09-29.md).
+
+        Falls back to the stored `user.account_size_usd` (the old source, which
+        only the dashboard updates) only while today's value is unknown — before
+        the first refresh of the ET day, or when the broker can't be read.
+        """
+        v = account_state.day_start_equity(user.id, account_state.mode_of(user))
+        if v is not None and v > 0:
+            return v
+        return float(user.account_size_usd or 10000)
+
     def calculate_position_size(
         self,
         user: User,
@@ -258,7 +274,7 @@ class RiskManager:
             int: Number of contracts/shares to trade
         """
         # Get account size
-        account_size = float(user.account_size_usd or 10000)
+        account_size = self._account_base(user)
 
         # Get max trade percentage (default 2% if not set)
         max_trade_pct = float(user.max_trade_percentage or 2.0)
@@ -540,7 +556,7 @@ class RiskManager:
 
         today_pnl = float(realized) + float(unrealized)
 
-        account_size = float(user.account_size_usd or 10000)
+        account_size = self._account_base(user)
         daily_loss_limit = account_size * (daily_loss_limit_pct / 100.0)
 
         if today_pnl < -daily_loss_limit:
@@ -616,7 +632,7 @@ class RiskManager:
         ).scalar() or 0.0
 
         # Default daily loss limit: 5% of account size
-        account_size = float(user.account_size_usd or 10000)
+        account_size = self._account_base(user)
         daily_loss_limit_pct = strategy.params_json.get('daily_loss_limit_pct', 5.0)
         daily_loss_limit = account_size * (daily_loss_limit_pct / 100.0)
 
@@ -712,7 +728,7 @@ class RiskManager:
         # Zero whenever the strategy is at a new peak.
         current_drawdown = peak_pnl - cumulative_pnl
 
-        account_size = float(user.account_size_usd or 10000)
+        account_size = self._account_base(user)
         max_drawdown_limit = account_size * (max_drawdown_limit_pct / 100.0)
 
         # Defaults to True so any strategy that has not opted out keeps the
@@ -858,7 +874,7 @@ class RiskManager:
         unrealized = float(unrealized)
         today_pnl = realized + unrealized
 
-        account_size = float(user.account_size_usd or 10000)
+        account_size = self._account_base(user)
         daily_loss_limit_pct = float(user.daily_loss_limit_pct or 5.0)
         daily_loss_limit = account_size * (daily_loss_limit_pct / 100.0)
 
@@ -956,7 +972,7 @@ class RiskManager:
         ).scalar() or 0.0
 
         # Limits
-        account_size = float(user.account_size_usd or 10000)
+        account_size = self._account_base(user)
         daily_loss_limit_pct = strategy.params_json.get('daily_loss_limit_pct', 5.0)
         daily_loss_limit = account_size * (daily_loss_limit_pct / 100.0)
 

@@ -18,6 +18,7 @@ from engine.trading_client_manager import TradingClientManager
 from engine.signal_generator import Signal, resolve_direction
 from engine.signal_generator import _market_hours
 from engine.event_logger import log_event
+from engine import account_state
 from notifications.discord import notify_position_opened, notify_position_closed
 from utils.symbol_helpers import is_option_symbol, parse_occ_symbol
 
@@ -162,6 +163,15 @@ class OrderManager:
             cls._unconfirmed_block_logged.discard((user_id, strategy_id))
 
     @classmethod
+    def _buys_in_flight(cls, user_id: int) -> bool:
+        """Any buy of this user's still working: a cash reservation, or an order
+        placed but not yet confirmed. The post-fill cash check stands down while
+        one is, or it would count that order's broker-side hold twice."""
+        if cls._active_reservations_total(user_id) > 0:
+            return True
+        return any(uid == user_id and orders for (uid, _), orders in cls._unconfirmed_orders.items())
+
+    @classmethod
     def has_unconfirmed_orders(cls, user_id: int, strategy_id: int) -> bool:
         return bool(cls._unconfirmed_orders.get((user_id, strategy_id)))
 
@@ -253,6 +263,28 @@ class OrderManager:
         )
         self.db.add(trade)
         self.db.commit()
+
+        if meta.get("side") == "buy":
+            # The account the order was placed on, not whatever the user row says now.
+            mode = meta.get("mode") or account_state.mode_of(user)
+            sym = meta.get("option_symbol") or meta.get("symbol") or ""
+            mult = 100 if is_option_symbol(sym) else 1
+            try:
+                placed_at = datetime.fromisoformat(meta.get("placed_at"))
+            except (TypeError, ValueError):
+                placed_at = None
+            # Subtract only if today's cash figure was read BEFORE the order was
+            # placed. Read after, it may already include this fill; then leave the
+            # count and let the careful check reconcile it with the broker.
+            if placed_at and account_state.refreshed_before(user.id, mode, placed_at):
+                account_state.record_buy_fill(user.id, mode, filled_price * filled_qty * mult)
+            elif mode == account_state.mode_of(user):
+                # Only when still on that account: get_client() follows the CURRENT mode.
+                account_state.schedule_post_fill_check(
+                    user.id, mode, self.trading_client.get_client(user),
+                    lambda uid=user.id: self._buys_in_flight(uid), first_delay=0.0,
+                )
+            self._invalidate_settled_cash(user.id)
 
         logger.warning(
             f"Backfilled unconfirmed order {order_id}: {meta.get('side')} {filled_qty}x "
@@ -381,6 +413,63 @@ class OrderManager:
         cash = float(raw) if raw is not None else float(balances.get("total_cash") or 0.0)
         self._settled_cash_cache[user.id] = (cash, datetime.utcnow())
         return cash
+
+    async def _cap_qty_to_cash_left(
+        self,
+        user: User,
+        symbol: str,
+        qty: int,
+        option_symbol: Optional[str],
+        price: Optional[float],
+    ) -> Tuple[int, Optional[str], Optional[float]]:
+        """Largest qty <= `qty` that cash left can pay for (sizing mode B,
+        docs/sizing-basis-design-2026-09-29.md). BUYS ONLY; never called for a sell.
+
+        Returns (qty, reason, available). `reason` is set when qty was lowered or
+        is 0. Unknown cash left or unknown price → `qty` unchanged: the settled-
+        cash gate after the preview still guards the order, as it did before this.
+        """
+        st = await account_state.ensure_fresh(
+            user.id, account_state.mode_of(user),
+            lambda: self.trading_client.get_client(user), self.db,
+        )
+        if st is None or not price or float(price) <= 0:
+            return qty, None, None
+        is_option = is_option_symbol(option_symbol or symbol)
+        multiplier = 100 if is_option else 1
+        # Fee allowance even in prod (where _estimate_fee_buffer is 0 because the
+        # preview's `cost` includes fees): without it an order sized to the last
+        # dollar passes here and is then refused WHOLE by the post-preview gate,
+        # instead of going through one contract smaller.
+        fee = max(self._estimate_fee_buffer(user, 1, option_symbol),
+                  SANDBOX_FEE_BUFFER_PER_OPTION_CONTRACT if is_option else 0.0)
+        per_unit = float(price) * multiplier + fee
+        available = st.cash_left - self._active_reservations_total(user.id)
+        affordable = int(available // per_unit) if available > 0 else 0
+        if affordable >= qty:
+            return qty, None, available
+        mode = account_state.mode_of(user)
+        if affordable < 1 and account_state.first_read_unconfirmed(user.id, mode):
+            # The day's single first read says we can't afford one contract. Don't
+            # trust it yet (owner: "double-check it"): read again in 30 s, and until
+            # then leave qty to the post-preview settled-cash gate, as before.
+            scheduled = account_state.request_first_read_confirmation(
+                user.id, mode, self.trading_client.get_client(user),
+                lambda uid=user.id: self._buys_in_flight(uid),
+            )
+            (logger.warning if scheduled else logger.debug)(   # once per re-check, not per signal
+                f"First cash reading today (${st.cash_left:.2f}) can't fund 1 at ${per_unit:.2f}; "
+                f"re-reading in {account_state.CONFIRM_SECONDS:.0f}s, broker gate decides meanwhile"
+            )
+            return qty, None, None
+        if affordable >= 1:
+            return affordable, (
+                f"cash left ${available:.2f} pays for {affordable} of {qty} at ${per_unit:.2f} each"
+            ), available
+        return 0, (
+            f"Insufficient cash left: ${available:.2f} can't fund 1 at ${per_unit:.2f} "
+            f"(cash left ${st.cash_left:.2f} - reserved ${st.cash_left - available:.2f})"
+        ), available
 
     @classmethod
     def _record_cash_block(cls, user_id: int) -> int:
@@ -944,6 +1033,40 @@ class OrderManager:
                     )
                 return OrderResult(success=False, message=msg)
 
+            # Sizing mode B: the executor sized from the start-of-day account value;
+            # never buy more than CASH LEFT can pay for. Only lowers qty (most-
+            # restrictive-bound wins); runs before the preview so the preview
+            # describes the real order. Buys only — exits are never capped.
+            if side == 'buy':
+                # Option orders price off the option mid; `signal.price` is the
+                # UNDERLYING (~$750) and would wrongly read as unaffordable.
+                cap_price = estimated_price or (
+                    None if is_option_symbol(option_symbol or symbol) else signal.price
+                )
+                capped, cap_reason, cap_available = await self._cap_qty_to_cash_left(
+                    user, symbol, qty, option_symbol, cap_price
+                )
+                if capped < 1:
+                    skipped = self._record_cash_block(user.id)
+                    if skipped == 1:
+                        logger.warning(f"{cap_reason} — entries paused, further skips counted quietly")
+                        log_event(
+                            db=self.db,
+                            user_id=user.id,
+                            event_type="ENTRY_SKIPPED_NO_CASH",
+                            title="Entries paused: out of cash left",
+                            detail=cap_reason,
+                            symbol=symbol,
+                            strategy_id=strategy.id,
+                            severity="warning",
+                            event_data={"available": cap_available, "qty": qty,
+                                        "option_symbol": option_symbol},
+                        )
+                    return OrderResult(success=False, message=f"Order aborted: {cap_reason}")
+                if capped < qty:
+                    logger.info(f"Entry size capped {qty} -> {capped}: {cap_reason}")
+                    qty = capped
+
             # Per-(user, symbol) order rate limit. Stops a runaway loop from
             # hammering the broker even if the strategy logic flips state every
             # tick. Independent of the broker rate limit.
@@ -996,6 +1119,15 @@ class OrderManager:
                 return OrderResult(success=False, message=f"Order aborted: {preview_msg}")
 
             try:
+                # Captured BEFORE the order goes out: which account it is on, that
+                # account's client, and when it was placed. The fill accounting below
+                # uses these, not the user row read after the fill (a paper/live switch
+                # during the fill wait must not move the cost to the other account).
+                # Inside this try so the `finally` below still releases the reservation.
+                fill_mode = account_state.mode_of(user)
+                fill_client = self.trading_client.get_client(user)
+                placed_at = datetime.utcnow()
+
                 # Place order via TradingClientManager (handles paper/live routing)
                 order_response = await self.trading_client.place_order(
                     user=user,
@@ -1035,7 +1167,8 @@ class OrderManager:
                             "signal_price": estimated_price or signal.price,
                             "signal_type": signal.signal_type,
                             "signal_reason": signal.reason,
-                            "placed_at": datetime.utcnow().isoformat(),
+                            "placed_at": placed_at.isoformat(),
+                            "mode": fill_mode,
                         },
                     )
                     msg = (
@@ -1170,6 +1303,19 @@ class OrderManager:
                 # A fill is the one thing that moves settled cash mid-session,
                 # so the precheck's cached figure is now stale.
                 self._invalidate_settled_cash(user.id)
+                # Cash left: a buy's cost comes off at once; a sell adds nothing
+                # (settles T+1). Then re-read the broker and keep the lower figure.
+                if side == 'buy':
+                    mult = 100 if is_option_symbol(option_symbol or symbol) else 1
+                    in_flight = lambda uid=user.id: self._buys_in_flight(uid)  # noqa: E731
+                    # Subtract only if today's cash figure was read before this order
+                    # went out; read after, it may already exclude the order's hold.
+                    if account_state.refreshed_before(user.id, fill_mode, placed_at):
+                        account_state.record_buy_fill(user.id, fill_mode, filled_price * filled_qty * mult)
+                        account_state.schedule_post_fill_check(user.id, fill_mode, fill_client, in_flight)
+                    else:
+                        account_state.schedule_post_fill_check(
+                            user.id, fill_mode, fill_client, in_flight, first_delay=0.0)
 
                 logger.info(
                     f"Order executed successfully: {order_id} - {side} {filled_qty} {symbol} @ ${filled_price:.2f}"

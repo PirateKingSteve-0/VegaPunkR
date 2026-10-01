@@ -31,6 +31,7 @@ from engine.signal_generator import (
 from engine.event_logger import log_event
 from engine import exit_shadow
 from engine.order_manager import OrderManager, OrderResult
+from engine import account_state
 from utils.market_hours import is_market_open
 
 logger = logging.getLogger(__name__)
@@ -430,6 +431,14 @@ class StrategyExecutor:
         else:
             sizing_price = current_price
             logger.info(f"ENTRY SIGNAL: {symbol} price=${sizing_price:.2f} reason={entry_signal.reason}")
+
+        # Today's start-of-day value and cash left: one broker call per ET day,
+        # then served from memory for every later signal, blocked ones included.
+        # Sizing and the loss caps below read it; None → they use the old source.
+        await account_state.ensure_fresh(
+            user.id, account_state.mode_of(user),
+            lambda: self.order_manager.trading_client.get_client(user), self.db,
+        )
 
         qty = self.risk_manager.calculate_position_size(
             user=user,
